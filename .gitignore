@@ -1,0 +1,26 @@
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environments and secrets
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# Runtime state: player scores and server output stay local
+data/*.db
+data/*.db-*
+data/*.sqlite*
+logs/
+
+# OS / editor noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
