@@ -6,17 +6,20 @@ Provides REST APIs for:
 - Fetching per-game leaderboards
 - Fetching player statistics
 
-Run directly with `python -m server.app` or via `flask run`.
+Run directly with `python -m server.app` or via `flask --app server.app run`.
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 
 from flask import Flask, g, jsonify, request
+from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.environ.get("GAMES_DB", BASE_DIR / "data" / "scores.db"))
@@ -32,12 +35,17 @@ SUPPORTED_GAMES = [
 
 app = Flask(__name__)
 app.config["JSON_AS_ASCII"] = False
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
+
+VALID_GAME_IDS = frozenset(game["id"] for game in SUPPORTED_GAMES)
+MAX_EXTRA_BYTES = 8 * 1024
 
 
 @contextmanager
 def db_conn():
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
@@ -47,6 +55,7 @@ def db_conn():
 
 def init_db() -> None:
     with db_conn() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS scores (
@@ -55,7 +64,8 @@ def init_db() -> None:
                 player TEXT NOT NULL,
                 score INTEGER NOT NULL,
                 extra TEXT,
-                created_at REAL NOT NULL
+                created_at REAL NOT NULL,
+                updated_at REAL
             );
             CREATE INDEX IF NOT EXISTS idx_scores_game_score
                 ON scores(game_id, score DESC);
@@ -70,10 +80,43 @@ def init_db() -> None:
             );
             """
         )
+        columns = {row["name"] for row in
+                   conn.execute("PRAGMA table_info(scores)").fetchall()}
+        if "updated_at" not in columns:
+            conn.execute("ALTER TABLE scores ADD COLUMN updated_at REAL")
+
+
+# Flask's CLI imports the module without calling ``main``. Initialize here so
+# every supported entry point sees the same ready database.
+init_db()
 
 
 def get_remote_ip() -> str:
-    return request.headers.get("X-Forwarded-For", request.remote_addr or "unknown")
+    # This service binds to localhost by default and has no configured trusted
+    # proxy. Accepting X-Forwarded-For here would only let callers spoof it.
+    return request.remote_addr or "unknown"
+
+
+def api_error(code: str, message: str, status: int = 400):
+    return jsonify({"ok": False, "code": code, "error": message}), status
+
+
+def parse_limit(default: int) -> tuple[int | None, object | None]:
+    raw = request.args.get("limit")
+    if raw is None:
+        return default, None
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError):
+        return None, api_error("invalid_limit", "limit must be an integer")
+    if not 1 <= limit <= 50:
+        return None, api_error("invalid_limit", "limit must be between 1 and 50")
+    return limit, None
+
+
+@app.errorhandler(RequestEntityTooLarge)
+def _too_large(_exc):
+    return api_error("body_too_large", "request body exceeds 64 KiB", 413)
 
 
 @app.before_request
@@ -84,14 +127,16 @@ def _before() -> None:
 @app.after_request
 def _after(resp):
     resp.headers["X-Backend-Latency-ms"] = f"{(time.time() - g.started) * 1000:.2f}"
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    resp.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
     return resp
 
 
 @app.route("/api/health")
 def health():
+    try:
+        with db_conn() as conn:
+            conn.execute("SELECT 1 FROM scores LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return api_error("database_unavailable", "score database unavailable", 503)
     return jsonify({"ok": True, "service": "classic-games", "ts": time.time()})
 
 
@@ -102,57 +147,74 @@ def games():
 
 @app.route("/api/scores", methods=["POST"])
 def submit_score():
-    body = request.get_json(silent=True)
-    if body is None:
-        body = {}
+    if not request.is_json:
+        return api_error("invalid_content_type",
+                         "Content-Type must be application/json")
+    try:
+        body = request.get_json(silent=False)
+    except BadRequest:
+        return api_error("malformed_json", "request body is not valid JSON")
     if not isinstance(body, dict):
-        return jsonify({"ok": False, "error": "JSON body must be an object"}), 400
+        return api_error("invalid_body", "JSON body must be an object")
+    allowed_fields = {"game_id", "player", "score", "extra", "replace",
+                      "submission_id"}
+    unknown_fields = sorted(set(body) - allowed_fields)
+    if unknown_fields:
+        return api_error("unknown_fields",
+                         f"unknown fields: {', '.join(unknown_fields)}")
 
     raw_game_id = body.get("game_id") or ""
     if not isinstance(raw_game_id, str):
-        return jsonify({"ok": False, "error": "game_id must be a string"}), 400
+        return api_error("invalid_game_id", "game_id must be a string")
     game_id = raw_game_id.strip()
 
     raw_player = body.get("player")
     if raw_player is None:
         raw_player = "anonymous"
     if not isinstance(raw_player, str):
-        return jsonify({"ok": False, "error": "player must be a string"}), 400
-    player = raw_player.strip()[:32] or "anonymous"
+        return api_error("invalid_player", "player must be a string")
+    player = unicodedata.normalize("NFC", raw_player).strip() or "anonymous"
+    if len(player) > 32:
+        return api_error("invalid_player", "player must be at most 32 characters")
+    if any(unicodedata.category(ch).startswith("C") for ch in player):
+        return api_error("invalid_player", "player contains control characters")
 
-    raw_score = body.get("score", 0)
-    if isinstance(raw_score, bool):
-        return jsonify({"ok": False, "error": "score must be int"}), 400
-    try:
-        score = int(raw_score)
-    except (TypeError, ValueError):
-        return jsonify({"ok": False, "error": "score must be int"}), 400
+    if "score" not in body:
+        return api_error("invalid_score", "score is required")
+    raw_score = body["score"]
+    if type(raw_score) is not int:
+        return api_error("invalid_score", "score must be an integer")
+    score = raw_score
     if score < 0 or score > 2_147_483_647:
-        return jsonify({"ok": False,
-                        "error": "score must be between 0 and 2147483647"}), 400
+        return api_error("invalid_score",
+                         "score must be between 0 and 2147483647")
     extra = body.get("extra")
+    if extra is not None and not isinstance(extra, dict):
+        return api_error("invalid_extra", "extra must be an object or null")
+    try:
+        extra_json = (json.dumps(extra, ensure_ascii=False,
+                                 separators=(",", ":"), sort_keys=True,
+                                 allow_nan=False)
+                      if extra is not None else None)
+    except (TypeError, ValueError):
+        return api_error("invalid_extra", "extra must contain valid JSON values")
+    if extra_json is not None and len(extra_json.encode("utf-8")) > MAX_EXTRA_BYTES:
+        return api_error("extra_too_large", "extra exceeds 8 KiB")
     # ``replace=True`` deletes this player's previous submissions for
     # this game before inserting. Used by games whose score is a running
-    # total that should overwrite earlier milestones (e.g. Sokoban's
-    # cumulative 4-level total).
+    # total that should overwrite an older completed run (e.g. Sokoban's
+    # cumulative all-level total).
     replace = body.get("replace", False)
     if not isinstance(replace, bool):
-        return jsonify({"ok": False, "error": "replace must be boolean"}), 400
+        return api_error("invalid_replace", "replace must be boolean")
     submission_id = body.get("submission_id")
     if submission_id is not None:
-        try:
-            if isinstance(submission_id, bool):
-                raise ValueError
-            submission_id = int(submission_id)
-            if submission_id <= 0:
-                raise ValueError
-        except (TypeError, ValueError):
-            return jsonify({"ok": False,
-                            "error": "submission_id must be a positive int"}), 400
+        if type(submission_id) is not int or submission_id <= 0:
+            return api_error("invalid_submission_id",
+                             "submission_id must be a positive integer")
 
-    valid_ids = {g["id"] for g in SUPPORTED_GAMES}
-    if game_id not in valid_ids:
-        return jsonify({"ok": False, "error": f"unknown game_id: {game_id}"}), 400
+    if game_id not in VALID_GAME_IDS:
+        return api_error("unknown_game", f"unknown game_id: {game_id}")
 
     with db_conn() as conn:
         deleted = 0
@@ -162,9 +224,9 @@ def submit_score():
         stored_score = score
         if submission_id is not None:
             cur = conn.execute(
-                "UPDATE scores SET score=?, extra=?, created_at=? "
+                "UPDATE scores SET score=?, extra=?, updated_at=? "
                 "WHERE id=? AND game_id=? AND player=?",
-                (score, str(extra) if extra is not None else None, time.time(),
+                (score, extra_json, time.time(),
                  submission_id, game_id, player),
             )
             updated = cur.rowcount > 0
@@ -191,10 +253,10 @@ def submit_score():
                 deleted = cur.rowcount
         if not updated and not preserved:
             cur = conn.execute(
-                "INSERT INTO scores (game_id, player, score, extra, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (game_id, player, score,
-                 str(extra) if extra is not None else None, time.time()),
+                "INSERT INTO scores "
+                "(game_id, player, score, extra, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (game_id, player, score, extra_json, time.time(), time.time()),
             )
             row_id = cur.lastrowid
         # Compute rank
@@ -219,10 +281,11 @@ def submit_score():
 
 @app.route("/api/leaderboard/<game_id>")
 def leaderboard(game_id: str):
-    try:
-        limit = max(1, min(50, int(request.args.get("limit", 10))))
-    except ValueError:
-        limit = 10
+    if game_id not in VALID_GAME_IDS:
+        return api_error("unknown_game", f"unknown game_id: {game_id}", 404)
+    limit, error = parse_limit(10)
+    if error is not None:
+        return error
 
     with db_conn() as conn:
         rows = conn.execute(
@@ -245,6 +308,8 @@ def leaderboard(game_id: str):
 
 @app.route("/api/stats/<game_id>")
 def stats(game_id: str):
+    if game_id not in VALID_GAME_IDS:
+        return api_error("unknown_game", f"unknown game_id: {game_id}", 404)
     with db_conn() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS n, MAX(score) AS best, AVG(score) AS avg "
@@ -263,21 +328,21 @@ def stats(game_id: str):
 
 @app.route("/api/recent")
 def recent():
-    try:
-        limit = max(1, min(50, int(request.args.get("limit", 20))))
-    except ValueError:
-        limit = 20
+    limit, error = parse_limit(20)
+    if error is not None:
+        return error
     with db_conn() as conn:
         rows = conn.execute(
-            "SELECT game_id, player, score, created_at FROM scores "
-            "ORDER BY created_at DESC LIMIT ?",
+            "SELECT game_id, player, score, "
+            "COALESCE(updated_at, created_at) AS activity_at FROM scores "
+            "ORDER BY COALESCE(updated_at, created_at) DESC LIMIT ?",
             (limit,),
         ).fetchall()
     return jsonify(
         {
             "recent": [
                 {"game_id": r["game_id"], "player": r["player"], "score": r["score"],
-                 "ts": r["created_at"]}
+                 "ts": r["activity_at"]}
                 for r in rows
             ]
         }

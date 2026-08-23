@@ -54,6 +54,8 @@ class Snake(BaseGame):
         cx, cy = COLS // 2, ROWS // 2
         self.body: deque = deque([(cx, cy), (cx - 1, cy), (cx - 2, cy)])
         self.direction = (1, 0)
+        self.turn_queue: deque = deque(maxlen=2)
+        # Compatibility/status view: the last direction waiting to run.
         self.pending_direction = (1, 0)
         self.food: Optional[Tuple[int, int]] = self._spawn_food()
         self.score = 0
@@ -85,10 +87,10 @@ class Snake(BaseGame):
             steps += 1
 
     def _step(self) -> None:
-        # Apply pending direction (reject 180° reversal)
-        nd = self.pending_direction
-        if (nd[0] * -1, nd[1] * -1) != self.direction:
-            self.direction = nd
+        if self.turn_queue:
+            self.direction = self.turn_queue.popleft()
+        self.pending_direction = (self.turn_queue[-1]
+                                  if self.turn_queue else self.direction)
         hx, hy = self.body[0]
         nx, ny = hx + self.direction[0], hy + self.direction[1]
         # Wall collision
@@ -129,6 +131,7 @@ class Snake(BaseGame):
                 or (event.type == pygame.KEYDOWN
                     and event.key == pygame.K_p)):
             self.pending_direction = self.direction
+            self.turn_queue.clear()
         if super().handle_event(event):
             return
         if event.type == pygame.KEYDOWN and self.state == "playing":
@@ -141,12 +144,15 @@ class Snake(BaseGame):
                 candidate = (0, -1)
             elif event.key in (pygame.K_DOWN, pygame.K_s):
                 candidate = (0, 1)
-            # Validate against the direction used for the next movement,
-            # not against another key buffered in this same frame.  Thus
-            # Up then Left while moving Right keeps the valid Up turn
-            # instead of replacing it with an illegal 180-degree reversal.
-            if candidate and candidate != (-self.direction[0],
-                                           -self.direction[1]):
+            # Validate against the newest queued turn. This preserves quick
+            # corners such as Right -> Up -> Left instead of dropping Left
+            # before the next movement tick.
+            base = (self.turn_queue[-1]
+                    if self.turn_queue else self.direction)
+            if (candidate and candidate != base
+                    and candidate != (-base[0], -base[1])
+                    and len(self.turn_queue) < self.turn_queue.maxlen):
+                self.turn_queue.append(candidate)
                 self.pending_direction = candidate
         elif event.type == pygame.KEYDOWN and self.state in ("gameover", "won"):
             if event.key == pygame.K_r:

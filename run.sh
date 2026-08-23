@@ -32,13 +32,25 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # Wait for backend
-for i in $(seq 1 30); do
-    if curl -s "http://${GAMES_HOST}:${GAMES_PORT}/api/health" >/dev/null 2>&1; then
+BACKEND_READY=false
+HEALTH_URL="http://${GAMES_HOST}:${GAMES_PORT}/api/health"
+health_ok() {
+    python -c 'import json,sys,urllib.request as u; d=json.load(u.urlopen(sys.argv[1], timeout=.3)); sys.exit(0 if d.get("ok") and d.get("service")=="classic-games" else 1)' \
+        "${HEALTH_URL}" >/dev/null 2>&1
+}
+for _ in {1..30}; do
+    if health_ok; then
         echo "[run] backend is up"
+        BACKEND_READY=true
         break
     fi
     sleep 0.3
 done
+if [[ "${BACKEND_READY}" != true ]]; then
+    echo "[run] backend failed to start; see logs/server.log" >&2
+    tail -n 20 logs/server.log >&2 || true
+    exit 1
+fi
 
 # Launch the hub (foreground)
 echo "[run] launching game hub"

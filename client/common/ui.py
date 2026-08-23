@@ -389,6 +389,8 @@ class BaseGame(abc.ABC):
         # per second (or repeatedly block when the backend is offline).
         self._overlay_lb_key = None
         self._overlay_leaderboard: List[dict] = []
+        self._overlay_lb_future = None
+        self._score_submit_future = None
         # Restart/continue buttons share the same mouse with some games.
         # Briefly swallow a rapid second click after an overlay action so a
         # double-click cannot fire a Zuma ball or begin a 2048 swipe.
@@ -457,16 +459,30 @@ class BaseGame(abc.ABC):
         """Force one fresh leaderboard fetch for the next result overlay."""
         self._overlay_lb_key = None
         self._overlay_leaderboard = []
+        self._overlay_lb_future = None
+
+    def _submit_result_score(self, score: int, extra=None) -> None:
+        if not self.backend or not self.game_id:
+            return
+        submit_async = getattr(self.backend, "submit_score_async", None)
+        if callable(submit_async):
+            self._score_submit_future = submit_async(
+                self.game_id, self.player, score, extra=extra,
+                replace=self.submit_replaces_existing)
+        else:
+            # Lightweight test/custom backends may only implement the
+            # synchronous protocol. The real BackendClient always uses the
+            # non-blocking branch above.
+            self.backend.submit_score(
+                self.game_id, self.player, score, extra=extra,
+                replace=self.submit_replaces_existing)
 
     def on_game_over(self, score: int, extra=None) -> None:
         self.score = score
         self.extra = extra
         self.state = "gameover"
         self.invalidate_overlay_leaderboard()
-        if self.backend and self.game_id:
-            self.backend.submit_score(
-                self.game_id, self.player, score, extra=extra,
-                replace=self.submit_replaces_existing)
+        self._submit_result_score(score, extra)
 
     def on_win(self, score: int, extra=None) -> None:
         """Variant of ``on_game_over`` that flips state to ``won`` instead
@@ -477,10 +493,7 @@ class BaseGame(abc.ABC):
         self.extra = extra
         self.state = "won"
         self.invalidate_overlay_leaderboard()
-        if self.backend and self.game_id:
-            self.backend.submit_score(
-                self.game_id, self.player, score, extra=extra,
-                replace=self.submit_replaces_existing)
+        self._submit_result_score(score, extra)
 
     def run(self) -> None:
         try:
@@ -616,12 +629,29 @@ class BaseGame(abc.ABC):
         if lb_key != self._overlay_lb_key:
             self._overlay_lb_key = lb_key
             self._overlay_leaderboard = []
+            self._overlay_lb_future = None
             if self.backend and self.game_id:
                 try:
-                    self._overlay_leaderboard = self.backend.leaderboard(
-                        self.game_id, limit=3)
+                    leaderboard_async = getattr(
+                        self.backend, "leaderboard_async", None)
+                    if callable(leaderboard_async):
+                        self._overlay_lb_future = leaderboard_async(
+                            self.game_id, limit=3)
+                    else:
+                        self._overlay_leaderboard = self.backend.leaderboard(
+                            self.game_id, limit=3)
                 except Exception:  # noqa: BLE001 - offline play must survive
                     self._overlay_leaderboard = []
+        if (self._overlay_lb_future is not None
+                and self._overlay_lb_future.done()):
+            try:
+                result = self._overlay_lb_future.result()
+                self._overlay_leaderboard = (result
+                                             if isinstance(result, list)
+                                             else [])
+            except Exception:  # noqa: BLE001 - offline play must survive
+                self._overlay_leaderboard = []
+            self._overlay_lb_future = None
         lb = self._overlay_leaderboard
         if lb:
             f13 = font(13)
@@ -633,6 +663,10 @@ class BaseGame(abc.ABC):
                 draw_text(self.screen, line,
                           (panel.centerx, panel.y + 132 + i * 16),
                           size=13, color=COLORS["text_dim"], center=True)
+        elif self._overlay_lb_future is not None:
+            draw_text(self.screen, "（排行加载中…）",
+                      (panel.centerx, panel.y + 138), size=13,
+                      color=COLORS["text_dim"], center=True)
         else:
             draw_text(self.screen, "（暂无排行）",
                       (panel.centerx, panel.y + 138), size=13,

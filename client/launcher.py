@@ -185,18 +185,19 @@ def main():
     clock = pygame.time.Clock()
 
     backend = BackendClient()
-    online = backend.health()
-    last_health_check = time.time()
-    games_meta = backend.list_games() if online else []
-
-    if not games_meta:
-        games_meta = [
-            {"id": "tetris", "name": "俄罗斯方块", "description": "经典下落方块消除游戏"},
-            {"id": "snake", "name": "贪吃蛇", "description": "控制蛇吃食物变长"},
-            {"id": "2048", "name": "2048", "description": "滑动合并相同数字"},
-            {"id": "sokoban", "name": "推箱子", "description": "把箱子推到目标点"},
-            {"id": "zuma", "name": "祖玛", "description": "发射彩球匹配消除"},
-        ]
+    # Paint the launcher immediately from local metadata while the localhost
+    # health check runs in the background. A stopped backend can otherwise
+    # freeze the very first frame for the full HTTP timeout.
+    online = False
+    last_health_check = time.monotonic()
+    health_future = backend.health_async()
+    games_meta = [
+        {"id": "tetris", "name": "俄罗斯方块", "description": "经典下落方块消除游戏"},
+        {"id": "snake", "name": "贪吃蛇", "description": "控制蛇吃食物变长"},
+        {"id": "2048", "name": "2048", "description": "滑动合并相同数字"},
+        {"id": "sokoban", "name": "推箱子", "description": "把箱子推到目标点"},
+        {"id": "zuma", "name": "祖玛", "description": "发射彩球匹配消除"},
+    ]
 
     # ----- Layout: 5 cards in a single row + 2 leaderboard panels below
     cols = 5
@@ -232,6 +233,8 @@ def main():
     lb_cache_ts: dict = {}   # game_id -> last fetch time
     recent_cache: List[dict] = []
     recent_ts = 0.0
+    leaderboard_futures: dict = {}
+    recent_future = None
     current_lb_game = "tetris"
     if games_meta:
         current_lb_game = games_meta[0]["id"]
@@ -239,34 +242,61 @@ def main():
     def refresh_game_leaderboard(gid: str, force: bool = False) -> None:
         if not online:
             return
-        now = time.time()
+        now = time.monotonic()
         if not force and gid in lb_cache_ts \
                 and now - lb_cache_ts[gid] < LEADERBOARD_REFRESH_SECS:
             return
-        try:
-            lb_cache[gid] = backend.leaderboard(gid, limit=10)
-            lb_cache_ts[gid] = now
-        except Exception:  # noqa: BLE001
-            lb_cache.setdefault(gid, [])
+        if gid not in leaderboard_futures:
+            leaderboard_futures[gid] = backend.leaderboard_async(
+                gid, limit=10)
 
     def refresh_recent(force: bool = False) -> None:
-        nonlocal recent_cache, recent_ts
+        nonlocal recent_cache, recent_ts, recent_future
         if not online:
             return
-        now = time.time()
+        now = time.monotonic()
         if not force and recent_ts and now - recent_ts < LEADERBOARD_REFRESH_SECS:
             return
-        try:
-            recent_cache = backend.recent(limit=8)
-            recent_ts = now
-        except Exception:  # noqa: BLE001
-            pass
+        if recent_future is None:
+            recent_future = backend.recent_async(limit=8)
+
+    def poll_network() -> None:
+        nonlocal online, health_future, recent_cache, recent_ts, recent_future
+        if health_future is not None and health_future.done():
+            was_online = online
+            try:
+                online = bool(health_future.result())
+            except Exception:  # noqa: BLE001
+                online = False
+            health_future = None
+            if online and not was_online:
+                for game in games_meta:
+                    refresh_game_leaderboard(game["id"], force=True)
+                refresh_recent(force=True)
+        for gid, future in list(leaderboard_futures.items()):
+            if not future.done():
+                continue
+            try:
+                result = future.result()
+                lb_cache[gid] = result if isinstance(result, list) else []
+            except Exception:  # noqa: BLE001
+                lb_cache.setdefault(gid, [])
+            lb_cache_ts[gid] = time.monotonic()
+            del leaderboard_futures[gid]
+        if recent_future is not None and recent_future.done():
+            try:
+                result = recent_future.result()
+                recent_cache = result if isinstance(result, list) else []
+            except Exception:  # noqa: BLE001
+                pass
+            recent_ts = time.monotonic()
+            recent_future = None
 
     for gm in games_meta:
         refresh_game_leaderboard(gm["id"], force=True)
     refresh_recent(force=True)
 
-    def reset_after_subgame() -> None:
+    def reset_after_subgame() -> pygame.Surface:
         """Re-create the launcher window after a sub-game exits.
 
         Sub-games now close only their DISPLAY (via
@@ -312,18 +342,13 @@ def main():
     running = True
     mouse_pos = pygame.mouse.get_pos()
     while running:
-        clock.tick(60)
-        now = time.time()
-        if now - last_health_check >= HEALTH_REFRESH_SECS:
-            was_online = online
-            online = backend.health()
+        frame_dt = clock.tick(60) / 1000.0
+        now = time.monotonic()
+        poll_network()
+        if (health_future is None
+                and now - last_health_check >= HEALTH_REFRESH_SECS):
+            health_future = backend.health_async()
             last_health_check = now
-            if online and not was_online:
-                # The launcher may have started before the server. Reconnect
-                # automatically and populate all previously-empty panels.
-                for gm in games_meta:
-                    refresh_game_leaderboard(gm["id"], force=True)
-                refresh_recent(force=True)
         # Hovered card → switch leaderboard view.
         hovered_game = current_lb_game
         for card in cards:
@@ -343,7 +368,7 @@ def main():
             gid = card["meta"]["id"]
             target = 1.0 if card["rect"].collidepoint(mouse_pos) else 0.0
             cur = card_lift[gid]
-            card_lift[gid] = cur + (target - cur) * 0.18
+            card_lift[gid] = cur + (target - cur) * min(1.0, frame_dt * 12.0)
 
         launched_this_frame = False
         for event in pygame.event.get():
@@ -426,7 +451,8 @@ def main():
                          COLORS["accent"] if editing_player else COLORS["border"],
                          player_input_rect, 1, border_radius=6)
         shown = player or "guest"
-        cursor_visible = editing_player and int(time.time() * 2) % 2 == 0
+        cursor_visible = (editing_player
+                          and int(time.monotonic() * 2) % 2 == 0)
         if cursor_visible:
             shown = player + "|"
         # Truncate to field width (180 - 16 padding = 164 usable).

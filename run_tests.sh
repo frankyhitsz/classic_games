@@ -14,6 +14,11 @@ TEST_RUNTIME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/classic-games-tests.XXXXXX")
 TEST_PORT=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 TEST_API_URL="http://127.0.0.1:${TEST_PORT}"
 
+health_ok() {
+    python -c 'import json,sys,urllib.request as u; d=json.load(u.urlopen(sys.argv[1], timeout=.3)); sys.exit(0 if d.get("ok") and d.get("service")=="classic-games" else 1)' \
+        "${TEST_API_URL}/api/health" >/dev/null 2>&1
+}
+
 cleanup() {
     kill "${TEST_SERVER_PID}" 2>/dev/null || true
     wait "${TEST_SERVER_PID}" 2>/dev/null || true
@@ -25,11 +30,11 @@ GAMES_DB="${TEST_RUNTIME_DIR}/scores.db" GAMES_PORT="${TEST_PORT}" \
 TEST_SERVER_PID=$!
 trap cleanup EXIT
 
-for _ in $(seq 1 30); do
-    curl -s "${TEST_API_URL}/api/health" >/dev/null 2>&1 && break
+for _ in {1..30}; do
+    health_ok && break
     sleep 0.2
 done
-if ! curl -s "${TEST_API_URL}/api/health" >/dev/null 2>&1; then
+if ! health_ok; then
     echo "isolated test backend failed to start" >&2
     exit 1
 fi

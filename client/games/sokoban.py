@@ -228,10 +228,18 @@ def parse_level(text: List[str]):
     use it to (a) prevent the player from walking off the map and
     (b) only render floor tiles inside the designed level area.
     """
+    if not text or not text[0]:
+        raise ValueError("level must not be empty")
+    width = len(text[0])
+    if any(len(row) != width for row in text):
+        raise ValueError("level rows must have equal width")
+    allowed = {"#", ".", "$", "*", "@", "+", "T", " "}
     walls, targets, boxes, floors = set(), set(), set(), set()
-    player = None
+    players = []
     for y, row in enumerate(text):
         for x, ch in enumerate(row):
+            if ch not in allowed:
+                raise ValueError(f"unknown level symbol {ch!r} at ({x}, {y})")
             if ch == "#":
                 walls.add((x, y))
                 continue
@@ -243,16 +251,18 @@ def parse_level(text: List[str]):
                 boxes.add((x, y))
                 targets.add((x, y))
             elif ch == "@":
-                player = (x, y)
+                players.append((x, y))
             elif ch == "+":
-                player = (x, y)
+                players.append((x, y))
                 targets.add((x, y))
             # Any non-wall, non-space cell is a valid floor.
             if ch != " ":
                 floors.add((x, y))
-    if player is None:
-        raise ValueError("level missing player (@)")
-    return walls, targets, boxes, player, floors
+    if len(players) != 1:
+        raise ValueError(f"level must contain exactly one player, got {len(players)}")
+    if len(boxes) != len(targets):
+        raise ValueError("level must contain the same number of boxes and targets")
+    return walls, targets, boxes, players[0], floors
 
 
 def level_bounds(level: List[str]) -> Tuple[int, int]:
@@ -264,15 +274,18 @@ def level_bounds(level: List[str]) -> Tuple[int, int]:
 class Sokoban(BaseGame):
     game_id = "sokoban"
     title = "推箱子"
-    # Sokoban score is a full-run cumulative total. Each level-win submission
-    # should REPLACE the player's previous submission for sokoban so the
-    # leaderboard shows only the latest (highest) running total — not
-    # every intermediate milestone.
+    # Sokoban submits only a complete, unassisted run. Replace keeps a
+    # player's best completed run from becoming duplicate leaderboard rows.
     submit_replaces_existing = True
 
     def __init__(self, backend: Optional[BackendClient] = None,
                  player: str = "anonymous"):
         self.level_idx = 0
+        self.total_score = 0
+        self.level_scores: dict[int, int] = {}
+        self.completed_levels: set[int] = set()
+        self.practice_mode = False
+        self._submitted_total: Optional[int] = None
         w, h = level_bounds(LEVELS[0])
         super().__init__(max(500, w * CELL + 40), max(380, h * CELL + 132),
                          fps=60, backend=backend, player=player)
@@ -293,13 +306,15 @@ class Sokoban(BaseGame):
         self.score = 0
         self.state = "playing"
         self.overlay_buttons = []
-        # ``total_score`` accumulates across all levels in a single
-        # playthrough. It only resets when the player starts back at
-        # level 0 (first level, or after wrapping past the last level).
-        # This way the leaderboard reflects a complete multi-level run,
-        # not a single level — as the user requested.
+        # Loading level 0 starts a new run. Other reloads preserve the run's
+        # per-level ledger so replaying a level can improve its score without
+        # adding the same level twice.
         if idx == 0:
             self.total_score = 0
+            self.level_scores = {}
+            self.completed_levels = set()
+            self.practice_mode = False
+            self._submitted_total = None
         w, h = level_bounds(level)
         # Recreate window to fit
         new_w = max(500, w * CELL + 40)
@@ -324,10 +339,17 @@ class Sokoban(BaseGame):
         if event.key == pygame.K_r:
             self.load_level(self.level_idx)
             return
-        # N (next level) works in any state — handy after winning or to
-        # skip a level. Loops back to level 0 after the last.
+        # N advances normally from a win overlay. During active play it is an
+        # explicit practice/skip action and cannot create a ranked clear.
         if event.key == pygame.K_n:
-            self.load_level((self.level_idx + 1) % len(LEVELS))
+            if (self.state == "won"
+                    and self.level_idx in self.completed_levels):
+                self._advance_after_win()
+                return
+            next_idx = (self.level_idx + 1) % len(LEVELS)
+            self.load_level(next_idx)
+            if next_idx != 0:
+                self.practice_mode = True
             return
         if event.key in (pygame.K_u, pygame.K_BACKSPACE):
             if self.state == "playing":
@@ -378,19 +400,40 @@ class Sokoban(BaseGame):
     def _check_win(self):
         if self.boxes == self.targets:
             level_score = max(0, 1000 - self.moves)
-            # Accumulate across the full run.
-            self.total_score = getattr(self, "total_score", 0) + level_score
+            # Keep only this run's best score for each level. Replaying a
+            # solved level can improve the total, never duplicate it.
+            previous = self.level_scores.get(self.level_idx, 0)
+            self.level_scores[self.level_idx] = max(previous, level_score)
+            self.completed_levels.add(self.level_idx)
+            self.total_score = sum(self.level_scores.values())
             self.score = self.total_score  # display the running total
-            completed_all = self.level_idx == len(LEVELS) - 1
-            self.on_win(
-                self.total_score,
-                extra={"level": self.level_idx,
-                       "level_score": level_score,
-                       "total_score": self.total_score,
-                       "moves": self.moves,
-                       "pushes": self.pushes,
-                       "won": True,
-                       "completed_all": completed_all})
+            completed_all = (len(self.completed_levels) == len(LEVELS)
+                             and not self.practice_mode)
+            result = {"level": self.level_idx,
+                      "level_score": level_score,
+                      "counted_level_score": self.level_scores[self.level_idx],
+                      "total_score": self.total_score,
+                      "moves": self.moves,
+                      "pushes": self.pushes,
+                      "won": True,
+                      "completed_levels": len(self.completed_levels),
+                      "practice": self.practice_mode,
+                      "completed_all": completed_all}
+            if (completed_all
+                    and (self._submitted_total is None
+                         or self.total_score > self._submitted_total)):
+                self._submitted_total = self.total_score
+                self.on_win(self.total_score, extra=result)
+            else:
+                # Intermediate/practice clears get the same result overlay,
+                # but only a legitimate all-level run reaches the leaderboard.
+                self.extra = result
+                self.state = "won"
+                self.invalidate_overlay_leaderboard()
+
+    def _advance_after_win(self) -> None:
+        next_idx = (self.level_idx + 1) % len(LEVELS)
+        self.load_level(next_idx)
 
     def draw(self):
         draw_gradient_bg(self.screen, top=(252, 253, 255),
@@ -411,7 +454,7 @@ class Sokoban(BaseGame):
         draw_text(self.screen, stats_line,
                   (header.right - sw - 12, header.y + 9), size=15,
                   color=COLORS["text"], bold=True)
-        hint = "U/退格 撤销 · R 重置 · N 下一关 · Esc 返回菜单"
+        hint = "U/退格 撤销 · R 重置 · N 跳关(练习) · Esc 返回菜单"
         hw = _font(11).size(hint)[0]
         draw_text(self.screen, hint,
                   (header.right - hw - 12, header.y + 29), size=11,
@@ -447,7 +490,7 @@ class Sokoban(BaseGame):
 
         # Footer
         draw_text(self.screen,
-                  "方向键/WASD 移动 · U/退格 撤销 · R 重置 · N 下一关 · Esc 退出",
+                  "方向键/WASD 移动 · U/退格 撤销 · R 重置 · N 跳关(练习) · Esc 退出",
                   (self.width // 2, self.height - 18),
                   size=12, color=COLORS["text_dim"], center=True)
 
@@ -458,15 +501,20 @@ class Sokoban(BaseGame):
             next_label = "返回第 1 关" if last else "下一关 (N)"
             btns = [
                 Button(pygame.Rect(0, 0, 150, 36), next_label,
-                       lambda: self.load_level(
-                           (self.level_idx + 1) % len(LEVELS)), primary=True),
+                       self._advance_after_win, primary=True),
                 Button(pygame.Rect(0, 0, 140, 36), "重玩本关 (R)",
                        lambda: self.load_level(self.level_idx)),
                 Button(pygame.Rect(0, 0, 140, 36), "返回菜单 (Esc)",
                        lambda: setattr(self, "running", False)),
             ]
-            msg = (f"全部通关！总分 {self.total_score}"
-                   if last else f"通过 关卡 {self.level_idx + 1}")
+            completed_all = bool(self.extra
+                                 and self.extra.get("completed_all"))
+            if completed_all:
+                msg = f"全部通关！总分 {self.total_score}"
+            elif self.practice_mode:
+                msg = f"练习完成 · 关卡 {self.level_idx + 1}"
+            else:
+                msg = f"通过 关卡 {self.level_idx + 1}"
             detail = (f"本关 +{max(0, 1000 - self.moves)}  ·  "
                       f"累计 {self.total_score}  ·  "
                       f"步数 {self.moves}  ·  推动 {self.pushes}")

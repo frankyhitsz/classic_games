@@ -114,6 +114,9 @@ class Game2048(BaseGame):
         self.score_submitted = False
         self.score_submission_id: Optional[int] = None
         self.submitted_score: Optional[int] = None
+        self._score_submission_future = None
+        self._score_submission_inflight_score: Optional[int] = None
+        self._queued_score_submission = None
         self.state = "playing"
         self.overlay_buttons = []
         self.anim_t = 1.0  # 1.0 = no animation in progress
@@ -179,6 +182,8 @@ class Game2048(BaseGame):
     def _move(self, direction: str) -> None:
         if self.state not in ("playing",):
             return
+        if direction not in {"left", "right", "up", "down"}:
+            raise ValueError(f"unknown 2048 direction: {direction}")
         # Refuse input mid-slide so the animation can finish cleanly.
         if self.anim_t < 1.0:
             self._queued_direction = direction
@@ -274,6 +279,7 @@ class Game2048(BaseGame):
             self._tick_animations(dt)
 
     def _tick_animations(self, dt: float) -> None:
+        self._poll_score_submission()
         prev_t = self.anim_t
         if self.anim_t < 1.0:
             self.anim_t = min(1.0, self.anim_t + dt / ANIM_DURATION)
@@ -330,22 +336,61 @@ class Game2048(BaseGame):
         # player continues past 2048 and later finishes with a higher score,
         # update this session's existing backend row instead of either
         # losing the final score or creating a duplicate leaderboard entry.
+        self._poll_score_submission()
         if self.score_submitted and self.submitted_score == self.score:
             return
-        # If the first offline submission failed there is no row we can
-        # safely update; retain the old one-attempt behaviour.
-        if self.score_submitted and self.score_submission_id is None:
+        if self._score_submission_future is not None:
+            # The final score may arrive while the 2048 milestone request is
+            # still in flight. Keep only the newest pending value; once the
+            # first response supplies an id, the queued value updates it.
+            self._queued_score_submission = (self.score, extra)
             return
-        result = None
-        if self.backend and self.game_id:
-            result = self.backend.submit_score(
-                self.game_id, self.player, self.score, extra=extra,
+        self._begin_score_submission(self.score, extra)
+
+    def _begin_score_submission(self, score: int, extra=None) -> None:
+        if not self.backend or not self.game_id:
+            return
+        submit_async = getattr(self.backend, "submit_score_async", None)
+        if callable(submit_async):
+            self._score_submission_future = submit_async(
+                self.game_id, self.player, score, extra=extra,
                 submission_id=self.score_submission_id)
+            self._score_submission_inflight_score = score
+            return
+        result = self.backend.submit_score(
+            self.game_id, self.player, score, extra=extra,
+            submission_id=self.score_submission_id)
+        self._record_score_submission(result, score)
+
+    def _record_score_submission(self, result, score: int) -> None:
+        # ``None`` is the BackendClient's explicit offline/failure result.
+        # Do not turn a failed attempt into permanent session state.
+        if not result:
+            return
         if isinstance(result, dict) and result.get("id") is not None:
             self.score_submission_id = int(result["id"])
         self.score_submitted = True
-        self.submitted_score = self.score
+        self.submitted_score = score
         self.invalidate_overlay_leaderboard()
+
+    def _poll_score_submission(self) -> None:
+        future = self._score_submission_future
+        if future is None or not future.done():
+            return
+        self._score_submission_future = None
+        submitted_score = (self._score_submission_inflight_score
+                           if self._score_submission_inflight_score is not None
+                           else self.score)
+        self._score_submission_inflight_score = None
+        try:
+            result = future.result()
+        except Exception:  # noqa: BLE001 - offline play must survive
+            result = None
+        self._record_score_submission(result, submitted_score)
+        queued = self._queued_score_submission
+        self._queued_score_submission = None
+        if queued is not None and queued[0] != self.submitted_score:
+            self._begin_score_submission(*queued)
 
     def _continue_after_win(self) -> None:
         self.state = "playing"

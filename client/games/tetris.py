@@ -1,15 +1,13 @@
 """Tetris — classic falling-block puzzle.
 
-Rotation system: Super Rotation System (SRS, the modern Tetris Guideline
-standard). Each piece has 4 rotation INDEX states (0=spawn, R=CW90,
+Rotation system: an SRS-inspired assisted rotation model. Each piece has
+4 rotation INDEX states (0=spawn, R=CW90,
 2=CW180, L=CW270). For pieces with rotational symmetry (I, S, Z), some
-of these states are visually identical — that's intentional per the
-SRS spec, not a missing rotation.
+of these states are visually identical.
 
-SRS wall-kick tables per rotation transition let a piece rotate even
-when jammed against a wall or floor. Without them, certain states
-become unreachable in tight positions, which is the bug "rotations
-still incomplete".
+The standard SRS kick tables are the base, with extra floor assistance and
+alignment recovery requested for this collection. It is deliberately not a
+claim of strict Tetris Guideline conformance.
 
 Controls:
   ←/→     move
@@ -42,6 +40,8 @@ BOARD_X = 20
 BOARD_Y = 20
 HORIZONTAL_DAS = 0.16  # delay before held left/right starts repeating
 HORIZONTAL_ARR = 0.045  # repeat interval after DAS
+SOFT_DROP_DAS = 0.12
+SOFT_DROP_ARR = 0.045
 TETRIS_LINES_PER_LEVEL = 10
 TETRIS_INITIAL_DROP_INTERVAL = 0.8
 TETRIS_MIN_DROP_INTERVAL = 0.08
@@ -177,7 +177,10 @@ class Tetris(BaseGame):
         self.drop_timer = 0.0
         self.drop_interval = tetris_drop_interval(self.level)
         self.horizontal_hold = 0
+        self.horizontal_pressed: List[int] = []
         self.horizontal_repeat_timer = 0.0
+        self.soft_drop_held = False
+        self.soft_drop_repeat_timer = 0.0
         self.state = "playing"
         self.overlay_buttons = []
         # Total successful rotations this game (for stats display).
@@ -208,6 +211,10 @@ class Tetris(BaseGame):
         return False
 
     def _lock(self):
+        # A newly spawned piece receives a full gravity interval. Without
+        # this reset, hard/soft locking near the end of an interval can make
+        # the next piece fall immediately.
+        self.drop_timer = 0.0
         cells = self.piece.cells()
         topped_out = any(y < 0 for _, y in cells)
         for x, y in cells:
@@ -354,41 +361,70 @@ class Tetris(BaseGame):
                 self._move(self.horizontal_hold)
                 self.horizontal_repeat_timer += HORIZONTAL_ARR
                 repeats += 1
+        if self.soft_drop_held:
+            self.soft_drop_repeat_timer -= dt
+            repeats = 0
+            while (self.soft_drop_repeat_timer <= 0.0
+                   and repeats < ROWS and self.state == "playing"):
+                self._soft_drop()
+                self.soft_drop_repeat_timer += SOFT_DROP_ARR
+                repeats += 1
         self.drop_timer += dt
-        if self.drop_timer >= self.drop_interval:
-            self.drop_timer = 0.0
+        gravity_steps = 0
+        while (self.drop_timer >= self.drop_interval
+               and gravity_steps < ROWS and self.state == "playing"):
+            self.drop_timer -= self.drop_interval
             if not self._collides(self.piece.cells(dy=1)):
                 self.piece.y += 1
                 self._rotation_lift_debt = max(
                     0, self._rotation_lift_debt - 1)
             else:
                 self._lock()
+            gravity_steps += 1
 
     def handle_event(self, event):
         if (event.type == getattr(pygame, "WINDOWFOCUSLOST", -1)
                 or (event.type == pygame.KEYDOWN
                     and event.key == pygame.K_p)):
             self.horizontal_hold = 0
+            self.horizontal_pressed = []
+            self.soft_drop_held = False
         if event.type == pygame.KEYUP:
-            if (event.key in (pygame.K_LEFT, pygame.K_a)
-                    and self.horizontal_hold == -1):
-                self.horizontal_hold = 0
-            elif (event.key in (pygame.K_RIGHT, pygame.K_d)
-                  and self.horizontal_hold == 1):
-                self.horizontal_hold = 0
+            released = None
+            if event.key in (pygame.K_LEFT, pygame.K_a):
+                released = -1
+            elif event.key in (pygame.K_RIGHT, pygame.K_d):
+                released = 1
+            if released is not None:
+                self.horizontal_pressed = [
+                    d for d in self.horizontal_pressed if d != released]
+                self.horizontal_hold = (self.horizontal_pressed[-1]
+                                        if self.horizontal_pressed else 0)
+                if self.horizontal_hold:
+                    self.horizontal_repeat_timer = HORIZONTAL_ARR
+            if event.key in (pygame.K_DOWN, pygame.K_s):
+                self.soft_drop_held = False
         if super().handle_event(event):
             return
         if event.type == pygame.KEYDOWN and self.state == "playing":
             if event.key in (pygame.K_LEFT, pygame.K_a):
                 self._move(-1)
+                self.horizontal_pressed = [
+                    d for d in self.horizontal_pressed if d != -1]
+                self.horizontal_pressed.append(-1)
                 self.horizontal_hold = -1
                 self.horizontal_repeat_timer = HORIZONTAL_DAS
             elif event.key in (pygame.K_RIGHT, pygame.K_d):
                 self._move(1)
+                self.horizontal_pressed = [
+                    d for d in self.horizontal_pressed if d != 1]
+                self.horizontal_pressed.append(1)
                 self.horizontal_hold = 1
                 self.horizontal_repeat_timer = HORIZONTAL_DAS
             elif event.key in (pygame.K_DOWN, pygame.K_s):
                 self._soft_drop()
+                self.soft_drop_held = True
+                self.soft_drop_repeat_timer = SOFT_DROP_DAS
             elif event.key in (pygame.K_UP, pygame.K_x):
                 self._rotate(1)
             elif event.key == pygame.K_z:

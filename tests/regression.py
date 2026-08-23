@@ -23,9 +23,14 @@ def run(name: str, body: str) -> None:
     global PASS, FAIL
     src = dedent(body).strip()
     full = "import sys; sys.path.insert(0, %r)\n" % str(ROOT) + src
-    proc = subprocess.run(
-        [sys.executable, "-c", full],
-        env=ENV, capture_output=True, text=True, cwd=str(ROOT))
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", full], env=ENV, capture_output=True,
+            text=True, cwd=str(ROOT), timeout=15)
+    except subprocess.TimeoutExpired:
+        FAIL += 1
+        print(f"  FAIL: {name} (timed out after 15s)")
+        return
     if proc.returncode == 0:
         PASS += 1
         print(f"  PASS: {name}")
@@ -580,7 +585,9 @@ run("2048-score-once", """
     from client.games import game_2048
     class CB:
         def __init__(self): self.n=0
-        def submit_score(self,*a,**k): self.n+=1
+        def submit_score(self,*a,**k):
+            self.n+=1
+            return {'ok': True, 'id': 1}
         def leaderboard(self,*a,**k): return []
         def health(self): return True
     cb = CB()
@@ -618,14 +625,16 @@ run("sokoban-submits-player-name", """
     submitted = {}
     class Spy:
         def __init__(self, real): self.real = real
-        def __getattr__(self, n): return getattr(self.real, n)
         def submit_score(self, gid, player, score, extra=None, **kw):
             submitted['gid']=gid; submitted['player']=player; submitted['score']=score
             return self.real.submit_score(gid, player, score, extra=extra, **kw)
     real = BackendClient()
     g = sokoban.Sokoban(backend=Spy(real), player='franky')
     assert g.player == 'franky', f'player name clobbered: {g.player!r}'
-    g.boxes = set(g.targets); g._check_win()
+    for level_idx in range(len(sokoban.LEVELS)):
+        g.load_level(level_idx)
+        g.boxes = set(g.targets)
+        g._check_win()
     assert submitted.get('player') == 'franky', f'submitted as {submitted}'
     assert submitted.get('gid') == 'sokoban'
     import requests
@@ -792,7 +801,6 @@ run("sokoban-total-score", """
     submitted = []
     class Spy:
         def __init__(self, real): self.real = real
-        def __getattr__(self, n): return getattr(self.real, n)
         def submit_score(self, gid, player, score, extra=None, **kw):
             submitted.append((score, extra, kw.get('replace', False)))
             return self.real.submit_score(gid, player, score, extra=extra, **kw)
@@ -805,19 +813,14 @@ run("sokoban-total-score", """
         g.boxes = set(g.targets)
         g._check_win()
 
-    assert len(submitted) == len(sokoban.LEVELS), \
-        f'expected {len(sokoban.LEVELS)} submissions, got {len(submitted)}'
+    assert len(submitted) == 1, \
+        f'expected one completed-run submission, got {len(submitted)}'
     last_score, last_extra, last_replace = submitted[-1]
     expected_total = sum(1000 - mv for mv in moves_by_level)
     assert last_score == expected_total, \\
         f'final submitted score={last_score}, expected total={expected_total}'
     assert last_extra.get('completed_all') is True, last_extra
-    # All submissions must use replace=True so intermediate milestones
-    # are deleted from the leaderboard.
-    assert all(repl for _, _, repl in submitted), \\
-        f'sokoban submissions must use replace=True: {submitted}'
-    scores = [s for s, _, _ in submitted]
-    assert scores == sorted(scores), f'scores not monotonic: {scores}'
+    assert last_replace, f'completed run must replace older run: {submitted}'
     # Verify backend really did delete previous submissions — only ONE
     # row for player 'rt' should remain.
     import requests
@@ -1707,18 +1710,18 @@ run("backend-failure-backoff", """
     import requests
     import client.common.network as network
     calls = {'n': 0}
-    original = network.requests.get
+    original = network.requests.Session.get
     def fail(*a, **k):
         calls['n'] += 1
         raise requests.ConnectionError('offline')
-    network.requests.get = fail
+    network.requests.Session.get = fail
     try:
         be = network.BackendClient(base_url='http://127.0.0.1:1')
         assert be._get('/x') is None
         assert be._get('/x') is None
         assert calls['n'] == 1, f'backoff made {calls["n"]} requests'
     finally:
-        network.requests.get = original
+        network.requests.Session.get = original
 """)
 
 # ===========================================================================
@@ -2073,6 +2076,334 @@ run("tetris-partial-piece-top-out", """
     assert g.state == 'gameover', g.state
     assert g.extra.get('top_out') is True, g.extra
     assert len(stub.submissions) == 1
+    pygame.quit()
+""")
+
+
+# ===========================================================================
+print("\n=== 79. Sokoban replay and skip cannot inflate a ranked run ===")
+run("sokoban-ranked-run-integrity", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.sokoban import Sokoban, LEVELS
+    class Stub:
+        def __init__(self): self.calls = []
+        def submit_score(self, *a, **k):
+            self.calls.append((a, k)); return {'ok': True, 'id': 1}
+        def leaderboard(self, *a, **k): return []
+
+    stub = Stub(); g = Sokoban(backend=stub)
+    g.load_level(1); g.moves = 10; g.boxes = set(g.targets); g._check_win()
+    first = g.total_score
+    g.load_level(1); g.moves = 20; g.boxes = set(g.targets); g._check_win()
+    assert g.total_score == first, (first, g.total_score)
+    assert not stub.calls, stub.calls
+
+    skipped = Sokoban(backend=Stub())
+    for _ in range(len(LEVELS) - 1):
+        skipped.handle_event(pygame.event.Event(
+            pygame.KEYDOWN, {'key':pygame.K_n, 'unicode':''}))
+    skipped.boxes = set(skipped.targets); skipped._check_win()
+    assert skipped.extra['practice'] is True
+    assert skipped.extra['completed_all'] is False
+    assert not skipped.backend.calls
+    pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 80. 2048 retries a failed score submission ===")
+run("2048-failed-submit-retries", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.game_2048 import Game2048
+    class Stub:
+        def __init__(self): self.calls = 0
+        def submit_score(self, *a, **k):
+            self.calls += 1
+            return None if self.calls == 1 else {'ok': True, 'id': 9}
+        def leaderboard(self, *a, **k): return []
+    stub = Stub(); g = Game2048(backend=stub); g.score = 100
+    g._submit_score(); assert not g.score_submitted
+    g._submit_score()
+    assert stub.calls == 2 and g.score_submission_id == 9
+    pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 81. Zuma preserves multiple simultaneous chain reactions ===")
+run("zuma-multiple-pending-reactions", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.zuma import Zuma, GAP
+    class Stub:
+        def submit_score(self, *a, **k): pass
+        def leaderboard(self, *a, **k): return []
+    g = Zuma(backend=Stub()); g.spawn_interval = 99
+    colors = [2,2,0,0,0,2,3,3,1,1,1,3]
+    g.chain = [{'pos':600-i*GAP, 'color':color, 'visual_offset':0.0}
+               for i, color in enumerate(colors)]
+    assert g._try_match_at(3)
+    assert g._try_match_at(6)
+    assert len(g.pending_chain_matches) == 2
+    g._update_pending_chain_match(10.0)
+    assert not g.chain, [ball['color'] for ball in g.chain]
+    pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 82. Tetris held keys and gravity preserve input state and time ===")
+run("tetris-held-input-and-gravity", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.tetris import Tetris
+    class Stub:
+        def submit_score(self, *a, **k): return {'ok': True, 'id': 1}
+        def leaderboard(self, *a, **k): return []
+
+    g = Tetris(backend=Stub()); start_y = g.piece.y
+    g.handle_event(pygame.event.Event(
+        pygame.KEYDOWN, {'key':pygame.K_DOWN, 'unicode':''}))
+    g.update(0.25)
+    assert g.piece.y - start_y > 1, (start_y, g.piece.y)
+    g.handle_event(pygame.event.Event(
+        pygame.KEYUP, {'key':pygame.K_DOWN, 'unicode':''}))
+    stopped_y = g.piece.y; g.update(0.20)
+    assert g.piece.y == stopped_y
+
+    g = Tetris(backend=Stub()); start_x = g.piece.x
+    for key in (pygame.K_LEFT, pygame.K_RIGHT):
+        g.handle_event(pygame.event.Event(
+            pygame.KEYDOWN, {'key':key, 'unicode':''}))
+    g.handle_event(pygame.event.Event(
+        pygame.KEYUP, {'key':pygame.K_RIGHT, 'unicode':''}))
+    assert g.horizontal_hold == -1
+    g.update(0.25)
+    assert g.piece.x < start_x
+
+    g = Tetris(backend=Stub()); g.drop_interval = 0.10; start_y = g.piece.y
+    g.update(0.25)
+    assert g.piece.y - start_y == 2
+    assert 'SRS-inspired' in (Tetris.__module__ and __import__(
+        'client.games.tetris', fromlist=['x']).__doc__)
+    pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 83. Flask import initializes DB and the score contract is strict ===")
+run("backend-import-init-and-strict-contract", """
+    import os, sqlite3, subprocess, sys, tempfile
+    with tempfile.TemporaryDirectory() as temp_dir:
+        env = os.environ.copy(); env['GAMES_DB'] = os.path.join(temp_dir, 'fresh.db')
+        code = ("from server.app import app\\n"
+                "c = app.test_client()\\n"
+                "r = c.post('/api/scores', "
+                "json={'game_id':'tetris','score':1})\\n"
+                "assert r.status_code == 200 and r.get_json()['ok']\\n")
+        result = subprocess.run([sys.executable, '-c', code], env=env,
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+    # Import-time initialization also migrates databases created by the
+    # previous schema instead of only handling brand-new files.
+    with tempfile.TemporaryDirectory() as temp_dir:
+        old_db = os.path.join(temp_dir, 'old.db')
+        with sqlite3.connect(old_db) as conn:
+            conn.execute('CREATE TABLE scores (id INTEGER PRIMARY KEY, '
+                         'game_id TEXT, player TEXT, score INTEGER, '
+                         'extra TEXT, created_at REAL)')
+        env = os.environ.copy(); env['GAMES_DB'] = old_db
+        code = ("import sqlite3\\n"
+                "from server.app import DB_PATH\\n"
+                "c=sqlite3.connect(DB_PATH)\\n"
+                "cols={r[1] for r in c.execute('pragma table_info(scores)')}\\n"
+                "assert 'updated_at' in cols\\n")
+        result = subprocess.run([sys.executable, '-c', code], env=env,
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+
+    from server.app import app
+    c = app.test_client()
+    invalid = [
+        {'game_id':'tetris', 'score':'12'},
+        {'game_id':'tetris', 'score':1.5},
+        {'game_id':'tetris', 'score':1, 'extra':['not-an-object']},
+        {'game_id':'tetris', 'score':1, 'player':'bad\\nname'},
+        {'game_id':'tetris', 'score':1, 'unknown':True},
+    ]
+    for payload in invalid:
+        response = c.post('/api/scores', json=payload)
+        assert response.status_code == 400, (payload, response.get_json())
+    malformed = c.post('/api/scores', data='{bad',
+                       content_type='application/json')
+    assert malformed.status_code == 400
+    assert malformed.get_json()['code'] == 'malformed_json'
+    assert c.get('/api/leaderboard/not-a-game').status_code == 404
+    spoof = c.post('/api/scores', json={'game_id':'tetris','score':2},
+                   headers={'X-Forwarded-For':'203.0.113.9'})
+    assert spoof.get_json()['submitted_from'] != '203.0.113.9'
+""")
+
+# ===========================================================================
+print("\n=== 84. Real pygame network paths do not block the render thread ===")
+run("network-work-runs-off-render-thread", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import time, pygame; pygame.init()
+    from client.common.network import BackendClient
+    from client.common.ui import BaseGame
+    class SlowBackend(BackendClient):
+        def submit_score(self, *a, **k):
+            time.sleep(0.25); return {'ok': True, 'id': 1}
+        def leaderboard(self, *a, **k):
+            time.sleep(0.25); return []
+    class Demo(BaseGame):
+        game_id = 'tetris'
+        def update(self, dt): pass
+        def draw(self): pass
+    g = Demo(240, 240, backend=SlowBackend())
+    start = time.perf_counter(); g.on_game_over(10)
+    assert time.perf_counter() - start < 0.10
+    start = time.perf_counter(); g.draw_gameover_overlay()
+    assert time.perf_counter() - start < 0.10
+    pygame.quit()
+""")
+
+
+# ===========================================================================
+print("\n=== 85. Snake buffers two legal turns for a quick corner ===")
+run("snake-two-turn-queue", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.snake import Snake
+    class Stub:
+        def submit_score(self, *a, **k): pass
+        def leaderboard(self, *a, **k): return []
+    g = Snake(backend=Stub())
+    for key in (pygame.K_UP, pygame.K_LEFT):
+        g.handle_event(pygame.event.Event(
+            pygame.KEYDOWN, {'key':key, 'unicode':''}))
+    assert list(g.turn_queue) == [(0, -1), (-1, 0)]
+    g.update(1 / g.move_speed); assert g.direction == (0, -1)
+    g.update(1 / g.move_speed); assert g.direction == (-1, 0)
+    pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 86. 2048 rejects unknown movement directions ===")
+run("2048-invalid-direction", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.game_2048 import Game2048
+    class Stub:
+        def submit_score(self, *a, **k): pass
+        def leaderboard(self, *a, **k): return []
+    g = Game2048(backend=Stub())
+    try:
+        g._move('sideways')
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('unknown direction entered the vertical branch')
+    pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 87. Sokoban parser rejects malformed authored levels ===")
+run("sokoban-parser-validation", """
+    from client.games.sokoban import parse_level
+    invalid = [
+        ['#####', '#@X.#', '#####'],
+        ['#####', '#@@T#', '#.$.#', '#####'],
+        ['#####', '#@$.#', '####'],
+        ['#####', '#@$.#', '#.T.#', '#.T.#', '#####'],
+    ]
+    for level in invalid:
+        try:
+            parse_level(level)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f'accepted malformed level: {level}')
+""")
+
+# ===========================================================================
+print("\n=== 88. Zuma preserves timer surplus and last-chance hits ===")
+run("zuma-timers-and-last-chance-hit", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.zuma import Zuma, GAP, pos_at
+    class Stub:
+        def submit_score(self, *a, **k): pass
+        def leaderboard(self, *a, **k): return []
+
+    spawned = Zuma(backend=Stub())
+    spawned.update(spawned.spawn_interval * 2.5)
+    assert spawned.spawned == 2, spawned.spawned
+    assert abs(spawned.spawn_timer - spawned.spawn_interval * 0.5) < 1e-6
+
+    burst = Zuma(backend=Stub()); burst.spawned = burst.level_ball_count
+    burst.shoot_cooldown = 0.05; burst.shot_queue = 3
+    burst.update(0.20)
+    assert len(burst.projectiles) == 3, len(burst.projectiles)
+
+    g = Zuma(backend=Stub()); color = 0
+    g.chain = [{'pos':g.path_length-i*GAP, 'color':color,
+                'visual_offset':0.0} for i in range(3)]
+    x, y = pos_at(g.path_pts, g.path_cum, g.path_length)
+    g.projectiles = [{'x':x, 'y':y, 'vx':0.0, 'vy':0.0, 'color':color}]
+    g.update(0.0)
+    assert g.state == 'playing', 'loss was checked before an existing hit'
+    assert not g.chain
+    pygame.quit()
+""")
+
+
+# ===========================================================================
+print("\n=== 89. Sokoban N advances a won level without marking a skip ===")
+run("sokoban-keyboard-advance-is-ranked", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.sokoban import Sokoban, LEVELS
+    class Stub:
+        def __init__(self): self.calls = []
+        def submit_score(self, *a, **k):
+            self.calls.append((a, k)); return {'ok': True, 'id': 1}
+        def leaderboard(self, *a, **k): return []
+    stub = Stub(); g = Sokoban(backend=stub)
+    for level_idx in range(len(LEVELS)):
+        assert g.level_idx == level_idx
+        g.boxes = set(g.targets); g._check_win()
+        if level_idx < len(LEVELS) - 1:
+            g.handle_event(pygame.event.Event(
+                pygame.KEYDOWN, {'key':pygame.K_n, 'unicode':'n'}))
+            assert not g.practice_mode
+    assert g.extra['completed_all'] is True
+    assert len(stub.calls) == 1
+    pygame.quit()
+""")
+
+
+# ===========================================================================
+print("\n=== 90. 2048 serializes in-flight milestone and final submissions ===")
+run("2048-async-score-update-order", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import time, pygame; pygame.init()
+    from client.common.network import BackendClient
+    from client.games.game_2048 import Game2048
+    class DelayedBackend(BackendClient):
+        def __init__(self): super().__init__(); self.calls = []
+        def submit_score(self, *a, **k):
+            time.sleep(0.05); self.calls.append((a, k))
+            return {'ok': True, 'id': 42, 'updated':len(self.calls) > 1}
+        def leaderboard(self, *a, **k): return []
+    backend = DelayedBackend(); g = Game2048(backend=backend)
+    g.score = 100; g._submit_score(extra={'won':True})
+    g.score = 250; g._submit_score(extra={'final':True})
+    time.sleep(0.10); g._poll_score_submission()
+    time.sleep(0.10); g._poll_score_submission()
+    assert len(backend.calls) == 2, backend.calls
+    assert backend.calls[0][1].get('submission_id') is None
+    assert backend.calls[1][1].get('submission_id') == 42
+    assert g.submitted_score == 250 and g.score_submission_id == 42
     pygame.quit()
 """)
 

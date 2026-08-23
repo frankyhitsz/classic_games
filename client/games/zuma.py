@@ -23,6 +23,7 @@ from __future__ import annotations
 import math
 import random
 import time
+from bisect import bisect_left
 from typing import List, Optional, Tuple
 
 import pygame
@@ -134,16 +135,13 @@ def pos_at(pts, cum, d: float) -> Tuple[float, float]:
         return pts[0]
     if d >= total:
         return pts[-1]
-    # linear scan (path is short, n=280)
-    for i in range(1, len(cum)):
-        if cum[i] >= d:
-            seg = cum[i] - cum[i - 1]
-            if seg <= 1e-6:
-                return pts[i]
-            t = (d - cum[i - 1]) / seg
-            return (pts[i - 1][0] + t * (pts[i][0] - pts[i - 1][0]),
-                    pts[i - 1][1] + t * (pts[i][1] - pts[i - 1][1]))
-    return pts[-1]
+    i = bisect_left(cum, d, lo=1)
+    seg = cum[i] - cum[i - 1]
+    if seg <= 1e-6:
+        return pts[i]
+    t = (d - cum[i - 1]) / seg
+    return (pts[i - 1][0] + t * (pts[i][0] - pts[i - 1][0]),
+            pts[i - 1][1] + t * (pts[i][1] - pts[i - 1][1]))
 
 
 def _build_smooth_track_surface(
@@ -229,7 +227,10 @@ class Zuma(BaseGame):
         self.combo = 0
         self.level_bonus = 0
         self.spawn_color_history: List[int] = []
-        self.pending_chain_match = None
+        # More than one projectile can create a reconnecting pair before an
+        # earlier collapse finishes. Keep every pending reaction; a single
+        # slot lets the newest match silently overwrite the older one.
+        self.pending_chain_matches: List[dict] = []
         self.match_particles: List[dict] = []
         self.chain_banner_timer = 0.0
         self.chain_banner_depth = 0
@@ -253,17 +254,20 @@ class Zuma(BaseGame):
     def update(self, dt: float):
         if self.state != "playing":
             return
-        self.shoot_cooldown = max(0.0, self.shoot_cooldown - dt)
-        if self.shoot_cooldown <= 0.0:
-            if self.shot_queue > 0:
-                self.shot_queue -= 1
-                self._fire_shot()
+        self.shoot_cooldown -= dt
+        while self.shoot_cooldown <= 0.0 and self.shot_queue > 0:
+            overdue = -self.shoot_cooldown
+            self.shot_queue -= 1
+            self._fire_shot()
+            self.shoot_cooldown -= overdue
+        self.shoot_cooldown = max(0.0, self.shoot_cooldown)
 
         # Spawn new chain ball
         if self.spawned < self.level_ball_count:
             self.spawn_timer += dt
-            if self.spawn_timer >= self.spawn_interval:
-                self.spawn_timer = 0
+            while (self.spawn_timer >= self.spawn_interval
+                   and self.spawned < self.level_ball_count):
+                self.spawn_timer -= self.spawn_interval
                 self._spawn_chain_ball()
 
         # Admit waiting balls only when a real on-pipe slot exists.  A while
@@ -292,6 +296,19 @@ class Zuma(BaseGame):
         self._update_pending_chain_match(dt)
         self._update_match_particles(dt)
         self.chain_banner_timer = max(0.0, self.chain_banner_timer - dt)
+
+        # Resolve shots before deciding that the leading ball reached the
+        # exit. A projectile already touching that ball in this frame gets
+        # its legitimate last-chance clear instead of an order-dependent loss.
+        for p in list(self.projectiles):
+            old_pos = (p["x"], p["y"])
+            p["x"] += p["vx"] * dt
+            p["y"] += p["vy"] * dt
+            if self._check_projectile_hit(p, old_pos):
+                continue
+            if (p["x"] < -30 or p["x"] > WIDTH + 30
+                    or p["y"] < -30 or p["y"] > HEIGHT + 30):
+                self.projectiles.remove(p)
 
         # Check loss
         if self.chain and self._visual_distance(self.chain[0]) >= self.path_length:
@@ -329,20 +346,6 @@ class Zuma(BaseGame):
                 self.state = "won"
                 self.invalidate_overlay_leaderboard()
             return
-
-        # Move projectiles and check collisions
-        for p in list(self.projectiles):
-            old_pos = (p["x"], p["y"])
-            p["x"] += p["vx"] * dt
-            p["y"] += p["vy"] * dt
-            # Segment collision prevents a projectile from tunnelling through
-            # a ball when a slow frame moves it farther than one diameter.
-            if self._check_projectile_hit(p, old_pos):
-                continue
-            if (p["x"] < -30 or p["x"] > WIDTH + 30
-                    or p["y"] < -30 or p["y"] > HEIGHT + 30):
-                self.projectiles.remove(p)
-                continue
 
     def _spawn_chain_ball(self):
         # New balls always queue at the fixed entrance. They are admitted by
@@ -382,25 +385,37 @@ class Zuma(BaseGame):
             previous = visual
 
     def _update_pending_chain_match(self, dt: float) -> None:
-        """Resolve a chain reaction only after both groups visibly meet."""
-        pending = self.pending_chain_match
-        if not pending:
+        """Resolve every due reaction after its boundary groups meet."""
+        if not self.pending_chain_matches:
             return
-        pending["timer"] -= dt
-        if pending["timer"] > 0.0:
-            return
-        self.pending_chain_match = None
-        left = next((i for i, ball in enumerate(self.chain)
-                     if ball is pending["left"]), None)
-        right = next((i for i, ball in enumerate(self.chain)
-                      if ball is pending["right"]), None)
-        if (left is None or right != left + 1
-                or self.chain[left]["color"] != self.chain[right]["color"]):
-            return
-        depth = pending["depth"]
-        if self._try_match_at(left, reaction_depth=depth):
-            self.chain_banner_depth = depth + 1
-            self.chain_banner_timer = 0.8
+        due = []
+        waiting = []
+        for pending in self.pending_chain_matches:
+            pending["timer"] -= dt
+            (due if pending["timer"] <= 0.0 else waiting).append(pending)
+        # Install the waiting list before resolving due entries because a
+        # successful recursive clear can enqueue another reaction.
+        self.pending_chain_matches = waiting
+        for pending in due:
+            left = next((i for i, ball in enumerate(self.chain)
+                         if ball is pending["left"]), None)
+            right = next((i for i, ball in enumerate(self.chain)
+                          if ball is pending["right"]), None)
+            if (left is None or right != left + 1
+                    or self.chain[left]["color"]
+                    != self.chain[right]["color"]):
+                continue
+            depth = pending["depth"]
+            if self._try_match_at(left, reaction_depth=depth):
+                self.chain_banner_depth = max(self.chain_banner_depth,
+                                              depth + 1)
+                self.chain_banner_timer = 0.8
+
+    @property
+    def pending_chain_match(self):
+        """Compatibility view for callers interested in any pending match."""
+        return (self.pending_chain_matches[0]
+                if self.pending_chain_matches else None)
 
     def _update_match_particles(self, dt: float) -> None:
         for particle in list(self.match_particles):
@@ -528,15 +543,13 @@ class Zuma(BaseGame):
                 ball["pos"] -= collapse
                 ball["visual_offset"] = (
                     ball.get("visual_offset", 0.0) + collapse)
-            self.pending_chain_match = {
+            self.pending_chain_matches.append({
                 "left": left_boundary,
                 "right": right_boundary,
                 "depth": reaction_depth + 1,
                 "timer": max(CHAIN_REACTION_DELAY,
                              collapse / CHAIN_ANIM_SPEED),
-            }
-        else:
-            self.pending_chain_match = None
+            })
         del self.chain[lo:hi + 1]
         self._sync_shooter_colors()
         return True
