@@ -88,3 +88,5 @@
 - CI #14 显示延长等待后 macOS 的 Flask 开发服务器仍停在绑定前，说明问题不是普通冷启动。
   CI HTTP 往返现改由进程内 Werkzeug server 提供：端口在同步绑定时由系统分配，不再有
   “探测空闲端口—关闭—子进程重绑”的竞态；健康检查、真实 HTTP 请求和关闭回收仍完整执行。
+- CI #15 全部通过：Ubuntu、macOS、Windows 的 storage、stress、gameplay，Python 3.12/3.13
+  兼容任务及 core-only 安装任务均成功。
