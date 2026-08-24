@@ -11,6 +11,7 @@ import tempfile
 import time
 import unittest
 from concurrent.futures import Future
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -504,7 +505,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
     def test_failed_schema_migration_rolls_back_schema_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "v1.db"
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute(
                     "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT)")
                 connection.execute(
@@ -526,7 +527,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
 
             with self.assertRaisesRegex(RuntimeError, "injected"):
                 FailingMigration(database)
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 columns = {row[1] for row in
                            connection.execute("PRAGMA table_info(attempts)")}
                 version = connection.execute(
@@ -538,7 +539,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             legacy = root / "legacy.db"
-            with sqlite3.connect(legacy) as connection:
+            with closing(sqlite3.connect(legacy)) as connection, connection:
                 connection.execute(
                     "CREATE TABLE scores (id INTEGER PRIMARY KEY, game_id TEXT)")
             store = LocalGameStore(root / "games.db", legacy_db_path=legacy)
@@ -550,7 +551,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             legacy = root / "legacy.db"
-            with sqlite3.connect(legacy) as connection:
+            with closing(sqlite3.connect(legacy)) as connection, connection:
                 connection.execute(
                     "CREATE TABLE scores (id INTEGER PRIMARY KEY, game_id TEXT, "
                     "player TEXT, score, extra TEXT, created_at REAL)")
@@ -566,7 +567,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             legacy = root / "legacy.db"
-            with sqlite3.connect(legacy) as connection:
+            with closing(sqlite3.connect(legacy)) as connection, connection:
                 connection.execute(
                     "CREATE TABLE scores (id INTEGER PRIMARY KEY, game_id TEXT, "
                     "player TEXT, score, extra TEXT, created_at REAL)")
@@ -595,7 +596,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "games.db"
             LocalGameStore(database)
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute("DROP INDEX idx_attempts_best")
             repaired = LocalGameStore(database)
             self.assertIsNotNone(repaired.migration_backup)
@@ -609,7 +610,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             legacy = root / "legacy.db"
-            with sqlite3.connect(legacy) as connection:
+            with closing(sqlite3.connect(legacy)) as connection, connection:
                 connection.execute(
                     "CREATE TABLE scores (id INTEGER PRIMARY KEY, game_id TEXT, "
                     "player TEXT, score, extra TEXT, created_at REAL)")
@@ -617,7 +618,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
                     "INSERT INTO scores VALUES (1,'zuma','old',10,NULL,1.0)")
             database = root / "games.db"
             LocalGameStore(database, legacy_db_path=legacy)
-            with sqlite3.connect(legacy) as connection:
+            with closing(sqlite3.connect(legacy)) as connection, connection:
                 connection.execute(
                     "INSERT INTO scores VALUES (2,'zuma','new',20,NULL,2.0)")
             reopened = LocalGameStore(database, legacy_db_path=legacy)
@@ -638,7 +639,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
                        root / "second" / "legacy.db"]
             for index, source in enumerate(sources, start=1):
                 source.parent.mkdir()
-                with sqlite3.connect(source) as connection:
+                with closing(sqlite3.connect(source)) as connection, connection:
                     connection.execute(
                         "CREATE TABLE scores (id INTEGER PRIMARY KEY, "
                         "game_id TEXT, player TEXT, score, extra TEXT, "
@@ -658,7 +659,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "games.db"
             LocalGameStore(database)
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.execute(
                     "DROP INDEX idx_save_requests_request_id")
             repaired = LocalGameStore(database)

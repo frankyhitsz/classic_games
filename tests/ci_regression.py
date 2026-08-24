@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def workflow_error(title: str, detail: str) -> None:
     """Expose a useful summary even when job logs require authentication."""
+    detail = detail[:3000]
     escaped = (detail.replace("%", "%25").replace("\r", "%0D")
                .replace("\n", "%0A"))
     print(f"::error title={title}::{escaped}")
@@ -85,8 +86,15 @@ def main() -> int:
                     failures = [line.strip() for line in lines
                                 if "FAIL:" in line]
                     detail = "\n".join(
-                        failures + ["", *lines[-16:]])
+                        failures[:8] + ["", *lines[-12:]])
                     workflow_error("Gameplay regression failures", detail)
+                    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+                    if summary_path:
+                        with Path(summary_path).open(
+                                "a", encoding="utf-8") as summary:
+                            summary.write(
+                                "## Gameplay regression failures\n\n```text\n"
+                                f"{detail[:6000]}\n```\n")
                 return result.returncode
             finally:
                 server.terminate()

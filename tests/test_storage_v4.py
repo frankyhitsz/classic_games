@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -212,7 +213,7 @@ class PendingParserTests(unittest.TestCase):
 class MigrationAndRepositoryTests(unittest.TestCase):
     @staticmethod
     def _legacy(path: Path) -> None:
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection, connection:
             connection.execute(
                 "CREATE TABLE scores(id INTEGER, game_id TEXT, player TEXT, "
                 "score INTEGER, extra TEXT, created_at REAL)")

@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from textwrap import dedent
 
@@ -24,6 +25,7 @@ def run(name: str, body: str) -> None:
     global PASS, FAIL
     src = dedent(body).strip()
     full = "import sys; sys.path.insert(0, %r)\n" % str(ROOT) + src
+    started = time.perf_counter()
     try:
         proc = subprocess.run(
             [sys.executable, "-c", full], env=ENV, capture_output=True,
@@ -36,10 +38,12 @@ def run(name: str, body: str) -> None:
         return
     if proc.returncode == 0:
         PASS += 1
-        print(f"  PASS: {name}")
+        elapsed = time.perf_counter() - started
+        print(f"  PASS: {name} ({elapsed:.3f}s)")
     else:
         FAIL += 1
-        print(f"  FAIL: {name} (exit={proc.returncode})")
+        elapsed = time.perf_counter() - started
+        print(f"  FAIL: {name} (exit={proc.returncode}, {elapsed:.3f}s)")
         if proc.stderr:
             for line in proc.stderr.strip().splitlines()[-8:]:
                 print(f"        {line}")
@@ -2224,7 +2228,7 @@ run("tetris-held-input-and-gravity", """
 # ===========================================================================
 print("\n=== 83. Flask import is side-effect free and its factory contract is strict ===")
 run("backend-app-factory-and-strict-contract", """
-    import os, sqlite3, subprocess, sys, tempfile
+    import contextlib, os, sqlite3, subprocess, sys, tempfile
     with tempfile.TemporaryDirectory() as temp_dir:
         env = os.environ.copy(); env['GAMES_DB'] = os.path.join(temp_dir, 'fresh.db')
         code = ("from server.app import create_app\\n"
@@ -2239,7 +2243,7 @@ run("backend-app-factory-and-strict-contract", """
     # Importing the module must not migrate or otherwise change an old DB.
     with tempfile.TemporaryDirectory() as temp_dir:
         old_db = os.path.join(temp_dir, 'old.db')
-        with sqlite3.connect(old_db) as conn:
+        with contextlib.closing(sqlite3.connect(old_db)) as conn, conn:
             conn.execute('CREATE TABLE scores (id INTEGER PRIMARY KEY, '
                          'game_id TEXT, player TEXT, score INTEGER, '
                          'extra TEXT, created_at REAL)')
@@ -2711,7 +2715,7 @@ run("sokoban-confirmed-total-requires-ack", """
 # ===========================================================================
 print("\n=== 96. Local scores persist without Flask and recover an outbox ===")
 run("local-store-persists-and-recovers-outbox", """
-    import os, sqlite3, subprocess, sys, tempfile
+    import contextlib, os, sqlite3, subprocess, sys, tempfile
     from pathlib import Path
     from game_service.local_backend import LocalBackendClient
     from game_service.store import LocalGameStore
@@ -2777,7 +2781,7 @@ run("local-store-persists-and-recovers-outbox", """
         assert result.returncode == 0, result.stderr
 
         legacy=root/'legacy.db'; migrated=root/'migrated.db'
-        with sqlite3.connect(legacy) as conn:
+        with contextlib.closing(sqlite3.connect(legacy)) as conn, conn:
             conn.execute('CREATE TABLE scores (id INTEGER PRIMARY KEY, '
                          'game_id TEXT, player TEXT, score INTEGER, '
                          'extra TEXT, created_at REAL)')
@@ -2793,7 +2797,7 @@ run("local-store-persists-and-recovers-outbox", """
         assert legacy.read_bytes() == legacy_before
 
         embedded=root/'embedded-legacy.db'
-        with sqlite3.connect(embedded) as conn:
+        with contextlib.closing(sqlite3.connect(embedded)) as conn, conn:
             conn.execute('CREATE TABLE scores (id INTEGER PRIMARY KEY, '
                          'game_id TEXT, player TEXT, score INTEGER, '
                          'extra TEXT, created_at REAL)')
@@ -2826,7 +2830,7 @@ run("local-store-persists-and-recovers-outbox", """
         degraded.close()
 
         future_db=root/'future.db'
-        with sqlite3.connect(future_db) as conn:
+        with contextlib.closing(sqlite3.connect(future_db)) as conn, conn:
             conn.execute('CREATE TABLE schema_meta '
                          '(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
             conn.execute("INSERT INTO schema_meta VALUES ('version','999')")

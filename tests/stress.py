@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
@@ -227,7 +228,7 @@ def storage_stress(root: Path) -> None:
         results = list(pool.map(write, range(240)))
     assert all(result["ok"] for result in results)
     assert store.attempt_count() == 240
-    with sqlite3.connect(root / "concurrent.db") as conn:
+    with closing(sqlite3.connect(root / "concurrent.db")) as conn:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     print("concurrent-writes: 240, integrity_check=ok")
 

@@ -64,3 +64,7 @@
   Windows 子进程完成预算由 2 秒调至 10 秒，storage 输出也始终进入 artifact。
 - CI #7 仍复现两处失败，而匿名访问不能下载 artifact。runner 现把 gameplay 的失败测试名和
   storage traceback 尾部直接写成 GitHub annotation，确保公开摘要即可定位真实根因。
+- CI #8 的公开 traceback 确认 Windows 失败来自测试 fixture：`sqlite3.Connection` 的上下文
+  只提交事务，并不会关闭文件句柄。所有临时数据库 fixture 和 stress 检查现显式关闭连接，
+  90 项存储测试重跑通过。gameplay 失败摘要同时限制长度并写入 job summary，单项耗时也随
+  结果输出，便于继续核对 macOS runner 上的唯一失败。
