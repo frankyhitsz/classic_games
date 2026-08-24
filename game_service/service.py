@@ -28,6 +28,7 @@ class StorageErrorKind(str, Enum):
 class SaveState(str, Enum):
     SAVING = "saving"
     COMMITTED = "committed"
+    SUPERSEDED = "superseded"
     DURABLE_PENDING = "durable_pending"
     NON_DURABLE_PENDING = "non_durable_pending"
     RECOVERY_REQUIRED = "recovery_required"
@@ -127,6 +128,18 @@ class StorageStatus:
     error_code: Optional[str] = None
     retryable: bool = False
     recovery_notice: Optional[str] = None
+    score_outbox_writable: Optional[bool] = None
+    state_outbox_writable: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        # Keep the original aggregate field for older callers while exposing
+        # the two durability channels independently.
+        if self.score_outbox_writable is None:
+            object.__setattr__(
+                self, "score_outbox_writable", self.outbox_writable)
+        if self.state_outbox_writable is None:
+            object.__setattr__(
+                self, "state_outbox_writable", self.outbox_writable)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -161,6 +174,7 @@ class GameDataService(Protocol):
 
     is_local: bool
     pending_saves_are_durable: bool
+    capabilities: frozenset[str]
 
     def health_async(self): ...
 

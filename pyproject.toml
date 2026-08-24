@@ -20,7 +20,6 @@ api = [
 dev = [
     "flask>=3.0",
     "requests>=2.31",
-    "pytest>=8.0",
     "coverage>=7.6",
     "ruff>=0.6",
 ]

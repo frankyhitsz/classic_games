@@ -1,61 +1,61 @@
-# 第八次审查修复规格
+# 第九次审查修复规格
 
 ## 目标
 
-核对第八次审查提出的本机状态一致性问题，使多进程 profile、setting、progress 和 save-slot
-写入具有确定顺序、可恢复的最终状态和可见故障；2048 在不能确认自动存档读取结果时不得
-静默开始或覆盖旧槽。
+核对第九次审查提出的状态并发、启动档案、2048 自动存档和工程门禁问题。状态日志与 SQLite
+必须共享同一套胜出顺序；读取、重放或进程时钟回拨都不能让旧值覆盖已经提交的新值。
 
 ## 范围
 
-- state journal schema v2：每个语义 key 使用 OS 文件锁、logical revision、hash CAS、显式
-  ruleset、目录 fsync、隔离通知和有界扫描；
-- journal 与 SQLite 同时失败时保留按 key 最新的内存 operation，退出前按持久性提示；
-- Sokoban/Zuma progress 使用各自字段 schema 和单调合并，UI 以 generation 拒绝晚到 read；
-- profile startup/save/list 和 queued launch 使用 generation 与预期 profile token；默认 guest 与
-  legacy anonymous 使用同一稳定身份；
-- SQLite current-schema 检查状态表 PK/UNIQUE 与外键完整性；profile 归一化碰撞合并子状态并
-  在 `invalid_local_state` 留证；正常读取不取写锁；
-- 2048 使用 typed slot load、超时/重试/二次确认门禁、语义坏槽隔离和 slot schema v3；稳定
-  attempt UUID 替代持久化 SQLite row ID；
-- 本机状态通过 `LocalStateEvent` 报告最终结果，成绩 committed 状态可从 durable receipt 重建；
-- CI 设置并发取消、job 超时并执行第八轮故障与迁移用例。
+- SQLite schema v6 增加 `state_receipts`，状态值与胜出 revision、operation ID、payload hash、
+  occurred time 在同一事务提交；单调 progress merge 另存 operation receipt，保证晚到增量只合并一次；
+- 跨进程持久逻辑时钟在后台写线程分配，旧 operation 返回 `SUPERSEDED`，重复 operation 为
+  不修改业务行的幂等重放；
+- 状态查询只读内存快照，journal 和 receipt 重建转移到 read worker，并提供按 key 直接读取；
+- state journal v1 升级保留原字节、迁移到规范 ruleset key，并使用固定兼容表而非未来 catalog；
+- 启动档案显式区分 loading、load-failed 和 resolved；未解析时只排队游戏，不创建 guest；
+  读取失败可重试，或由用户按 G 明确选择 guest；
+- 2048 校验 won/最大方块、playing/死局和 slot revision；ruleset 不兼容不当作损坏，隔离成功
+  前不显示“已隔离”；profile ensure 与 slot load 使用异步链和同 key 合并，不占用写 worker；
+- score receipt 过期后从 attempt 语义重建，相同请求保持幂等，不同 payload 返回稳定冲突；
+- setting、progress、slot 增加版本、时间、ruleset 等数据库约束；score/state outbox 分别报告健康；
+- gameplay 子进程进入 coverage 汇总，移除未使用的 pytest 依赖。
 
 ## 非目标与约束
 
-- 不改变五款游戏现有 ruleset、计分或关卡内容；
-- 不增加账号、云同步、遥测或公网服务；
-- 不在没有权利来源确认时替仓库所有者选择 LICENSE；
-- 不按文件年龄删除跨进程锁 inode。该做法会让已经打开旧 inode 的 waiter 与新建 inode
-  同时获得“同一 key”的锁；清理必须先设计目录级代际协议；
-- GitHub required checks、签名、公证和安装器需要远端权限或真实平台验收，代码结果不能冒充
-  仓库设置或发行证明。
+- 不改变五款游戏的计分、关卡或 ruleset；
+- 不增加账号、云同步、联网对战、遥测或广告；
+- 不替仓库所有者选择 LICENSE、素材授权声明或商标结论；
+- 同一档案的两个独立 2048 进程仍共享 `autosave` 语义键。schema v6 可阻止旧 revision 回写，
+  但“两个仍活跃的实例如何选择所有者”需要可见的接管/多槽交互，不能静默猜测；
+- GitHub branch protection 是仓库设置。本次验证 workflow 和推送后的实际运行结果，但不把
+  本地文件当作 required-check 已开启的证明。
 
 ## 关键决策
 
-1. state operation 在提交到 worker 前取得 `(logical_revision, operation_id)`；setting/profile/slot
-   使用 last-write ordering，progress 无论到达顺序都做 schema-aware merge。
-2. put、读取重写、隔离与 remove-if-current 使用由 key 摘要确定的同一 OS 锁。锁文件使用稳定
-   inode，文件内容不表示进程存活。
-3. state envelope v1 先核对原 hash，再按当前兼容 catalog 冻结旧 operation 的 ruleset并原子
-   重写为 v2。现有规则升级必须保留旧 catalog 版本，不能让 pending 漂移。
-4. journal publish 成功后 operation 已可安全退出；publish 与数据库都失败时进入内存队列并触发
-   二次确认门禁，后台重试会先恢复 journal 再写库。
-5. profile 迁移碰撞只从有效 JSON 中选值：progress 单调合并，setting 取较新有效值，slot 优先
-   `slot_revision`；损坏和被舍弃原文均进入隔离表。
-6. 2048 slot v3 保存 attempt UUID、attempt revision、slot revision、确认分数和棋盘，不保存
-   SQLite row ID。v2 row ID 只作为废弃字段读取并丢弃。
-7. slot 临时失败、profile pending、超时和语义损坏都保持玩法门禁。只有明确 no-slot 或用户二次
-   确认新开后才能写 autosave。
+1. `(logical_revision, operation_id)` 是状态的全局确定顺序。revision 较大者胜出；相同 revision
+   用 operation ID 确定顺序；相同 operation 与 hash 是幂等重放，hash 不同是冲突。
+2. `apply_state_operation` 在 `BEGIN IMMEDIATE` 内比较 receipt、修改业务表并更新 receipt。旧
+   operation 不触碰 value、version、timestamp 或 profile last-used。
+   `merge_progress` 是例外：旧快照写入仍淘汰，较旧但尚未应用的单调 merge 会合并一次，且不
+   回退胜出 revision。
+3. operation 的发生时间由 journal 保存，重放使用该时间；后台持久时钟只决定顺序，不冒充
+   业务发生时间。
+4. getter 不访问文件或 SQLite。首次无缓存时返回 `None`，后台重建后通过同一状态缓存可见；
+   外部较新 pending 可按 revision 覆盖旧 committed 快照。
+5. v1 ruleset 兼容映射是版本化常量。升级前写入 migration-backup，规范 key 与旧 key 冲突时
+   仍按相同 revision 规则合并。
+6. 档案读取失败不是“没有档案”。只有明确 no-profile 才 ensure 默认 guest；错误状态只能重试
+   或由用户明确选择 guest。
+7. 2048 的坏槽删除是一个需要确认的异步动作。Future 未成功前保持玩法与自动写入门禁。
 
 ## 验收标准
 
-- F01–F26 逐项有代码证据、明确反驳或仍受外部条件约束的状态；
-- 旧 worker 不能删除/覆盖较新 journal；另一进程持同 key lock 时写入必须等待；
-- progress 多实例写入不回退，v1 journal 升级后 ruleset 固定；
-- journal 与数据库同时失败时退出保护生效，恢复后 setting/slot/progress 可读；
-- 临时 slot read 不等于 no-slot；2048 读取超时或损坏时输入和自动写入保持关闭；
-- 改名后的 2048 revision 继续写入同一 attempt，v2 row ID 不进入 v3 slot；
-- 畸形 v5 PK 会备份重建；guest/anonymous 子状态碰撞不静默丢失有效值；
-- 两轮独立复查完成，每轮发现的问题均修复并重新验证；
-- 功能、存储、迁移、压力、Ruff、编译、构建和默认数据库指纹检查通过。
+- F01–F28 逐项给出成立性、代码证据和未完成边界；132 项优化建议逐项标记；
+- setting、profile rename、set-progress 和 slot 的旧 operation 均无法覆盖已提交的新 operation；
+- crash-after-commit 重放不增加版本、不刷新时间；receipt 过期的 score 重试不产生第二条 attempt；
+- 主线程状态 getter 和状态提交入口不等待 journal 文件锁；时钟回拨后 revision 仍递增；
+- v1 原文件有备份并迁入规范 key；历史 state quarantine 重启后仍提示；
+- 启动 load 未完成时不 ensure guest，失败后不静默降级；queued launch 绑定最终档案；
+- 2048 不恢复矛盾 won 状态或死局 playing 状态，隔离文案等待真实确认；
+- 两轮独立复查完成，完整功能、存储、压力、静态检查、编译、coverage 和远端 CI 通过。

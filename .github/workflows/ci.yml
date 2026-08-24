@@ -24,7 +24,7 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e .
-      - run: python -m unittest tests.test_storage_v5 tests.test_storage_v6
+      - run: python -m unittest discover -s tests -p "test_storage*.py"
 
   test:
     strategy:
@@ -71,20 +71,21 @@ jobs:
             python -c 'from pathlib import Path; text=Path("stress-tests.log").read_text(errors="replace"); detail="\n".join(text.splitlines()[-30:]); detail=detail.replace("%","%25").replace("\r","%0D").replace("\n","%0A"); print(f"::error title=Stress test failures::{detail}")'
           fi
           exit ${status}
-      - run: python -m coverage report --fail-under=60
-      - run: python -m coverage xml
       - name: Run gameplay tests
         shell: bash
         run: |
           set -o pipefail
           set +e
-          python -m tests.ci_regression 2>&1 | tee gameplay-tests.log
+          CLASSIC_GAMES_COVERAGE=1 python -m tests.ci_regression 2>&1 | tee gameplay-tests.log
           status=${PIPESTATUS[0]}
           set -e
           if [[ ${status} -ne 0 ]]; then
             python -c 'from pathlib import Path; text=Path("gameplay-tests.log").read_text(errors="replace"); failed=[line.strip() for line in text.splitlines() if "FAIL:" in line]; detail="\n".join(failed[:12] + ["", *text.splitlines()[-16:]]); detail=detail[:4000].replace("%","%25").replace("\r","%0D").replace("\n","%0A"); print(f"::error title=Gameplay test failures::{detail}")'
           fi
           exit ${status}
+      - run: python -m coverage combine --append
+      - run: python -m coverage report --fail-under=60
+      - run: python -m coverage xml
       - uses: actions/upload-artifact@v7
         if: always()
         with:

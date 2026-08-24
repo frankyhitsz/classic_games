@@ -28,6 +28,7 @@ class ProfileController:
         self.generation = 0
         self.profile_id = profile_id
         self.identity_resolved = False
+        self.startup_state = "loading"
         self._operations: dict[str, ProfileOperation] = {}
         self._queued_launch: Optional[ProfileLaunchToken] = None
 
@@ -35,6 +36,7 @@ class ProfileController:
         self.generation += 1
         self.profile_id = profile_id
         self.identity_resolved = True
+        self.startup_state = "resolved"
         self._queued_launch = None
         return self.generation
 
@@ -42,6 +44,28 @@ class ProfileController:
         """Bind the startup placeholder after last-profile has completed."""
         self.profile_id = profile_id
         self.identity_resolved = True
+        self.startup_state = "resolved"
+        token = self._queued_launch
+        if (token is not None and token.generation == self.generation
+                and token.expected_profile_id is None):
+            self._queued_launch = ProfileLaunchToken(
+                token.game_id, token.generation, profile_id)
+
+    def start_load(self) -> None:
+        self.identity_resolved = False
+        self.startup_state = "loading"
+
+    def fail_load(self) -> None:
+        if not self.identity_resolved:
+            self.startup_state = "load_failed"
+
+    @property
+    def startup_loading(self) -> bool:
+        return self.startup_state == "loading"
+
+    @property
+    def startup_load_failed(self) -> bool:
+        return self.startup_state == "load_failed"
 
     def bind(self, kind: str, future, *,
              expected_profile_id: Optional[str] = None,

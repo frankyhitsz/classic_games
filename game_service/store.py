@@ -24,7 +24,7 @@ from .progress import (ProgressPolicyError,
                        validate_progress)
 from .service import StorageStatus
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 # The render thread never waits on this budget. A quarter second gives the
 # optional Flask adapter and direct maintenance callers room to serialize
 # ordinary bursts while still falling back far sooner than the old 5 s wait.
@@ -182,6 +182,28 @@ class LocalGameStore:
                     "kind TEXT NOT NULL, profile_id TEXT, game_id TEXT, "
                     "item_key TEXT, raw_value TEXT NOT NULL, "
                     "reason TEXT NOT NULL, quarantined_at REAL NOT NULL)")
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS state_receipts ("
+                    "semantic_key TEXT PRIMARY KEY, "
+                    "logical_revision INTEGER NOT NULL CHECK(logical_revision>=0), "
+                    "operation_id TEXT NOT NULL CHECK(length(operation_id) BETWEEN 1 AND 128), "
+                    "payload_hash TEXT NOT NULL CHECK(length(payload_hash)=64), "
+                    "method TEXT NOT NULL CHECK(method IN "
+                    "('ensure_profile','set_setting','set_progress',"
+                    "'merge_progress','save_slot')), "
+                    "result_json TEXT NOT NULL, "
+                    "occurred_at REAL NOT NULL "
+                    "CHECK(occurred_at>=0 AND abs(occurred_at)<=1e20), "
+                    "applied_at REAL NOT NULL "
+                    "CHECK(applied_at>=0 AND abs(applied_at)<=1e20))")
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS state_merge_receipts ("
+                    "operation_id TEXT PRIMARY KEY "
+                    "CHECK(length(operation_id) BETWEEN 1 AND 128), "
+                    "semantic_key TEXT NOT NULL, "
+                    "payload_hash TEXT NOT NULL CHECK(length(payload_hash)=64), "
+                    "applied_at REAL NOT NULL "
+                    "CHECK(applied_at>=0 AND abs(applied_at)<=1e20))")
                 self._ensure_v2_columns(conn)
                 self._migrate_attempt_rows(conn)
                 self._migrate_rulesets_v3(conn)
@@ -261,6 +283,12 @@ class LocalGameStore:
         required_invalid_local = {
             "id", "kind", "profile_id", "game_id", "item_key",
             "raw_value", "reason", "quarantined_at"}
+        required_state_receipts = {
+            "semantic_key", "logical_revision", "operation_id",
+            "payload_hash", "method", "result_json", "occurred_at",
+            "applied_at"}
+        required_merge_receipts = {
+            "operation_id", "semantic_key", "payload_hash", "applied_at"}
         with self.connection() as conn:
             if not required_attempts <= self._table_columns(conn, "attempts"):
                 return False
@@ -271,11 +299,20 @@ class LocalGameStore:
             if not required_invalid_local <= self._table_columns(
                     conn, "invalid_local_state"):
                 return False
+            if not required_state_receipts <= self._table_columns(
+                    conn, "state_receipts"):
+                return False
+            if not required_merge_receipts <= self._table_columns(
+                    conn, "state_merge_receipts"):
+                return False
             for table, columns in (
                 ("profiles", required_profiles), ("settings", required_settings),
                 ("progress", required_progress), ("save_slots", required_slots)):
                 if not columns <= self._table_columns(conn, table):
                     return False
+            if any(not self._local_state_table_is_current(conn, table)
+                   for table in ("settings", "progress", "save_slots")):
+                return False
             for table in ("settings", "progress", "save_slots"):
                 foreign_keys = conn.execute(
                     f"PRAGMA foreign_key_list({table})").fetchall()
@@ -516,9 +553,17 @@ class LocalGameStore:
                 (new_id, row["profile_id"]))
             for table in ("settings", "progress", "save_slots"):
                 columns = self._table_columns(conn, table)
-                if ("profile_id" not in columns
-                        or not self._local_state_table_is_current(
-                            conn, table)):
+                required = {
+                    "settings": {"profile_id", "key", "value_json",
+                                 "value_version", "updated_at"},
+                    "progress": {"profile_id", "game_id", "ruleset_version",
+                                 "key", "value_json", "value_version",
+                                 "updated_at"},
+                    "save_slots": {"profile_id", "game_id", "slot_id",
+                                   "state_json", "state_version",
+                                   "ruleset_version", "updated_at"},
+                }[table]
+                if not required <= columns:
                     continue
                 self._merge_profile_child_rows(
                     conn, table, row["profile_id"], new_id)
@@ -673,26 +718,43 @@ class LocalGameStore:
     def _create_local_state_tables(conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS settings ("
-            "profile_id TEXT NOT NULL, key TEXT NOT NULL, "
-            "value_json TEXT NOT NULL, value_version INTEGER NOT NULL DEFAULT 1, "
-            "updated_at REAL NOT NULL, PRIMARY KEY(profile_id, key), "
+            "profile_id TEXT NOT NULL CHECK(length(profile_id)=32 AND "
+            "lower(profile_id) NOT GLOB '*[^0-9a-f]*'), "
+            "key TEXT NOT NULL CHECK(length(key) BETWEEN 1 AND 64), "
+            "value_json TEXT NOT NULL, value_version INTEGER NOT NULL DEFAULT 1 "
+            "CHECK(value_version BETWEEN 1 AND 2147483647), "
+            "updated_at REAL NOT NULL "
+            "CHECK(updated_at>=0 AND abs(updated_at)<=1e20), "
+            "PRIMARY KEY(profile_id, key), "
             "FOREIGN KEY(profile_id) REFERENCES profiles(profile_id) "
             "ON DELETE CASCADE)")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS progress ("
-            "profile_id TEXT NOT NULL, game_id TEXT NOT NULL, "
-            "ruleset_version TEXT NOT NULL, key TEXT NOT NULL, "
-            "value_json TEXT NOT NULL, value_version INTEGER NOT NULL DEFAULT 1, "
-            "updated_at REAL NOT NULL, "
+            "profile_id TEXT NOT NULL CHECK(length(profile_id)=32 AND "
+            "lower(profile_id) NOT GLOB '*[^0-9a-f]*'), "
+            "game_id TEXT NOT NULL CHECK(length(game_id) BETWEEN 1 AND 32), "
+            "ruleset_version TEXT NOT NULL "
+            "CHECK(length(ruleset_version) BETWEEN 1 AND 32), "
+            "key TEXT NOT NULL CHECK(length(key) BETWEEN 1 AND 64), "
+            "value_json TEXT NOT NULL, value_version INTEGER NOT NULL DEFAULT 1 "
+            "CHECK(value_version BETWEEN 1 AND 2147483647), "
+            "updated_at REAL NOT NULL "
+            "CHECK(updated_at>=0 AND abs(updated_at)<=1e20), "
             "PRIMARY KEY(profile_id, game_id, ruleset_version, key), "
             "FOREIGN KEY(profile_id) REFERENCES profiles(profile_id) "
             "ON DELETE CASCADE)")
         conn.execute(
             "CREATE TABLE IF NOT EXISTS save_slots ("
-            "profile_id TEXT NOT NULL, game_id TEXT NOT NULL, "
-            "slot_id TEXT NOT NULL, state_json TEXT NOT NULL, "
-            "state_version INTEGER NOT NULL DEFAULT 1, "
-            "ruleset_version TEXT NOT NULL, updated_at REAL NOT NULL, "
+            "profile_id TEXT NOT NULL CHECK(length(profile_id)=32 AND "
+            "lower(profile_id) NOT GLOB '*[^0-9a-f]*'), "
+            "game_id TEXT NOT NULL CHECK(length(game_id) BETWEEN 1 AND 32), "
+            "slot_id TEXT NOT NULL CHECK(length(slot_id) BETWEEN 1 AND 64), "
+            "state_json TEXT NOT NULL, state_version INTEGER NOT NULL DEFAULT 1 "
+            "CHECK(state_version BETWEEN 1 AND 2147483647), "
+            "ruleset_version TEXT NOT NULL "
+            "CHECK(length(ruleset_version) BETWEEN 1 AND 32), "
+            "updated_at REAL NOT NULL "
+            "CHECK(updated_at>=0 AND abs(updated_at)<=1e20), "
             "PRIMARY KEY(profile_id, game_id, slot_id), "
             "FOREIGN KEY(profile_id) REFERENCES profiles(profile_id) "
             "ON DELETE CASCADE)")
@@ -724,7 +786,16 @@ class LocalGameStore:
             unique and columns == expected_key
             for unique, columns in
             LocalGameStore._table_indexes(conn, table).values())
-        return has_foreign_key and has_unique_key
+        table_sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table,)).fetchone()
+        table_sql = "" if table_sql_row is None else (
+            table_sql_row["sql"] or "").lower().replace(" ", "")
+        version_column = "state_version" if table == "save_slots" else "value_version"
+        has_checks = (
+            f"check({version_column}between1and2147483647)" in table_sql
+            and "check(updated_at>=0andabs(updated_at)<=1e20)" in table_sql)
+        return has_foreign_key and has_unique_key and has_checks
 
     @staticmethod
     def _migration_profile(conn: sqlite3.Connection, raw_profile,
@@ -1047,7 +1118,14 @@ class LocalGameStore:
         return response
 
     def storage_status(self, outbox_writable: bool = True,
-                       recovery_notice: Optional[str] = None) -> StorageStatus:
+                       recovery_notice: Optional[str] = None, *,
+                       score_outbox_writable: Optional[bool] = None,
+                       state_outbox_writable: Optional[bool] = None
+                       ) -> StorageStatus:
+        if score_outbox_writable is None:
+            score_outbox_writable = outbox_writable
+        if state_outbox_writable is None:
+            state_outbox_writable = outbox_writable
         readable = writable = False
         code = None
         try:
@@ -1064,10 +1142,13 @@ class LocalGameStore:
                 writable = True
             except sqlite3.Error:
                 code = "database_unwritable"
+        outbox_writable = score_outbox_writable and state_outbox_writable
         ok = readable and (writable or outbox_writable)
         return StorageStatus(
             ok=ok, readable=readable, writable=writable,
-            outbox_writable=outbox_writable, error_code=code,
+            outbox_writable=outbox_writable,
+            score_outbox_writable=score_outbox_writable,
+            state_outbox_writable=state_outbox_writable, error_code=code,
             retryable=bool(code), recovery_notice=recovery_notice)
 
     @staticmethod
@@ -1155,9 +1236,16 @@ class LocalGameStore:
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             prior = conn.execute(
-                "SELECT payload_hash, response_json FROM save_requests "
+                "SELECT payload_hash, response_json, expires_at "
+                "FROM save_requests "
                 "WHERE request_id=?", (mutation.request_id,),
             ).fetchone()
+            if (prior is not None and prior["expires_at"] is not None
+                    and float(prior["expires_at"]) < now):
+                conn.execute(
+                    "DELETE FROM save_requests WHERE request_id=?",
+                    (mutation.request_id,))
+                prior = None
             if prior is not None:
                 if prior["payload_hash"] != payload_hash:
                     conn.rollback()
@@ -1184,6 +1272,60 @@ class LocalGameStore:
                     response["duplicate_request"] = True
                     conn.commit()
                     return response
+
+            # The bounded receipt cache may expire before a delayed retry.
+            # request_id is also unique on attempts, so consult the
+            # authoritative row before attempting a new INSERT.
+            request_attempt = conn.execute(
+                "SELECT * FROM attempts WHERE request_id=?",
+                (mutation.request_id,)).fetchone()
+            if request_attempt is not None:
+                same_request = all((
+                    request_attempt["attempt_uuid"] == mutation.attempt_uuid,
+                    request_attempt["profile_id"] == mutation.profile_id,
+                    request_attempt["game_id"] == mutation.game_id,
+                    request_attempt["mode"] == mutation.mode,
+                    request_attempt["ruleset_version"]
+                    == mutation.ruleset_version,
+                    request_attempt["status"] == mutation.status,
+                    int(request_attempt["revision"]) == mutation.revision,
+                    int(request_attempt["score"]) == mutation.score,
+                    request_attempt["extra_json"] == mutation.extra_json,
+                ))
+                if not same_request:
+                    conn.rollback()
+                    raise StoreError(
+                        "request_id_conflict",
+                        "request_id was already used for another score", 409)
+                best = self._personal_best(conn, mutation)
+                rank = self._personal_best_rank(conn, mutation, best)
+                response = {
+                    "ok": True, "id": int(request_attempt["id"]),
+                    "attempt_uuid": request_attempt["attempt_uuid"],
+                    "revision": int(request_attempt["revision"]),
+                    "status": request_attempt["status"],
+                    "request_id": mutation.request_id,
+                    "rank": rank, "personal_best_rank": rank,
+                    "score": int(request_attempt["score"]),
+                    "attempt_recorded": True,
+                    "new_personal_best": False,
+                    "personal_best": best or 0,
+                    "updated": False, "no_op": True,
+                    "stale_revision": False, "preserved": False,
+                    "replaced": 0, "duplicate_request": True,
+                    "receipt_rebuilt": True,
+                    "clock_adjusted": clock_adjusted,
+                }
+                conn.execute(
+                    "INSERT INTO save_requests(request_id,payload_hash,"
+                    "attempt_uuid,revision,response_json,created_at,expires_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (mutation.request_id, payload_hash,
+                     mutation.attempt_uuid, mutation.revision,
+                     canonical_json(response), now,
+                     now + RECEIPT_RETENTION_DAYS * 86400))
+                conn.commit()
+                return response
 
             conn.execute(
                 "INSERT INTO profiles(profile_id, display_name, created_at, "
@@ -1555,6 +1697,326 @@ class LocalGameStore:
         except ProfileIdentityError as exc:
             raise StoreError("invalid_profile_id", str(exc)) from exc
 
+    @staticmethod
+    def _state_operation_hash(operation: dict) -> str:
+        semantic = {
+            key: value for key, value in operation.items()
+            if key != "payload_hash"
+        }
+        try:
+            encoded = canonical_json(semantic).encode("utf-8")
+        except MutationError as exc:
+            raise StoreError.from_mutation(exc) from exc
+        return hashlib.sha256(encoded).hexdigest()
+
+    @classmethod
+    def _validate_state_operation(cls, operation: dict) -> tuple:
+        if not isinstance(operation, dict):
+            raise StoreError(
+                "invalid_state_operation", "local state operation is invalid")
+        method = operation.get("method")
+        args = operation.get("args")
+        key = operation.get("key")
+        revision = operation.get("logical_revision")
+        operation_id = operation.get("operation_id")
+        payload_hash = operation.get("payload_hash")
+        occurred_at = operation.get("updated_at")
+        if (method not in {"ensure_profile", "set_setting", "set_progress",
+                           "merge_progress", "save_slot"}
+                or not isinstance(args, list)
+                or not isinstance(key, str) or not key
+                or type(revision) is not int
+                or not 0 <= revision <= (1 << 63) - 1
+                or not isinstance(operation_id, str)
+                or not 1 <= len(operation_id) <= 128
+                or not isinstance(payload_hash, str) or len(payload_hash) != 64
+                or type(occurred_at) not in (int, float)
+                or not math.isfinite(float(occurred_at))
+                or float(occurred_at) < 0
+                or abs(float(occurred_at)) > 1e20):
+            raise StoreError(
+                "invalid_state_operation", "local state operation is invalid")
+        if payload_hash != cls._state_operation_hash(operation):
+            raise StoreError(
+                "state_operation_hash_mismatch",
+                "local state operation was modified")
+        try:
+            if method == "ensure_profile" and len(args) == 2:
+                expected = f"profile:{args[1]}"
+            elif method == "set_setting" and len(args) == 3:
+                expected = f"setting:{args[0]}:{args[1]}"
+            elif method in {"set_progress", "merge_progress"} and len(args) == 5:
+                expected = f"progress:{args[0]}:{args[1]}:{args[4]}:{args[2]}"
+            elif method == "save_slot" and len(args) == 5:
+                expected = f"slot:{args[0]}:{args[1]}:{args[2]}"
+            else:
+                raise ValueError
+        except (IndexError, TypeError, ValueError) as exc:
+            raise StoreError(
+                "invalid_state_operation", "local state arguments are invalid") from exc
+        if key != expected:
+            raise StoreError(
+                "state_key_conflict", "local state key does not match its payload")
+        return (method, args, key, revision, operation_id, payload_hash,
+                float(occurred_at))
+
+    @staticmethod
+    def _decode_state_result(raw: str) -> dict:
+        try:
+            result = json.loads(raw, parse_constant=_reject_json_constant)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise StoreError(
+                "state_receipt_corrupt", "local state receipt is invalid") from exc
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise StoreError(
+                "state_receipt_corrupt", "local state receipt is invalid")
+        return result
+
+    def get_state_receipt(self, semantic_key: str) -> Optional[dict]:
+        if not isinstance(semantic_key, str) or not semantic_key:
+            raise StoreError("invalid_state_key", "local state key is invalid")
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM state_receipts WHERE semantic_key=?",
+                (semantic_key,)).fetchone()
+        if row is None:
+            return None
+        result = self._decode_state_result(row["result_json"])
+        return {
+            **result,
+            "semantic_key": row["semantic_key"],
+            "logical_revision": int(row["logical_revision"]),
+            "operation_id": row["operation_id"],
+            "payload_hash": row["payload_hash"],
+            "method": row["method"],
+            "occurred_at": row["occurred_at"],
+            "applied_at": row["applied_at"],
+        }
+
+    def apply_state_operation(self, operation: dict) -> dict:
+        """Apply a journaled state mutation and its ordering receipt atomically."""
+        (method, args, key, revision, operation_id, payload_hash,
+         occurred_at) = self._validate_state_operation(operation)
+        now = time.time()
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            merge_receipt = None
+            if method == "merge_progress":
+                merge_receipt = conn.execute(
+                    "SELECT semantic_key,payload_hash FROM "
+                    "state_merge_receipts WHERE operation_id=?",
+                    (operation_id,)).fetchone()
+                if merge_receipt is not None:
+                    if (merge_receipt["semantic_key"] != key
+                            or merge_receipt["payload_hash"] != payload_hash):
+                        conn.rollback()
+                        raise StoreError(
+                            "state_operation_conflict",
+                            "operation_id was already used for another state",
+                            409)
+                    conn.commit()
+                    return {
+                        "ok": True, "duplicate_operation": True,
+                        "state_apply": "duplicate",
+                        "semantic_key": key,
+                        "logical_revision": revision,
+                        "operation_id": operation_id,
+                    }
+            prior = conn.execute(
+                "SELECT * FROM state_receipts WHERE semantic_key=?", (key,)
+            ).fetchone()
+            merge_stale = False
+            if prior is not None:
+                prior_order = (
+                    int(prior["logical_revision"]), prior["operation_id"])
+                incoming_order = (revision, operation_id)
+                if incoming_order == prior_order:
+                    if prior["payload_hash"] != payload_hash:
+                        conn.rollback()
+                        raise StoreError(
+                            "state_operation_conflict",
+                            "operation_id was already used for another state",
+                            409)
+                    result = self._decode_state_result(prior["result_json"])
+                    if method == "merge_progress":
+                        conn.execute(
+                            "INSERT OR IGNORE INTO state_merge_receipts "
+                            "(operation_id,semantic_key,payload_hash,applied_at) "
+                            "VALUES(?,?,?,?)",
+                            (operation_id, key, payload_hash, now))
+                    conn.commit()
+                    return {**result, "duplicate_operation": True,
+                            "state_apply": "duplicate"}
+                if incoming_order < prior_order:
+                    if method == "merge_progress":
+                        merge_stale = True
+                    else:
+                        conn.commit()
+                        return {
+                            "ok": True, "superseded": True,
+                            "state_apply": "superseded",
+                            "logical_revision": revision,
+                            "operation_id": operation_id,
+                            "winning_logical_revision": prior_order[0],
+                            "winning_operation_id": prior_order[1],
+                        }
+
+            result: dict
+            if method == "ensure_profile":
+                display_name, profile_id = args
+                try:
+                    display_name = ProfileIdentity.normalize_display_name(
+                        display_name)
+                except ProfileIdentityError as exc:
+                    conn.rollback()
+                    raise StoreError("invalid_display_name", str(exc)) from exc
+                profile_id = self._profile_uuid(profile_id)
+                conn.execute(
+                    "INSERT INTO profiles(profile_id, display_name, created_at, "
+                    "last_used) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(profile_id) DO UPDATE SET "
+                    "display_name=excluded.display_name, "
+                    "last_used=MAX(profiles.last_used, excluded.last_used)",
+                    (profile_id, display_name, occurred_at, occurred_at))
+                result = {
+                    "ok": True, "profile_id": profile_id,
+                    "display_name": display_name, "last_used": occurred_at}
+            elif method == "set_setting":
+                profile_id = self._profile_uuid(args[0])
+                setting_key = self._query_identifier(
+                    args[1], "setting_key", 64)
+                encoded = self._encoded_value(args[2])
+                self._require_profile(conn, profile_id)
+                conn.execute(
+                    "INSERT INTO settings(profile_id,key,value_json,"
+                    "value_version,updated_at) VALUES(?,?,?,1,?) "
+                    "ON CONFLICT(profile_id,key) DO UPDATE SET "
+                    "value_json=excluded.value_json, "
+                    "value_version=settings.value_version+1, "
+                    "updated_at=excluded.updated_at",
+                    (profile_id, setting_key, encoded, occurred_at))
+                result = {"ok": True}
+            elif method in {"set_progress", "merge_progress"}:
+                profile_id = self._profile_uuid(args[0])
+                game_id = args[1]
+                if game_id not in VALID_GAME_IDS:
+                    conn.rollback()
+                    raise StoreError(
+                        "unknown_game", f"unknown game_id: {game_id}", 404)
+                progress_key = self._query_identifier(
+                    args[2], "progress_key", 64)
+                ruleset = self._query_identifier(
+                    args[4], "ruleset_version", 32)
+                try:
+                    incoming = validate_progress(game_id, progress_key, args[3])
+                except ProgressPolicyError as exc:
+                    conn.rollback()
+                    raise StoreError("invalid_progress", str(exc)) from exc
+                self._require_profile(conn, profile_id)
+                row = conn.execute(
+                    "SELECT value_json,value_version,updated_at FROM progress WHERE "
+                    "profile_id=? AND game_id=? AND ruleset_version=? AND key=?",
+                    (profile_id, game_id, ruleset, progress_key)).fetchone()
+                value = incoming
+                version = 1
+                progress_updated_at = occurred_at
+                if row is not None:
+                    version = int(row["value_version"]) + 1
+                    if method == "merge_progress":
+                        progress_updated_at = max(
+                            occurred_at, float(row["updated_at"]))
+                        try:
+                            existing = json.loads(
+                                row["value_json"],
+                                parse_constant=_reject_json_constant)
+                            value = merge_progress_values(
+                                game_id, progress_key, existing, incoming)
+                        except (TypeError, ValueError, json.JSONDecodeError,
+                                ProgressPolicyError) as exc:
+                            conn.rollback()
+                            raise StoreError(
+                                "invalid_progress",
+                                "stored progress cannot be merged") from exc
+                encoded = self._encoded_value(value)
+                conn.execute(
+                    "INSERT INTO progress(profile_id,game_id,ruleset_version,"
+                    "key,value_json,value_version,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_id,game_id,"
+                    "ruleset_version,key) DO UPDATE SET "
+                    "value_json=excluded.value_json, "
+                    "value_version=excluded.value_version, "
+                    "updated_at=excluded.updated_at",
+                    (profile_id, game_id, ruleset, progress_key, encoded,
+                     version, progress_updated_at))
+                result = {"ok": True, "value": value}
+            else:
+                profile_id = self._profile_uuid(args[0])
+                game_id = args[1]
+                if game_id not in VALID_GAME_IDS:
+                    conn.rollback()
+                    raise StoreError(
+                        "unknown_game", f"unknown game_id: {game_id}", 404)
+                slot_id = self._query_identifier(args[2], "slot_id", 64)
+                state = args[3]
+                encoded = self._encoded_value(state)
+                ruleset = self._query_identifier(
+                    args[4], "ruleset_version", 32)
+                state_version = (
+                    state.get("version", 1) if isinstance(state, dict) else 1)
+                if (type(state_version) is not int
+                        or not 1 <= state_version <= 2147483647):
+                    conn.rollback()
+                    raise StoreError(
+                        "invalid_state_version", "invalid save state version")
+                self._require_profile(conn, profile_id)
+                conn.execute(
+                    "INSERT INTO save_slots(profile_id,game_id,slot_id,"
+                    "state_json,state_version,ruleset_version,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_id,game_id,"
+                    "slot_id) DO UPDATE SET state_json=excluded.state_json, "
+                    "state_version=excluded.state_version, "
+                    "ruleset_version=excluded.ruleset_version, "
+                    "updated_at=excluded.updated_at",
+                    (profile_id, game_id, slot_id, encoded, state_version,
+                     ruleset, occurred_at))
+                result = {"ok": True}
+
+            result.update({
+                "state_apply": (
+                    "merged_stale" if merge_stale else "committed"),
+                "semantic_key": key,
+                "logical_revision": revision,
+                "operation_id": operation_id,
+            })
+            if merge_stale and prior is not None:
+                result.update({
+                    "winning_logical_revision": int(
+                        prior["logical_revision"]),
+                    "winning_operation_id": prior["operation_id"],
+                })
+            result_json = canonical_json(result)
+            if not merge_stale:
+                conn.execute(
+                    "INSERT INTO state_receipts(semantic_key,logical_revision,"
+                    "operation_id,payload_hash,method,result_json,occurred_at,"
+                    "applied_at) VALUES(?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(semantic_key) DO UPDATE SET "
+                    "logical_revision=excluded.logical_revision, "
+                    "operation_id=excluded.operation_id, "
+                    "payload_hash=excluded.payload_hash, method=excluded.method, "
+                    "result_json=excluded.result_json, "
+                    "occurred_at=excluded.occurred_at, "
+                    "applied_at=excluded.applied_at",
+                    (key, revision, operation_id, payload_hash, method,
+                     result_json, occurred_at, now))
+            if method == "merge_progress":
+                conn.execute(
+                    "INSERT INTO state_merge_receipts(operation_id,"
+                    "semantic_key,payload_hash,applied_at) VALUES(?,?,?,?)",
+                    (operation_id, key, payload_hash, now))
+            conn.commit()
+        return result
+
     def ensure_profile(self, display_name: str,
                        profile_id: Optional[str] = None) -> dict:
         try:
@@ -1796,7 +2258,8 @@ class LocalGameStore:
             "ruleset_version", 32)
         state_version = (state.get("version", 1)
                          if isinstance(state, dict) else 1)
-        if type(state_version) is not int or state_version < 1:
+        if (type(state_version) is not int
+                or not 1 <= state_version <= 2147483647):
             raise StoreError("invalid_state_version", "invalid save state version")
         with self.connection() as conn:
             self._require_profile(conn, profile_id)

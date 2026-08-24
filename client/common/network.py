@@ -26,6 +26,7 @@ SCORE_SAVE_RETRY_DELAYS = (0.0, 0.15, 0.40)
 class BackendClient:
     is_local = False
     pending_saves_are_durable = False
+    capabilities = frozenset({"scores", "leaderboards"})
 
     def __init__(self, base_url: str = DEFAULT_BASE, timeout=TIMEOUT):
         self.base_url = base_url.rstrip("/")

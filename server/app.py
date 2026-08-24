@@ -90,6 +90,13 @@ def create_app(config: dict | None = None) -> Flask:
                          "score database is temporarily unavailable", 503,
                          retryable=True)
 
+    @app.errorhandler(sqlite3.IntegrityError)
+    def database_constraint_error(exc):
+        app.logger.warning("database constraint rejected a request: %s", exc)
+        return api_error(
+            "database_constraint", "request conflicts with stored data", 409,
+            retryable=False)
+
     @app.errorhandler(Exception)
     def unexpected_error(exc):
         if isinstance(exc, HTTPException):

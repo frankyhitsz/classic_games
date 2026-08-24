@@ -125,9 +125,12 @@ class StateJournalV2Tests(unittest.TestCase):
             self.assertEqual(entry["schema_version"], 2)
             self.assertEqual(entry["ruleset_version"], ruleset)
             self.assertEqual(entry["args"][4], ruleset)
+            canonical = outbox._target(entry["key"])
+            self.assertFalse(target.exists())
             self.assertEqual(
-                json.loads(target.read_text(encoding="utf-8"))["schema_version"],
-                2)
+                json.loads(canonical.read_text(
+                    encoding="utf-8"))["schema_version"], 2)
+            self.assertTrue(any(outbox.migration_backup_path.iterdir()))
 
     def test_corrupt_state_is_quarantined_with_notice(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -155,7 +158,7 @@ class StateFailureAndLoadTests(unittest.TestCase):
                     backend.state_outbox, "put",
                     side_effect=OSError(errno.ENOSPC, "full")),
                   mock.patch.object(
-                    backend.store, "set_setting", side_effect=full)):
+                    backend.store, "apply_state_operation", side_effect=full)):
                 result = backend.set_setting_async(
                     profile["profile_id"], "volume", 0.4).result(timeout=5)
             self.assertFalse(result["ok"])
@@ -200,6 +203,10 @@ class StateFailureAndLoadTests(unittest.TestCase):
                 attempt_uuid="receipt-rebuild-attempt-0001")
             backend._save_status.clear()
             event = backend.get_save_status(request_id)
+            deadline = time.monotonic() + 2
+            while event is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+                event = backend.get_save_status(request_id)
             self.assertEqual(event.state, SaveState.COMMITTED)
             self.assertEqual(event.result["id"], result["id"])
             backend.close()
@@ -269,6 +276,27 @@ class ProfileAndMigrationV6Tests(unittest.TestCase):
             connection = sqlite3.connect(database)
             try:
                 connection.execute("PRAGMA foreign_keys=OFF")
+                for table in ("settings", "progress", "save_slots"):
+                    connection.execute(f"DROP TABLE {table}")
+                connection.execute(
+                    "CREATE TABLE settings(profile_id TEXT NOT NULL, "
+                    "key TEXT NOT NULL, value_json TEXT NOT NULL, "
+                    "value_version INTEGER NOT NULL, updated_at REAL NOT NULL, "
+                    "PRIMARY KEY(profile_id,key))")
+                connection.execute(
+                    "CREATE TABLE progress(profile_id TEXT NOT NULL, "
+                    "game_id TEXT NOT NULL, ruleset_version TEXT NOT NULL, "
+                    "key TEXT NOT NULL, value_json TEXT NOT NULL, "
+                    "value_version INTEGER NOT NULL, updated_at REAL NOT NULL, "
+                    "PRIMARY KEY(profile_id,game_id,ruleset_version,key))")
+                connection.execute(
+                    "CREATE TABLE save_slots(profile_id TEXT NOT NULL, "
+                    "game_id TEXT NOT NULL, slot_id TEXT NOT NULL, "
+                    "state_json TEXT NOT NULL, state_version INTEGER NOT NULL, "
+                    "ruleset_version TEXT NOT NULL, updated_at REAL NOT NULL, "
+                    "PRIMARY KEY(profile_id,game_id,slot_id))")
+                connection.execute(
+                    "UPDATE schema_meta SET value='5' WHERE key='version'")
                 connection.executemany(
                     "INSERT INTO profiles VALUES(?,?,?,?)",
                     [("guest", "guest", 1.0, 2.0),

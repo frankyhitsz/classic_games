@@ -2,6 +2,14 @@
 
 ## 未发布
 
+- 数据库升级为 schema v6：每个本机状态键在同一事务保存胜出 revision、operation ID 和回执；
+  旧进程不能在新 journal 删除后把旧 setting、档案、进度或存档写回。
+- 状态重放改为幂等操作，保留原发生时间；被较新操作淘汰时报告 `SUPERSEDED`，不再冒充提交成功。
+- 晚到的单调 progress merge 会在独立 operation receipt 保护下合并一次，不丢成就也不重复加版本。
+- state journal 使用后台分配的跨进程持久逻辑时钟；v1 升级保留原字节并迁到固定 ruleset 的规范 key。
+- 启动档案读取未完成时只排队游戏；失败后可重试，或按 G 明确选择 guest，不再静默竞争身份。
+- 2048 补全 won/死局不变量，隔离完成前不显示成功；slot load 不再占用单写 worker。
+- score receipt 过期后从 attempt 语义重建；状态查询不再在 pygame 帧线程读取文件或 SQLite。
 - 本机状态日志升级为 schema 2：同 key 跨进程加锁、按 logical revision 排序、CAS 删除，
   并冻结 ruleset；旧 schema 1 日志可原子升级。
 - 日志与 SQLite 同时不可写时保留最新内存状态，退出前提示；后台补写通过

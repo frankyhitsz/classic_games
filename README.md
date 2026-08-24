@@ -19,6 +19,7 @@ Flask API 作为可选适配器保留。
 中文、日文和韩文输入使用系统输入法的组合文本事件。2048 每次有效移动后自动保存
 当前棋盘；推箱子和祖玛会记录关卡进度。若自动存档读取失败或超时，2048 会保持输入门禁；
 可按 T 重试、按 N 两次确认新开，或按 Esc 返回菜单，不会把读取故障当成空存档。
+若启动器读取最近档案失败，点击游戏会重试读取；也可以按 G 明确改用 guest。
 
 ## 环境要求
 
@@ -139,7 +140,8 @@ classic_games/
 │   ├── test_storage_v2.py
 │   ├── test_storage_v4.py
 │   ├── test_storage_v5.py
-│   └── test_storage_v6.py
+│   ├── test_storage_v6.py
+│   └── test_storage_v7.py
 ├── docs/               # 审查记录、设计决策和维护文档
 ├── pyproject.toml
 ├── environment.yml
@@ -161,9 +163,11 @@ classic_games/
 单个文件上限为 64 KiB，数量或总大小异常时启动器会提示。运行中的启动器也会
 发现其他实例后来写入的待保存文件。
 `pending-state/` 使用每个档案或存档键一个文件的状态日志，保存最新昵称、设置、关卡进度和
-自动存档。schema 2 日志冻结 ruleset，用跨进程文件锁串行同一 key，以 logical revision
-防止晚到旧值覆盖新值；progress 则按游戏规则做单调合并。数据库解除锁定后会自动补写，
-成功后仅在 hash 仍匹配时删除对应日志。损坏的状态文件移入 `pending-state-quarantine/`。
+自动存档。schema 2 日志冻结 ruleset，用跨进程文件锁串行同一 key，以持久 logical revision
+防止晚到旧值覆盖新值；progress 则按游戏规则做单调合并。数据库 schema v6 在同一事务保存
+状态值和胜出回执，因此 journal 已删除后晚到的旧进程也不能回写。数据库解除锁定后会自动
+补写，成功后仅在 hash 仍匹配时删除对应日志。损坏的状态文件移入
+`pending-state-quarantine/`；v1 升级原件保存在 `pending-state-migration-backup/`。
 
 每次新游戏生成一个稳定的 attempt UUID。2048 的里程碑、最终分数和失败重放
 使用同一 UUID 与递增 revision，因此晚到的旧记录不会覆盖最终分数或生成第二局。

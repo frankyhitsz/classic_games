@@ -222,6 +222,7 @@ def main():
     profile_choice_locked = False
     last_profile_async = getattr(backend, "last_profile_async", None)
     if callable(last_profile_async):
+        profile_controller.start_load()
         profile_controller.bind(
             "load", last_profile_async(), match_profile=False)
     profiles_cache: List[dict] = []
@@ -290,6 +291,7 @@ def main():
             except Exception:  # noqa: BLE001
                 saved_profile = None
                 if profile_controller.is_current(profile_operation):
+                    profile_controller.fail_load()
                     profile_error = "本机档案载入失败，暂时不能开始游戏"
             if (profile_controller.is_current(profile_operation)
                     and isinstance(saved_profile, dict)
@@ -445,6 +447,15 @@ def main():
 
     def retry_profile_save() -> None:
         nonlocal profile_error
+        if profile_controller.has_operation("load"):
+            return
+        if profile_controller.startup_load_failed:
+            if callable(last_profile_async):
+                profile_error = None
+                profile_controller.start_load()
+                profile_controller.bind(
+                    "load", last_profile_async(), match_profile=False)
+            return
         if profile_controller.has_operation("save"):
             return
         ensure_profile = getattr(backend, "ensure_profile_async", None)
@@ -453,6 +464,24 @@ def main():
             profile_controller.bind(
                 "save", ensure_profile(
                     player.strip() or "guest", profile_id))
+
+    def use_guest_after_load_failure() -> None:
+        nonlocal player, profile_id, profile_choice_locked
+        nonlocal profile_ready, profile_error
+        if not profile_controller.startup_load_failed:
+            return
+        profile_id = ProfileIdentity.default().profile_id
+        player = ""
+        profile_choice_locked = True
+        profile_ready = False
+        profile_error = None
+        profile_controller.resolve(profile_id)
+        ensure_profile = getattr(backend, "ensure_profile_async", None)
+        if callable(ensure_profile):
+            profile_controller.bind(
+                "save", ensure_profile("guest", profile_id))
+        else:
+            profile_ready = True
 
     def choose_profile(*, create_new: bool = False) -> None:
         nonlocal player, profile_id, profile_choice_locked, profile_ready
@@ -582,6 +611,10 @@ def main():
                     quit_with_unsaved_armed = False
                     quit_with_unsaved_deadline = 0.0
                     continue
+                elif (event.key == pygame.K_g
+                      and profile_controller.startup_load_failed):
+                    use_guest_after_load_failure()
+                    continue
             elif event.type == pygame.TEXTINPUT and editing_player:
                 incoming = "".join(
                     char for char in event.text if char.isprintable())
@@ -685,9 +718,10 @@ def main():
                   (player_input_rect.x + 8, player_input_rect.y + 7),
                   size=14, color=COLORS["text"])
         if not profile_ready:
-            draw_text(screen, "载入中" if profile_error is None else "待重试",
+            draw_text(screen, (
+                "载入中" if profile_error is None else "点游戏重试 · G 用 guest"),
                       (player_input_rect.centerx, player_input_rect.bottom + 9),
-                      size=9, color=(COLORS["text_dim"] if profile_error is None
+                      size=8, color=(COLORS["text_dim"] if profile_error is None
                                      else COLORS["danger"]), center=True)
 
         # ---- Cards / bright toy-box stickers ---------------------------

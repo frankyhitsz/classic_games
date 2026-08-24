@@ -340,11 +340,13 @@ class Game2048(BaseGame):
         # Animations keep progressing in any state — see ``update_overlay``.
         self._poll_slot_load()
         self._poll_slot_save()
+        self._poll_slot_quarantine()
         self._tick_animations(dt)
 
     def update_overlay(self, dt: float) -> None:
         self._poll_slot_load()
         self._poll_slot_save()
+        self._poll_slot_quarantine()
         # A real pause must freeze the in-flight move. Previously the slide
         # finalized behind the pause overlay while tile spawning was skipped
         # because state != "playing", effectively granting a free move.
@@ -527,9 +529,13 @@ class Game2048(BaseGame):
         flat = ([value for row in grid for value in row]
                 if isinstance(grid, list)
                 and all(isinstance(row, list) for row in grid) else [])
-        if (saved.get("ruleset_version")
-                != self.attempt_context.ruleset_version
-                or not isinstance(state, dict) or version not in (1, 2, 3)
+        if saved.get("ruleset_version") != self.attempt_context.ruleset_version:
+            self.slot_load_state = "failed"
+            self.slot_load_error = (
+                "自动存档来自不兼容的规则版本；可返回菜单或确认新开，"
+                "原存档不会被当作损坏数据删除")
+            return
+        if (not isinstance(state, dict) or version not in (1, 2, 3)
                 or type(score) is not int or not 0 <= score <= MAX_SCORE
                 or not isinstance(grid, list) or len(grid) != GRID
                 or any(not isinstance(row, list) or len(row) != GRID
@@ -542,9 +548,22 @@ class Game2048(BaseGame):
                 or not any(flat)
                 or game_state not in {"playing", "won", "gameover"}
                 or (game_state == "won" and not bool(state.get("won")))
-                or (bool(state.get("won")) and max(flat, default=0) < 2048)):
+                or (bool(state.get("won"))
+                    != (max(flat, default=0) >= 2048))):
             self._quarantine_bad_slot("invalid_2048_slot_semantics")
             return
+        if game_state == "playing":
+            movable = any(value == 0 for value in flat)
+            if not movable:
+                movable = any(
+                    grid[row][col] == grid[row][col + 1]
+                    for row in range(GRID) for col in range(GRID - 1))
+            if not movable:
+                movable = any(
+                    grid[row][col] == grid[row + 1][col]
+                    for row in range(GRID - 1) for col in range(GRID))
+            if not movable:
+                game_state = "gameover"
         if game_state == "gameover":
             self.slot_load_state = "ready"
             self.slot_load_error = None
@@ -563,7 +582,8 @@ class Game2048(BaseGame):
                         and (char.isalnum() or char in "-_")
                         for char in attempt_uuid))
             if (not valid_attempt or type(revision) is not int or revision < 0
-                    or type(slot_revision) is not int or slot_revision < 0
+                    or type(slot_revision) is not int
+                    or not 0 <= slot_revision <= (1 << 63) - 1
                     or (confirmed_score is not None
                         and (type(confirmed_score) is not int
                              or not 0 <= confirmed_score <= score))
@@ -612,8 +632,31 @@ class Game2048(BaseGame):
                     self.profile_id, self.game_id, "autosave", reason)
             except Exception:  # noqa: BLE001
                 self._slot_quarantine_future = None
-        self.slot_load_state = "failed"
-        self.slot_load_error = "自动存档内容损坏，原始数据已隔离；可重试或确认新开"
+        if self._slot_quarantine_future is None:
+            self.slot_load_state = "quarantine_failed"
+            self.slot_load_error = (
+                "自动存档内容损坏且未能隔离；不会覆盖原数据，可返回菜单")
+        else:
+            self.slot_load_state = "quarantining"
+            self.slot_load_error = "检测到损坏存档，正在保留原始数据…"
+
+    def _poll_slot_quarantine(self) -> None:
+        future = self._slot_quarantine_future
+        if future is None or not future.done():
+            return
+        self._slot_quarantine_future = None
+        try:
+            quarantined = bool(future.result())
+        except Exception:  # noqa: BLE001
+            quarantined = False
+        if quarantined:
+            self.slot_load_state = "failed"
+            self.slot_load_error = (
+                "自动存档内容损坏，原始数据已隔离；可重试或确认新开")
+        else:
+            self.slot_load_state = "quarantine_failed"
+            self.slot_load_error = (
+                "自动存档内容损坏但隔离未确认；不会覆盖原数据，可返回菜单")
 
     def _submit_score(self, extra=None) -> None:
         # Repeated calls for the same settled score are ignored.  When the
@@ -688,11 +731,12 @@ class Game2048(BaseGame):
                     or (event.type == pygame.KEYDOWN
                         and event.key == pygame.K_ESCAPE)):
                 super().handle_event(event)
-            elif (self.slot_load_state == "failed"
+            elif (self.slot_load_state in {"failed", "quarantine_failed"}
                   and event.type == pygame.KEYDOWN):
                 if event.key == pygame.K_t:
                     self._retry_slot_load()
-                elif event.key == pygame.K_n:
+                elif (event.key == pygame.K_n
+                      and self.slot_load_state == "failed"):
                     self._confirm_new_game_after_load_failure()
             self._swipe_start = None
             self._queued_directions.clear()

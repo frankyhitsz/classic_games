@@ -10,13 +10,20 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from textwrap import dedent
 
 ROOT = Path(__file__).resolve().parent.parent
-ENV = {**os.environ, "SDL_VIDEODRIVER": "dummy", "SDL_AUDIODRIVER": "dummy",
-       "PYTHONPATH": str(ROOT)}
+_inherited_pythonpath = os.environ.get("PYTHONPATH")
+ENV = {
+    **os.environ,
+    "SDL_VIDEODRIVER": "dummy",
+    "SDL_AUDIODRIVER": "dummy",
+    "PYTHONPATH": os.pathsep.join(
+        item for item in (str(ROOT), _inherited_pythonpath) if item),
+}
 PASS, FAIL = 0, 0
 SUBPROCESS_TIMEOUT_SECONDS = 30
 
@@ -26,9 +33,20 @@ def run(name: str, body: str) -> None:
     src = dedent(body).strip()
     full = "import sys; sys.path.insert(0, %r)\n" % str(ROOT) + src
     started = time.perf_counter()
+    command = [sys.executable, "-c", full]
+    script_path = None
+    if ENV.get("CLASSIC_GAMES_COVERAGE") == "1":
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", prefix="classic-games-check-",
+                encoding="utf-8", delete=False) as script:
+            script.write(full)
+            script_path = Path(script.name)
+        command = [
+            sys.executable, "-m", "coverage", "run", "--parallel-mode",
+            "--source=client,game_service,server", str(script_path)]
     try:
         proc = subprocess.run(
-            [sys.executable, "-c", full], env=ENV, capture_output=True,
+            command, env=ENV, capture_output=True,
             text=True, cwd=str(ROOT), timeout=SUBPROCESS_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         FAIL += 1
@@ -36,6 +54,12 @@ def run(name: str, body: str) -> None:
             f"  FAIL: {name} "
             f"(timed out after {SUBPROCESS_TIMEOUT_SECONDS}s)")
         return
+    finally:
+        if script_path is not None:
+            try:
+                script_path.unlink()
+            except FileNotFoundError:
+                pass
     if proc.returncode == 0:
         PASS += 1
         elapsed = time.perf_counter() - started
