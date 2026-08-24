@@ -51,7 +51,14 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          set +e
           python -m coverage run -m unittest discover -s tests -p "test_storage*.py" 2>&1 | tee storage-tests.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ ${status} -ne 0 ]]; then
+            python -c 'from pathlib import Path; text=Path("storage-tests.log").read_text(errors="replace"); detail="\n".join(text.splitlines()[-40:]); detail=detail.replace("%","%25").replace("\r","%0D").replace("\n","%0A"); print(f"::error title=Storage test failures::{detail}")'
+          fi
+          exit ${status}
       - run: python -m coverage run --append -m tests.stress
       - run: python -m coverage report --fail-under=60
       - run: python -m coverage xml

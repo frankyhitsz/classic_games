@@ -62,3 +62,5 @@
 - CI #6 进一步定位到 Windows storage 与 macOS gameplay。启动器速度用例原先只发一次退出，
   在慢 runner 上会与新增的未持久 profile 退出保护混测；现固定使用无 profile 状态的 HTTP stub。
   Windows 子进程完成预算由 2 秒调至 10 秒，storage 输出也始终进入 artifact。
+- CI #7 仍复现两处失败，而匿名访问不能下载 artifact。runner 现把 gameplay 的失败测试名和
+  storage traceback 尾部直接写成 GitHub annotation，确保公开摘要即可定位真实根因。

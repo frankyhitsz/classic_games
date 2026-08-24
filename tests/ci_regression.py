@@ -16,6 +16,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def workflow_error(title: str, detail: str) -> None:
+    """Expose a useful summary even when job logs require authentication."""
+    escaped = (detail.replace("%", "%25").replace("\r", "%0D")
+               .replace("\n", "%0A"))
+    print(f"::error title={title}::{escaped}")
+
+
 def free_port() -> int:
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -73,6 +80,13 @@ def main() -> int:
                 (ROOT / "ci-regression.log").write_text(
                     output, encoding="utf-8")
                 print(output, end="" if output.endswith("\n") else "\n")
+                if result.returncode:
+                    lines = output.splitlines()
+                    failures = [line.strip() for line in lines
+                                if "FAIL:" in line]
+                    detail = "\n".join(
+                        failures + ["", *lines[-16:]])
+                    workflow_error("Gameplay regression failures", detail)
                 return result.returncode
             finally:
                 server.terminate()
