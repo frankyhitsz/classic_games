@@ -39,7 +39,7 @@ class BackendClient:
         self._pending_futures: set[Future] = set()
         self._sessions: set[requests.Session] = set()
         self._failed_score_submissions: list[dict] = []
-        self._confirmed_replace_scores: dict[tuple[str, str], int] = {}
+        self._confirmed_replace_scores: dict[tuple[str, str, str], int] = {}
         self._save_sequence = 0
         self._retrying_request_ids: set[str] = set()
         self._closed = False
@@ -347,32 +347,44 @@ class BackendClient:
             result = None
         row_id, _error = parse_score_response(result)
         with self._lock:
-            profile_key = (payload["game_id"], payload["player"])
             request_id = payload.get(
                 "request_id", f"legacy-save-{save_record['token']:016d}")
             payload["request_id"] = request_id
+            attempt_key = (
+                payload.get("attempt_uuid") or request_id,
+                payload.get("mode") or "classic",
+                payload.get("ruleset_version") or "")
             self._retrying_request_ids.discard(request_id)
             self._failed_score_submissions = [
                 item for item in self._failed_score_submissions
                 if item["payload"]["request_id"] != request_id]
             if row_id is None:
-                confirmed = self._confirmed_replace_scores.get(profile_key)
+                confirmed = self._confirmed_replace_scores.get(attempt_key)
                 superseded = (payload["replace"] and confirmed is not None
                               and confirmed >= payload["score"])
                 if (not superseded
                         and self._score_failure_retryable(result)):
                     self._failed_score_submissions.append(save_record)
             elif payload["replace"]:
-                self._confirmed_replace_scores[profile_key] = max(
+                self._confirmed_replace_scores[attempt_key] = max(
                     payload["score"],
-                    self._confirmed_replace_scores.get(profile_key, -1))
-                confirmed = self._confirmed_replace_scores[profile_key]
+                    self._confirmed_replace_scores.get(attempt_key, -1))
+                confirmed = self._confirmed_replace_scores[attempt_key]
                 self._failed_score_submissions = [
                     item for item in self._failed_score_submissions
                     if not (item["payload"]["replace"]
-                            and (item["payload"]["game_id"],
-                                 item["payload"]["player"]) == profile_key
+                            and ((item["payload"].get("attempt_uuid")
+                                  or item["payload"]["request_id"]),
+                                 item["payload"].get("mode") or "classic",
+                                 item["payload"].get("ruleset_version") or "")
+                            == attempt_key
                             and item["payload"]["score"] <= confirmed)]
+
+    def poll_save_events(self) -> list:
+        return []
+
+    def get_save_status(self, _request_id: str):
+        return None
 
     def failed_save_count(self) -> int:
         with self._lock:

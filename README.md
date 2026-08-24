@@ -14,6 +14,10 @@ Flask API 作为可选适配器保留。
 
 正常游玩不需要启动后端，也不需要网络或端口。
 
+启动器会保存最后使用的本机档案和昵称，显示名可以修改而不会改变档案 UUID。
+中文、日文和韩文输入使用系统输入法的组合文本事件。2048 每次有效移动后自动保存
+当前棋盘；推箱子和祖玛会记录关卡进度。
+
 ## 环境要求
 
 - Python 3.11
@@ -129,7 +133,8 @@ classic_games/
 │   └── app.py         # 可选 Flask 适配器
 ├── tests/
 │   ├── regression.py
-│   └── test_storage_v2.py
+│   ├── test_storage_v2.py
+│   └── test_storage_v4.py
 ├── pyproject.toml
 ├── environment.yml
 ├── requirements.txt
@@ -158,7 +163,9 @@ classic_games/
 当前规则版本为：俄罗斯方块 `tetris-assist-2`、贪吃蛇 `snake-classic-1`、2048
 `2048-classic-2`、推箱子 `sokoban-campaign-2`、祖玛 `zuma-classic-2`。从旧库
 导入的记录标为 `legacy-v1`，保留在历史中，但不参与当前规则的默认最佳成绩。
-目前显示名同时作为本机 profile 标识；家庭成员档案和改名保持同一身份尚未实现。
+本机档案使用独立 UUID，显示名只负责界面展示；旧显示名身份在 schema v4 迁移时
+映射为稳定 UUID。`profiles`、`settings`、`progress` 和 `save_slots` 均保存在同一
+本机数据库中，不需要账号或网络。
 
 数据库 schema 升级或同版本结构修复前会创建唯一备份。幂等请求回执保留 180 天；
 游戏结算历史不会自动删除。旧库缺字段或包含坏行时，新库仍会启动；坏附加信息只会

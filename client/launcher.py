@@ -6,6 +6,7 @@ import importlib
 import os
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import List
 
@@ -183,7 +184,7 @@ def main():
                 "HTTP 调试模式需要安装可选依赖：pip install '.[api]'") from exc
         backend = BackendClient()
     else:
-        backend = LocalBackendClient()
+        backend = LocalBackendClient(defer_initialization=True)
     atexit.register(backend.close)
     # Paint the launcher immediately from local metadata while the localhost
     # health check runs in the background. A stopped backend can otherwise
@@ -209,6 +210,13 @@ def main():
     # the first click now starts a real name instead of appending to the
     # literal string "guest".
     player = ""
+    profile_id = uuid.uuid4().hex
+    profile_future = None
+    profile_save_future = None
+    profile_choice_locked = False
+    last_profile_async = getattr(backend, "last_profile_async", None)
+    if callable(last_profile_async):
+        profile_future = last_profile_async()
 
     # Bottom panels — leaderboard (left, switches on hover) + recent (right).
     panel_y = start_y + card_h + 24
@@ -218,6 +226,7 @@ def main():
                               WIDTH // 2 - 60, panel_h)
 
     editing_player = False
+    player_composition = ""
     player_input_rect = pygame.Rect(WIDTH - 220, 28, 180, 30)
 
     # Per-game leaderboard cache. ``current_lb_game`` is the game whose
@@ -256,8 +265,32 @@ def main():
             recent_future = backend.recent_async(limit=8)
 
     def poll_network() -> None:
+        nonlocal player, profile_id, profile_future, profile_save_future
+        nonlocal profile_choice_locked
         nonlocal online, health_future, recent_cache, recent_ts, recent_future
         nonlocal records_error
+        if profile_future is not None and profile_future.done():
+            try:
+                saved_profile = profile_future.result()
+            except Exception:  # noqa: BLE001
+                saved_profile = None
+            profile_future = None
+            if isinstance(saved_profile, dict) and not profile_choice_locked:
+                profile_id = saved_profile.get("profile_id") or profile_id
+                saved_name = saved_profile.get("display_name") or "guest"
+                player = "" if saved_name == "guest" else saved_name
+            elif saved_profile is None and not profile_choice_locked:
+                ensure_profile = getattr(backend, "ensure_profile_async", None)
+                if callable(ensure_profile):
+                    profile_save_future = ensure_profile("guest", profile_id)
+        if profile_save_future is not None and profile_save_future.done():
+            try:
+                saved_profile = profile_save_future.result()
+                if isinstance(saved_profile, dict):
+                    profile_id = saved_profile.get("profile_id") or profile_id
+            except Exception:  # noqa: BLE001
+                pass
+            profile_save_future = None
         if health_future is not None and health_future.done():
             was_online = online
             try:
@@ -330,6 +363,18 @@ def main():
     quit_with_unsaved_armed = False
     quit_with_unsaved_deadline = 0.0
 
+    def finish_player_edit() -> None:
+        nonlocal editing_player, player_composition, profile_save_future
+        nonlocal profile_choice_locked
+        profile_choice_locked = True
+        editing_player = False
+        player_composition = ""
+        pygame.key.stop_text_input()
+        ensure_profile = getattr(backend, "ensure_profile_async", None)
+        if callable(ensure_profile):
+            profile_save_future = ensure_profile(
+                player.strip() or "guest", profile_id)
+
     def exit_confirmed() -> bool:
         nonlocal quit_with_unsaved_armed, quit_with_unsaved_deadline
         durable = getattr(backend, "pending_saves_are_durable", False)
@@ -391,29 +436,41 @@ def main():
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     if editing_player:
-                        editing_player = False
+                        finish_player_edit()
                     elif exit_confirmed():
                         running = False
                     continue
                 elif editing_player:
                     if event.key == pygame.K_RETURN:
-                        editing_player = False
-                    elif event.key == pygame.K_BACKSPACE:
+                        finish_player_edit()
+                    elif (event.key == pygame.K_BACKSPACE
+                          and not player_composition):
                         player = player[:-1]
-                    elif (event.unicode and len(player) < 32
-                          and event.unicode.isprintable()):
-                        player += event.unicode
                     continue
                 elif event.key == pygame.K_s and backend.failed_save_count():
                     backend.retry_failed_saves()
                     quit_with_unsaved_armed = False
                     quit_with_unsaved_deadline = 0.0
                     continue
+            elif event.type == pygame.TEXTINPUT and editing_player:
+                incoming = "".join(
+                    char for char in event.text if char.isprintable())
+                player = (player + incoming)[:32]
+                player_composition = ""
+                continue
+            elif event.type == pygame.TEXTEDITING and editing_player:
+                player_composition = event.text[:32]
+                continue
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if player_input_rect.collidepoint(event.pos):
                     editing_player = True
+                    profile_choice_locked = True
+                    player_composition = ""
+                    pygame.key.start_text_input()
+                    pygame.key.set_text_input_rect(player_input_rect)
                     continue
-                editing_player = False
+                if editing_player:
+                    finish_player_edit()
                 for card in cards:
                     gid = card["meta"]["id"]
                     visible_rect = card["rect"].move(
@@ -423,7 +480,8 @@ def main():
                             launch_error = None
                             mod = import_game_module(gid)
                             mod.run_game(backend=backend,
-                                         player=player.strip() or "guest")
+                                         player=player.strip() or "guest",
+                                         profile_id=profile_id)
                         except Exception as e:  # noqa: BLE001
                             launch_error = (
                                 f"{card['meta']['name']}启动失败，请查看终端日志")
@@ -469,10 +527,12 @@ def main():
                          COLORS["accent"] if editing_player else COLORS["border"],
                          player_input_rect, 1, border_radius=6)
         shown = player or "guest"
+        if editing_player and player_composition:
+            shown = player + player_composition
         cursor_visible = (editing_player
                           and int(time.monotonic() * 2) % 2 == 0)
         if cursor_visible:
-            shown = player + "|"
+            shown = player + player_composition + "|"
         # Truncate to field width (180 - 16 padding = 164 usable).
         max_w = player_input_rect.w - 16
         f14 = font(14)
@@ -543,14 +603,13 @@ def main():
         draw_leaderboard(screen, lb_rect,
                          lb_cache.get(current_lb_game, []),
                          title=lb_title)
-        recent_entries = [{"rank": i + 1,
-                           "game_id": r["game_id"],
+        recent_entries = [{"game_id": r["game_id"],
                            "player": r["player"],
                            "score": r["score"]}
-                          for i, r in enumerate(recent_cache)]
+                          for r in recent_cache]
         draw_leaderboard(screen, recent_rect, recent_entries,
                          title="最近游戏", show_game=True,
-                         game_names=lb_title_map)
+                         game_names=lb_title_map, competitive=False)
 
         draw_text(screen,
                   f"Esc 退出 · {'API 成绩服务' if use_http else '本机记录'}: "

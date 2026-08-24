@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "classic-games-hub"
-version = "0.4.0"
+version = "0.5.0"
 description = "Five local-first pygame classics with SQLite records"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "pygame>=2.5",
+    "pygame>=2.5,<3",
 ]
 
 [project.optional-dependencies]
@@ -21,6 +21,7 @@ dev = [
     "flask>=3.0",
     "requests>=2.31",
     "pytest>=8.0",
+    "coverage>=7.6",
     "ruff>=0.6",
 ]
 
@@ -34,3 +35,11 @@ include = ["client*", "game_service*", "server*"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.coverage.run]
+branch = true
+source = ["client", "game_service", "server"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

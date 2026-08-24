@@ -185,8 +185,10 @@ class Zuma(BaseGame):
     title = "祖玛"
 
     def __init__(self, backend: Optional[GameDataService] = None,
-                 player: str = "anonymous"):
-        super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player)
+                 player: str = "anonymous",
+                 profile_id: Optional[str] = None):
+        super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player,
+                         profile_id=profile_id)
         self.reset()
 
     # ------------------------------------------------------------------
@@ -339,6 +341,17 @@ class Zuma(BaseGame):
                       "level_bonus": self.level_bonus,
                       "won": True,
                       "completed_all": completed_all}
+            save_progress = getattr(self.backend, "set_progress_async", None)
+            if callable(save_progress):
+                try:
+                    save_progress(
+                        self.profile_id, self.game_id, "campaign",
+                        {"unlocked_level": min(
+                            len(ZUMA_LEVELS), self.level_idx + 2),
+                         "highest_score": self.score,
+                         "completed_all": completed_all})
+                except Exception:  # noqa: BLE001 - progress is non-critical
+                    pass
             if completed_all:
                 self.on_win(self.score, extra=result)
             else:
@@ -910,8 +923,9 @@ class Zuma(BaseGame):
 
 
 def run_game(backend: Optional[GameDataService] = None,
-             player: str = "anonymous") -> None:
-    Zuma(backend=backend, player=player).run()
+             player: str = "anonymous",
+             profile_id: Optional[str] = None) -> None:
+    Zuma(backend=backend, player=player, profile_id=profile_id).run()
 
 
 if __name__ == "__main__":

@@ -44,11 +44,13 @@ class Snake(BaseGame):
     title = "贪吃蛇"
 
     def __init__(self, backend: Optional[GameDataService] = None,
-                 player: str = "anonymous"):
+                 player: str = "anonymous",
+                 profile_id: Optional[str] = None):
         # Render and process input at 60 FPS; movement has its own timer.
         # Tying both to the old 12 FPS movement rate made early input feel
         # abrupt and prevented us from expressing an explicit level curve.
-        super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player)
+        super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player,
+                         profile_id=profile_id)
         self.reset()
 
     def reset(self):
@@ -267,8 +269,9 @@ class Snake(BaseGame):
 
 
 def run_game(backend: Optional[GameDataService] = None,
-             player: str = "anonymous") -> None:
-    Snake(backend=backend, player=player).run()
+             player: str = "anonymous",
+             profile_id: Optional[str] = None) -> None:
+    Snake(backend=backend, player=player, profile_id=profile_id).run()
 
 
 if __name__ == "__main__":

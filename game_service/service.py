@@ -4,9 +4,47 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import asdict, dataclass, field
+from enum import Enum
 from typing import Any, Optional, Protocol
 
 from .catalog import GAME_BY_ID
+
+
+class StorageErrorKind(str, Enum):
+    BUSY = "busy"
+    FULL = "full"
+    READ_ONLY = "read_only"
+    IO_ERROR = "io_error"
+    CANT_OPEN = "cant_open"
+    CORRUPT = "corrupt"
+    CONSTRAINT = "constraint"
+    SCHEMA_REPAIR_REQUIRED = "schema_repair_required"
+    INTERRUPTED = "interrupted"
+    INVALID_MUTATION = "invalid_mutation"
+    INTERNAL = "internal"
+
+
+class SaveState(str, Enum):
+    SAVING = "saving"
+    COMMITTED = "committed"
+    DURABLE_PENDING = "durable_pending"
+    RECOVERY_REQUIRED = "recovery_required"
+    QUARANTINED = "quarantined"
+    PERMANENT_FAILURE = "permanent_failure"
+
+
+@dataclass(frozen=True)
+class SaveEvent:
+    request_id: str
+    attempt_uuid: str
+    revision: int
+    state: SaveState
+    result: dict
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["state"] = self.state.value
+        return value
 
 
 @dataclass
@@ -22,11 +60,16 @@ class AttemptContext:
     revision: int = 0
 
     @classmethod
-    def for_game(cls, game_id: str, player: str, *, mode: str = "classic",
+    def for_game(cls, game_id: str, player: str, *,
+                 profile_id: Optional[str] = None, mode: str = "classic",
                  status: str = "completed") -> "AttemptContext":
+        if profile_id is None:
+            profile_id = uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"classic-games-local-profile:{player}").hex
         return cls(
             game_id=game_id,
-            profile_id=player,
+            profile_id=profile_id,
             mode=mode,
             ruleset_version=GAME_BY_ID[game_id].ruleset_version,
             status=status,
@@ -105,9 +148,13 @@ class GameDataService(Protocol):
 
     def failed_save_count(self) -> int: ...
 
-    def retry_failed_saves(self) -> int: ...
+    def retry_failed_saves(self): ...
 
     def poll_pending_saves(self, interval_seconds: float = 2.0) -> int: ...
+
+    def poll_save_events(self) -> list[SaveEvent]: ...
+
+    def get_save_status(self, request_id: str) -> Optional[SaveEvent]: ...
 
     def drain(self, timeout: Optional[float] = None) -> bool: ...
 

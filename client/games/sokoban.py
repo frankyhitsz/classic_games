@@ -281,17 +281,19 @@ class Sokoban(BaseGame):
     submit_replaces_existing = True
 
     def __init__(self, backend: Optional[GameDataService] = None,
-                 player: str = "anonymous"):
+                 player: str = "anonymous",
+                 profile_id: Optional[str] = None):
         self.level_idx = 0
         self.total_score = 0
         self.level_scores: dict[int, int] = {}
         self.completed_levels: set[int] = set()
         self.practice_mode = False
-        self._confirmed_total = 0
+        self._confirmed_total: Optional[int] = None
         self._pending_total: Optional[int] = None
         w, h = level_bounds(LEVELS[0])
         super().__init__(max(500, w * CELL + 40), max(380, h * CELL + 132),
-                         fps=60, backend=backend, player=player)
+                         fps=60, backend=backend, player=player,
+                         profile_id=profile_id)
         self.load_level(0)
 
     def load_level(self, idx: int):
@@ -318,7 +320,7 @@ class Sokoban(BaseGame):
             self.level_scores = {}
             self.completed_levels = set()
             self.practice_mode = False
-            self._confirmed_total = 0
+            self._confirmed_total = None
             self._pending_total = None
         w, h = level_bounds(level)
         # Recreate window to fit
@@ -427,8 +429,22 @@ class Sokoban(BaseGame):
                       "completed_levels": len(self.completed_levels),
                       "practice": self.practice_mode,
                       "completed_all": completed_all}
+            save_progress = getattr(self.backend, "set_progress_async", None)
+            if callable(save_progress):
+                try:
+                    save_progress(
+                        self.profile_id, self.game_id, "campaign",
+                        {"unlocked_level": min(
+                            len(LEVELS), max(self.completed_levels) + 2),
+                         "completed_levels": sorted(self.completed_levels),
+                         "level_scores": {
+                             str(key): value
+                             for key, value in self.level_scores.items()}})
+                except Exception:  # noqa: BLE001 - progress is non-critical
+                    pass
             if (completed_all
-                    and self.total_score > self._confirmed_total
+                    and (self._confirmed_total is None
+                         or self.total_score > self._confirmed_total)
                     and self.total_score != self._pending_total):
                 self._pending_total = self.total_score
                 self.on_win(self.total_score, extra=result)
@@ -440,7 +456,9 @@ class Sokoban(BaseGame):
                 self.invalidate_overlay_leaderboard()
 
     def on_score_save_succeeded(self, result: dict, payload: dict) -> None:
-        self._confirmed_total = max(self._confirmed_total, payload["score"])
+        self._confirmed_total = (
+            payload["score"] if self._confirmed_total is None
+            else max(self._confirmed_total, payload["score"]))
         self._pending_total = None
 
     def on_score_save_failed(self, payload: dict,
@@ -607,8 +625,9 @@ class Sokoban(BaseGame):
 
 
 def run_game(backend: Optional[GameDataService] = None,
-             player: str = "anonymous") -> None:
-    Sokoban(backend=backend, player=player).run()
+             player: str = "anonymous",
+             profile_id: Optional[str] = None) -> None:
+    Sokoban(backend=backend, player=player, profile_id=profile_id).run()
 
 
 if __name__ == "__main__":

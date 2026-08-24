@@ -162,8 +162,10 @@ class Tetris(BaseGame):
     title = "俄罗斯方块"
 
     def __init__(self, backend: Optional[GameDataService] = None,
-                 player: str = "anonymous"):
-        super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player)
+                 player: str = "anonymous",
+                 profile_id: Optional[str] = None):
+        super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player,
+                         profile_id=profile_id)
         self.reset()
 
     # ------------------------------------------------------------------
@@ -591,8 +593,9 @@ class Tetris(BaseGame):
 
 
 def run_game(backend: Optional[GameDataService] = None,
-             player: str = "anonymous") -> None:
-    Tetris(backend=backend, player=player).run()
+             player: str = "anonymous",
+             profile_id: Optional[str] = None) -> None:
+    Tetris(backend=backend, player=player, profile_id=profile_id).run()
 
 
 if __name__ == "__main__":

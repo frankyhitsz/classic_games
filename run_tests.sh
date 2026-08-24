@@ -58,7 +58,8 @@ env GAMES_API_URL="${TEST_API_URL}" \
 if [[ "${TEST_STATUS}" -eq 0 ]]; then
     env GAMES_DB="${TEST_RUNTIME_DIR}/review4-default.db" \
         SDL_VIDEODRIVER=dummy \
-        SDL_AUDIODRIVER=dummy python -m unittest tests.test_storage_v2 \
+        SDL_AUDIODRIVER=dummy python -m unittest discover -s tests \
+        -p 'test_storage*.py' \
         || TEST_STATUS=$?
 fi
 

@@ -85,7 +85,8 @@ class LocalAsyncTests(unittest.TestCase):
             self.assertEqual(backend.failed_save_count(), 1)
             lock.rollback()
             lock.close()
-            self.assertEqual(backend.retry_failed_saves(), 1)
+            self.assertEqual(
+                backend.retry_failed_saves().result(timeout=1), 1)
             self.assertTrue(backend.drain(2))
             self.assertEqual(backend.failed_save_count(), 0)
             backend.close()
@@ -374,7 +375,7 @@ class AttemptModelTests(unittest.TestCase):
                 "2048", "p", 200, request_id="final-request-00000000001",
                 attempt_uuid=attempt, revision=2).result(timeout=1)
             self.assertTrue(final["ok"])
-            backend.retry_failed_saves()
+            backend.retry_failed_saves().result(timeout=1)
             self.assertTrue(backend.drain(2))
             self.assertEqual(backend.store.attempt_count("2048"), 1)
             recent = backend.store.recent()
@@ -624,7 +625,8 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
             with reopened.connection() as connection:
                 marker = connection.execute(
                     "SELECT value FROM schema_meta "
-                    "WHERE key LIKE 'legacy_scores_v3_%'").fetchone()[0]
+                    "WHERE key LIKE 'legacy_scores_v4_%' "
+                    "ORDER BY rowid DESC LIMIT 1").fetchone()[0]
             report = json.loads(marker)
             self.assertEqual((report["valid"], report["skipped"],
                               report["imported"]), (2, 0, 1))
@@ -695,7 +697,8 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
                 "game_id": "sokoban", "player": "other", "score": 22,
                 "request_id": "external-pending-request-0001",
             })
-            self.assertEqual(backend.retry_failed_saves(), 1)
+            self.assertEqual(
+                backend.retry_failed_saves().result(timeout=1), 1)
             self.assertTrue(backend.drain(2))
             self.assertEqual(backend.store.attempt_count("sokoban"), 1)
             backend.close()

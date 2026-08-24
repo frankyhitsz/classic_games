@@ -44,9 +44,12 @@ def create_app(config: dict | None = None) -> Flask:
     app.extensions["game_store"] = store
 
     def api_error(code: str, message: str, status: int = 400,
-                  retryable: bool = False):
-        return jsonify({"ok": False, "code": code, "error": message,
-                        "retryable": retryable}), status
+                  retryable: bool = False, details: dict | None = None):
+        payload = {"ok": False, "code": code, "error": message,
+                   "retryable": retryable}
+        if details:
+            payload["details"] = details
+        return jsonify(payload), status
 
     def parse_limit(default: int):
         raw = request.args.get("limit")
@@ -61,8 +64,9 @@ def create_app(config: dict | None = None) -> Flask:
                 "invalid_limit", "limit must be between 1 and 50")
         return limit, None
 
-    def query_dimensions(allowed: set[str]) -> tuple[dict, object | None]:
-        accepted = allowed | {"limit"}
+    def query_dimensions(allowed: set[str], *,
+                         allow_limit: bool = False) -> tuple[dict, object | None]:
+        accepted = allowed | ({"limit"} if allow_limit else set())
         unknown = sorted(set(request.args) - accepted)
         if unknown:
             return {}, api_error(
@@ -89,7 +93,8 @@ def create_app(config: dict | None = None) -> Flask:
     @app.errorhandler(Exception)
     def unexpected_error(exc):
         if isinstance(exc, HTTPException):
-            return exc
+            code = (exc.name or "http_error").lower().replace(" ", "_")
+            return api_error(code, exc.description, exc.code or 500)
         app.logger.exception("unexpected API error", exc_info=exc)
         return api_error("internal_error", "unexpected server error", 500)
 
@@ -158,7 +163,8 @@ def create_app(config: dict | None = None) -> Flask:
                 status=body.get("status", "completed"),
             )
         except StoreError as exc:
-            return api_error(exc.code, exc.message, exc.status, exc.retryable)
+            return api_error(exc.code, exc.message, exc.status, exc.retryable,
+                             exc.details)
         result["submitted_from"] = request.remote_addr or "unknown"
         return jsonify(result)
 
@@ -170,13 +176,14 @@ def create_app(config: dict | None = None) -> Flask:
         if error is not None:
             return error
         dimensions, error = query_dimensions(
-            {"mode", "ruleset_version", "status"})
+            {"mode", "ruleset_version", "status"}, allow_limit=True)
         if error is not None:
             return error
         try:
             rows = store.leaderboard(game_id, limit, **dimensions)
         except StoreError as exc:
-            return api_error(exc.code, exc.message, exc.status, exc.retryable)
+            return api_error(exc.code, exc.message, exc.status, exc.retryable,
+                             exc.details)
         return jsonify({"game_id": game_id, "leaderboard": rows})
 
     @app.route("/api/stats/<game_id>")
@@ -188,7 +195,8 @@ def create_app(config: dict | None = None) -> Flask:
         try:
             return jsonify(store.stats(game_id, **dimensions))
         except StoreError as exc:
-            return api_error(exc.code, exc.message, exc.status, exc.retryable)
+            return api_error(exc.code, exc.message, exc.status, exc.retryable,
+                             exc.details)
 
     @app.route("/api/recent")
     def recent():
@@ -196,13 +204,15 @@ def create_app(config: dict | None = None) -> Flask:
         if error is not None:
             return error
         dimensions, error = query_dimensions(
-            {"profile_id", "game_id", "mode", "ruleset_version", "status"})
+            {"profile_id", "game_id", "mode", "ruleset_version", "status"},
+            allow_limit=True)
         if error is not None:
             return error
         try:
             rows = store.recent(limit, **dimensions)
         except StoreError as exc:
-            return api_error(exc.code, exc.message, exc.status, exc.retryable)
+            return api_error(exc.code, exc.message, exc.status, exc.retryable,
+                             exc.details)
         return jsonify({"recent": rows})
 
     return app

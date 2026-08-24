@@ -680,6 +680,7 @@ run("launcher-recent-shows-game-name", """
         return orig(surf, rect, entries, title=title, **kw)
     L.draw_leaderboard = spy
     class FakeLocal(BackendClient):
+        def __init__(self, *a, **k): super().__init__()
         def health(self): return True
         def list_games(self, *a, **k): return []
         def leaderboard(self, *a, **k): return []
@@ -969,9 +970,10 @@ run("launcher-input-truncates", """
         pygame.event.post(pygame.event.Event(pygame.MOUSEBUTTONDOWN, {'button':1,'pos':(870, 43)}))
         time.sleep(0.1)
         # Type 16 CJK chars (max allowed).
-        for ch in '阿斯达克科技有限股份公司有限':
-            pygame.event.post(pygame.event.Event(pygame.KEYDOWN, {'key':0,'unicode':ch}))
-            time.sleep(0.02)
+        pygame.event.post(pygame.event.Event(
+            pygame.TEXTEDITING, {'text':'阿斯达克科技'}))
+        pygame.event.post(pygame.event.Event(
+            pygame.TEXTINPUT, {'text':'阿斯达克科技有限股份公司有限'}))
         time.sleep(0.2)
         pygame.event.post(pygame.event.Event(pygame.QUIT))
     threading.Thread(target=driver, daemon=True).start()
@@ -1339,9 +1341,10 @@ run("launcher-guest-placeholder", """
         time.sleep(0.25)
         pygame.event.post(pygame.event.Event(
             pygame.MOUSEBUTTONDOWN, {'button':1, 'pos':(870, 43)}))
-        for ch in '小明':
-            pygame.event.post(pygame.event.Event(
-                pygame.KEYDOWN, {'key':0, 'unicode':ch}))
+        pygame.event.post(pygame.event.Event(
+            pygame.TEXTEDITING, {'text':'小'}))
+        pygame.event.post(pygame.event.Event(
+            pygame.TEXTINPUT, {'text':'小明'}))
         pygame.event.post(pygame.event.Event(
             pygame.MOUSEBUTTONDOWN, {'button':1, 'pos':(126, 220)}))
         time.sleep(0.4)
@@ -2573,9 +2576,11 @@ run("backend-reliable-save-and-close", """
         def result(self): return self.value
     low={'token':1, 'payload':{'game_id':'2048','player':'p','score':100,
          'extra':None,'replace':True,'submission_id':None,
+         'attempt_uuid':'same-network-attempt-0001',
          'request_id':'low-save-request-0001'}}
     high={'token':2, 'payload':{'game_id':'2048','player':'p','score':250,
           'extra':None,'replace':True,'submission_id':None,
+          'attempt_uuid':'same-network-attempt-0001',
           'request_id':'high-save-request-001'}}
     backend._capture_score_save(Done({'ok':True,'id':5}), high)
     backend._capture_score_save(Done(None), low)
@@ -2692,7 +2697,7 @@ run("sokoban-confirmed-total-requires-ack", """
     for level in range(len(LEVELS)):
         g.load_level(level); g.boxes=set(g.targets); g._check_win()
     g.draw()
-    assert g._confirmed_total == 0 and g._pending_total == g.total_score
+    assert g._confirmed_total is None and g._pending_total == g.total_score
     g.retry_score_save(); g.draw()
     assert g._confirmed_total == g.total_score and g._pending_total is None
     pygame.quit()
@@ -2720,11 +2725,12 @@ run("local-store-persists-and-recovers-outbox", """
         class FailOnceStore(LocalGameStore):
             def __init__(self, path):
                 super().__init__(path); self.fail=True
-            def record_mutation(self, mutation):
+            def record_mutation(self, mutation, occurred_at=None):
                 if self.fail:
                     self.fail=False
                     raise sqlite3.OperationalError('locked')
-                return super().record_mutation(mutation)
+                return super().record_mutation(
+                    mutation, occurred_at=occurred_at)
         pending_db=root/'pending.db'; pending_outbox=root/'pending-saves.json'
         failed=LocalBackendClient(
             store=FailOnceStore(pending_db), outbox_path=pending_outbox)

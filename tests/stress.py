@@ -188,7 +188,7 @@ def storage_stress(root: Path) -> None:
     blocker.rollback()
     blocker.close()
     assert locked.drain(5)
-    locked.retry_failed_saves()
+    locked.retry_failed_saves().result(timeout=2)
     assert locked.drain(5)
     assert locked.store.attempt_count("snake") == 20
     submit_p99 = sorted(submit_samples)[int(len(submit_samples) * 0.99) - 1]
@@ -212,7 +212,10 @@ def storage_stress(root: Path) -> None:
         assert after_fds <= before_fds + 1
     print(f"resource-cycles: 100, fds={before_fds}->{after_fds}")
 
-    store = LocalGameStore(root / "concurrent.db")
+    # This branch intentionally bypasses the desktop's one-writer executor
+    # and starts 16 direct SQLite writers. Give that synthetic contention a
+    # larger busy budget than the latency-sensitive desktop facade.
+    store = LocalGameStore(root / "concurrent.db", busy_timeout_ms=2000)
 
     def write(index: int):
         game_id = ["tetris", "snake", "2048", "sokoban", "zuma"][index % 5]

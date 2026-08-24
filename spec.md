@@ -1,59 +1,62 @@
-# 第五次审查修复规格
+# 第六次审查修复规格
 
 ## 目标
 
-核实第五次审查任务书中的 F01–F21，优先关闭 request ID、旧成绩迁移、规则版本、
-attempt revision 和跨进程待保存文件的数据一致性问题。默认运行方式仍是本机 pygame
-与 SQLite；Flask 只保留为可选调试适配器。
+逐项核对第六次审查任务书，先关闭本地成绩丢失和坏旧数据阻断启动的风险，再完善
+保存状态回写、迁移约束、本机档案和工程门禁。默认桌面路径继续保持离线、本机优先；
+Flask 只作为显式开启的调试适配器。
 
 ## 范围
 
-- request ID 在待保存文件和数据库之间保持同一语义，冲突必须在写库前拒绝；
-- schema v3 区分当前规则与 `legacy-v1`，旧成绩不进入当前最佳；
-- 兼容早期 `str(dict)` 附加信息，坏附加信息不能拖累基础成绩；
-- 检查并修复当前版本缺失的唯一索引，修复前保留数据库备份；
-- final-only 与 monotonic-revision 游戏使用明确的分数合并策略；
-- receipt 过期或损坏后，重放仍由 attempt 行安全恢复；
-- 待保存文件支持无硬链接文件系统、目录 fsync、错名修复、大小/数量告警和隔离；
-- 运行中的实例定期发现其他进程新增的待保存文件，临时初始化失败可自行重试；
-- 保存写入、普通读取使用独立 executor，旧记录分批恢复；
-- BaseGame 和 2048 显式传递一次游戏的 profile、mode、ruleset 与 status；
-- Flask 各端点使用独立查询参数集合，错误响应保持 JSON；
-- 未落盘操作的二次确认只在 3 秒内有效。
+- SQLite 错误优先按 error code 分类；磁盘满、只读、I/O、锁、结构和损坏库均不得被
+  当作请求语义错误而删除最后一份 mutation；
+- 旧 `pending_saves.json` 和逐 request spool 使用严格 JSON、大小、深度、节点数和
+  有限数限制；单个坏文件、隔离失败或无法生成预览不阻断其他记录和游戏启动；
+- 每个 request 保存 `durable_pending`、`committed`、`recovery_required`、
+  `quarantined` 或 `permanent_failure` 状态，游戏界面可在后台重试后更新结果；
+- 手动重试、首次 pending 扫描、quarantine 计数和启动器的数据库初始化不在 pygame
+  线程执行；重试和重开使用退避；
+- 待保存重放沿用最初结算时间，外部旧库导入与 schema 快路径解耦，同内容换路径不重复；
+- schema v4 检查行级不变量，并用触发器约束后续直接写入；无效行在备份后隔离；
+- 本机档案使用 UUID，显示名、最后使用档案、设置、进度和存档槽有实际读写入口；
+- 启动器使用 `TEXTINPUT/TEXTEDITING`，推箱子和祖玛保存进度，2048 自动保存和恢复；
+- 2048 使用 BaseGame 的统一保存状态机，只保留同 attempt 新 revision 的排队策略；
+- optional Flask 对查询参数和 JSON 错误保持一致，HTTP 重试按 attempt 维度清理；
+- 增加三平台 CI、coverage 产物、版本记录和社区维护文档。
 
 ## 非目标
 
-- 不建设账号、云端排行榜、联网对战、遥测或公网 API；
-- 不在本轮设计家庭档案、存档槽、设置、数据清理或导入界面；
-- 不顺带加入 IME、手柄、音频、窗口缩放、可访问性或新玩法；
-- 不取消尚未完成的必要写入来换取更短退出时间；
-- 不擅自选择仓库许可证，也不创建未经用户要求的发布或 Pull Request；
-- 不承诺异步任务尚未获得执行机会时也能抵抗进程立即崩溃；一旦返回
-  `durable_pending`，待保存文件必须已经完成写入和同步。
+- 不增加账号、云端存储、公网排行榜、匹配、反作弊、强制联网或遥测；
+- 不在没有独立规则版本和验收用例时改变五款游戏的核心计分与随机规则；
+- 不由代码提交替仓库所有者选择 LICENSE；
+- 不声称本机注入测试等同于 Windows、Linux 和 macOS 的真实桌面打包验收；CI 提供的是
+  headless smoke，而不是安装器证明。
 
 ## 关键决策
 
-1. 五款游戏各有当前规则版本；迁移来源统一标为 `legacy-v1`。
-2. 俄罗斯方块、贪吃蛇和祖玛每局只接受一次最终状态；2048 和推箱子允许分数不下降的
-   revision 更新。attempt 的 `practice/completed` 状态不可改变。
-3. receipt 是可重建的响应缓存，attempt 行才是幂等重放的事实来源。
-4. 待保存文件先写临时文件并 fsync；硬链接不可用时，在逐 request 跨进程锁内原子替换。
-5. schema 快路径同时核对列和命名索引；同版本结构异常也先备份再修复。
-6. 旧库 marker 按绝对路径、大小、mtime 和迁移版本识别，并记录有效、跳过、仅恢复分数
-   与实际新增数量。
-7. `AttemptContext` 持有一次游戏的身份和查询维度，各游戏不依赖仓储默认值碰巧一致。
-8. 普通读取可取消，成绩写入和待保存状态转换必须在关闭前完成。
+1. 只有 mutation 本身永久非法时才可清除 pending；所有存储基础设施错误默认保留。
+2. `StorageErrorKind` 与 `SaveState` 使用枚举，catalog 的 score policy 也使用枚举并在
+   import 时验证。
+3. pending envelope 的 `created_at` 是结算事实时间，重放写入 attempt 的 finished/achieved
+   时间时继续使用该值。
+4. external legacy 内容 hash 负责跨路径去重，路径状态 marker 负责同一路径快速启动；失败
+   marker 有重试时间，不能触发反复 schema backup。
+5. schema v4 在迁移事务内修复旧 transport/profile 身份、隔离坏行、创建约束触发器和
+   `expires_at` 索引；回执每批最多删除 500 条。
+6. 显示名不再承担身份语义。旧显示名 profile 映射为确定性 UUID，新档案生成随机 UUID。
+7. 启动器允许记录服务在后台初始化；同步 LocalGameStore API仍保留给脚本、测试和 Flask。
+8. 2048 自动存档只接受当前 ruleset、版本 1、4×4 且值为 0 或不小于 2 的二次幂棋盘。
 
 ## 验收标准
 
-- F01–F21 均有代码证据、测试证据或明确的不采纳理由；
-- 已有 pending A、数据库为空时，同 request ID 的 B 返回 409，A 不变且 B 不写库；
-- Python repr 旧附加信息可恢复，损坏附加信息只丢元数据；
-- 旧成绩默认不出现在当前榜单，五款游戏都有显式当前规则版本；
-- 低分高 revision、状态切换、空 ID 和超大 SQLite 整数得到稳定错误；
-- 删除或损坏 receipt 后重放不新增 attempt；
-- 无硬链接 fallback、错名、超大文件、跨实例发现和临时初始化锁均有用例；
-- 2048 同分但最终元数据不同的在途更新不会丢失；
-- 107 项功能检查、存储边界用例、20,000 步固定输入、渲染/保存/资源/SQLite 压力均通过；
-- Ruff、Python 编译、shell 语法、wheel 构建和 diff whitespace 检查通过；
-- 验证过程不修改仓库旧成绩库，提交只包含本任务和用户已放入工作区的文档整理。
+- F01–F22 均有代码、测试或具体不采纳理由；
+- FULL 与 outbox ENOSPC 同时发生时 mutation 仍留在内存并可在释放空间后提交；
+- NaN、Infinity、深嵌套、超大和逐文件 OSError 不逃出 outbox 构造/扫描；
+- pending 最终 commit/quarantine 可观察，BaseGame 和 2048 都能回写界面；
+- 手动 retry 调用和异步 submit 调用不阻塞 pygame 线程；
+- 旧库换路径不重复，重放不改变完成时间，当前坏行在备份后进入 `invalid_attempts`；
+- 零分推箱子完整通关仍提交，并列第一显示相同奖牌，最近记录不显示竞技奖牌；
+- 档案、设置、进度和 2048 存档完成真实数据库往返，昵称与 IME 有界面路径；
+- 全部功能、存储、固定输入、渲染、资源和 SQLite 并发检查通过；
+- Ruff、编译、wheel、shell、whitespace 和数据库指纹检查通过；
+- 提交只包含本轮相关改动以及用户已放入工作区的审查文档替换。

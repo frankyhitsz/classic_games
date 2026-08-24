@@ -15,7 +15,7 @@ from typing import Callable, List, Optional
 import pygame
 
 from game_service.local_backend import LocalBackendClient
-from game_service.service import (AttemptContext, GameDataService,
+from game_service.service import (AttemptContext, GameDataService, SaveState,
                                   parse_score_response)
 
 OVERLAY_INPUT_GUARD_MS = 180
@@ -296,7 +296,8 @@ class Button:
 # ----------------------------------------------------------------------------
 def draw_leaderboard(surf, rect: pygame.Rect, entries: List[dict],
                      title: str = "排行榜", show_game: bool = False,
-                     game_names: Optional[dict] = None):
+                     game_names: Optional[dict] = None,
+                     competitive: bool = True):
     """Render a leaderboard panel.
 
     ``show_game=True`` shows the game name (looked up in ``game_names``
@@ -328,12 +329,23 @@ def draw_leaderboard(surf, rect: pygame.Rect, entries: List[dict],
         rank = e.get("rank", i + 1)
         player = (e.get("player") or "anon")[:32]
         score = e.get("score", 0)
-        medal = ["1st", "2nd", "3rd"][i] if i < 3 else f"#{rank}"
-        medal_color = medal_colors[i] if i < 3 else COLORS["text_dim"]
+        if competitive and type(rank) is int and 1 <= rank <= 3:
+            medal = ["1st", "2nd", "3rd"][rank - 1]
+            medal_color = medal_colors[rank - 1]
+            medal_bold = True
+        elif competitive:
+            medal = f"#{rank}"
+            medal_color = COLORS["text_dim"]
+            medal_bold = False
+        else:
+            medal = "•"
+            medal_color = COLORS["accent"]
+            medal_bold = False
         # Render medal, name, score as separate text runs so we can
         # color the medal and the game-name tag differently.
         x = rect.x + 14
-        draw_text(surf, medal, (x, y), size=15, color=medal_color, bold=(i < 3))
+        draw_text(surf, medal, (x, y), size=15, color=medal_color,
+                  bold=medal_bold)
         x += 52
         if show_game:
             gid = e.get("game_id", "")
@@ -347,7 +359,9 @@ def draw_leaderboard(surf, rect: pygame.Rect, entries: List[dict],
         draw_text(surf, player, (x, y), size=15, color=COLORS["text"])
         draw_text(surf, score_str,
                   (score_x, y),
-                  size=15, color=COLORS["accent2"] if i == 0 else COLORS["text"])
+                  size=15,
+                  color=(COLORS["accent2"]
+                         if competitive and rank == 1 else COLORS["text"]))
         y += row_h
     surf.set_clip(clip)
 
@@ -373,7 +387,8 @@ class BaseGame(abc.ABC):
 
     def __init__(self, width: int, height: int, fps: int = 60,
                  backend: Optional[GameDataService] = None,
-                 player: str = "anonymous"):
+                 player: str = "anonymous",
+                 profile_id: Optional[str] = None):
         pygame.init()
         self.screen = pygame.display.set_mode((width, height))
         pygame.display.set_caption(self.title)
@@ -382,7 +397,9 @@ class BaseGame(abc.ABC):
         self._owns_backend = backend is None
         self.backend = backend if backend is not None else LocalBackendClient()
         self.player = player
-        self.attempt_context = AttemptContext.for_game(self.game_id, player)
+        self.attempt_context = AttemptContext.for_game(
+            self.game_id, player, profile_id=profile_id)
+        self.profile_id = self.attempt_context.profile_id
         self.running = True
         self.state = "playing"  # playing | paused | gameover | won
         self.score = 0
@@ -503,7 +520,7 @@ class BaseGame(abc.ABC):
         self._last_score_payload = None
         self._score_submission_id = None
         self.attempt_context = AttemptContext.for_game(
-            self.game_id, self.player)
+            self.game_id, self.player, profile_id=self.profile_id)
         self._score_attempt_uuid = self.attempt_context.attempt_uuid
         self._score_attempt_revision = self.attempt_context.revision
         self.score_save_state = SAVE_IDLE
@@ -610,17 +627,42 @@ class BaseGame(abc.ABC):
 
     def _poll_score_submission(self) -> None:
         future = self._score_submit_future
-        if future is None or not future.done():
+        if future is not None and future.done():
+            generation = self._score_submit_future_generation
+            payload = self._score_submit_active_payload
+            self._score_submit_future = None
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001
+                self._finish_score_submission(None, payload, generation, str(exc))
+            else:
+                self._finish_score_submission(result, payload, generation)
+        self._poll_pending_score_status()
+
+    def _poll_pending_score_status(self) -> None:
+        if self.score_save_state != SAVE_PENDING or not self._last_score_payload:
             return
-        generation = self._score_submit_future_generation
-        payload = self._score_submit_active_payload
-        self._score_submit_future = None
-        try:
-            result = future.result()
-        except Exception as exc:  # noqa: BLE001
-            self._finish_score_submission(None, payload, generation, str(exc))
-        else:
-            self._finish_score_submission(result, payload, generation)
+        getter = getattr(self.backend, "get_save_status", None)
+        if not callable(getter):
+            return
+        event = getter(self._last_score_payload["request_id"])
+        if event is None:
+            return
+        state = getattr(event, "state", None)
+        if state == SaveState.COMMITTED:
+            self._finish_score_submission(
+                event.result, self._last_score_payload,
+                self._score_submit_generation)
+        elif state in (SaveState.QUARANTINED, SaveState.PERMANENT_FAILURE):
+            self.score_save_state = SAVE_FAILED
+            self.score_save_error = event.result.get("error", "待保存记录需要恢复")
+            self.score_save_retryable = False
+            self.score_save_durable_pending = bool(
+                event.result.get("pending_preserved"))
+            self.score_save_message = "待保存记录已隔离，请返回菜单查看"
+        elif state == SaveState.RECOVERY_REQUIRED:
+            self.score_save_message = event.result.get(
+                "error", "待保存记录需要恢复")
 
     def _finish_score_submission(self, result, payload, generation: int,
                                  exception_text: Optional[str] = None) -> None:

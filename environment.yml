@@ -5,4 +5,4 @@ dependencies:
   - python=3.11
   - pip
   - pip:
-      - pygame>=2.5
+      - pygame==2.6.1

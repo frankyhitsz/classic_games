@@ -66,6 +66,19 @@ def _transport_id(value: Optional[str], field: str) -> tuple[str, bool]:
     return value, provided
 
 
+def _profile_id(value: Optional[str], player: str) -> str:
+    if value is None:
+        return uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"classic-games-local-profile:{player}").hex
+    value = _identifier(value, "profile_id", maximum=64)
+    if (len(value) != 32
+            or any(char not in "0123456789abcdef" for char in value.lower())):
+        raise MutationError(
+            "invalid_profile_id", "profile_id must be a 32-character UUID")
+    return value.lower()
+
+
 @dataclass(frozen=True)
 class ScoreMutation:
     game_id: str
@@ -128,9 +141,7 @@ def normalize_score_mutation(
         player = "anonymous"
     player = unicodedata.normalize(
         "NFC", _identifier(player, "player", maximum=32, default="anonymous"))
-    profile_id = unicodedata.normalize(
-        "NFC", _identifier(profile_id, "profile_id", maximum=64,
-                           default=player))
+    profile_id = _profile_id(profile_id, player)
     if type(score) is not int or not 0 <= score <= MAX_SCORE:
         raise MutationError(
             "invalid_score", f"score must be an integer between 0 and {MAX_SCORE}")
