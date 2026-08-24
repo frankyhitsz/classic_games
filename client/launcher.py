@@ -35,6 +35,12 @@ def import_game_module(game_id: str):
     return importlib.import_module(GAME_BY_ID[game_id].module)
 
 
+def game_profile_id(backend, local_profile_id: str):
+    """Only local profile-capable backends receive the canonical profile ID."""
+    capabilities = getattr(backend, "capabilities", ())
+    return local_profile_id if "profiles" in capabilities else None
+
+
 # ---------------------------------------------------------------------------
 # Per-game programmatic icons. Drawn fresh each frame so they always render
 # crisply at the current card size; we don't depend on any external image
@@ -215,7 +221,9 @@ def main():
     player = ""
     profile_id = ProfileIdentity.default().profile_id
     profile_controller = ProfileController(profile_id)
-    profile_ready = not callable(getattr(backend, "last_profile_async", None))
+    profiles_supported = "profiles" in getattr(backend, "capabilities", ())
+    profile_ready = (not profiles_supported
+                     or not callable(getattr(backend, "last_profile_async", None)))
     if profile_ready:
         profile_controller.resolve(profile_id)
     profile_error = None
@@ -532,7 +540,7 @@ def main():
             mod = import_game_module(gid)
             mod.run_game(backend=backend,
                          player=player.strip() or "guest",
-                         profile_id=profile_id)
+                         profile_id=game_profile_id(backend, profile_id))
         except Exception as exc:  # noqa: BLE001
             name = lb_title_map.get(gid, gid)
             launch_error = f"{name}启动失败，请查看终端日志"
@@ -625,7 +633,8 @@ def main():
                 player_composition = event.text[:32]
                 continue
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if profile_switch_rect.collidepoint(event.pos):
+                if (profiles_supported
+                        and profile_switch_rect.collidepoint(event.pos)):
                     choose_profile(create_new=bool(
                         pygame.key.get_mods() & pygame.KMOD_SHIFT))
                     continue
@@ -686,10 +695,14 @@ def main():
                          border_radius=6)
         pygame.draw.rect(screen, COLORS["border"], profile_switch_rect, 1,
                          border_radius=6)
-        draw_text(screen, "切换档案", profile_switch_rect.center, size=10,
-                  color=COLORS["accent"], bold=True, center=True)
-        draw_text(screen, "Shift+点击新建", (profile_switch_rect.centerx, 69),
-                  size=8, color=COLORS["text_dim"], center=True)
+        draw_text(screen, ("切换档案" if profiles_supported else "按名字记录"),
+                  profile_switch_rect.center, size=10,
+                  color=(COLORS["accent"] if profiles_supported
+                         else COLORS["text_dim"]), bold=True, center=True)
+        draw_text(screen, ("Shift+点击新建" if profiles_supported
+                           else "HTTP 调试模式"),
+                  (profile_switch_rect.centerx, 69), size=8,
+                  color=COLORS["text_dim"], center=True)
         draw_text(screen, "名字", (WIDTH - 270, 43), size=13,
                   color=COLORS["text_dim"])
         pygame.draw.rect(screen, COLORS["panel"], player_input_rect,

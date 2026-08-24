@@ -350,6 +350,8 @@ class Sokoban(BaseGame):
             return
         if not isinstance(value, dict):
             return
+        if isinstance(value.get("value"), dict):
+            value = value["value"]
         unlocked = value.get("unlocked_level", 1)
         completed = value.get("completed_levels", [])
         if type(unlocked) is int:

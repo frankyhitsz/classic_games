@@ -706,10 +706,11 @@ class PersistentSaveOutbox:
 class PersistentStateOutbox:
     """Cross-process latest-value journal for local profile state."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
     FIELDS = frozenset({
         "schema_version", "operation_id", "key", "kind", "method", "args",
-        "ruleset_version", "logical_revision", "updated_at", "payload_hash",
+        "ruleset_version", "logical_revision", "updated_at", "components",
+        "payload_hash",
     })
 
     ALLOWED_METHODS = frozenset({
@@ -778,8 +779,15 @@ class PersistentStateOutbox:
             except FileNotFoundError:
                 pass
             except (OSError, UnicodeError, ValueError):
+                self._quarantine_clock_locked(clock_path)
+                previous = 0
+            if previous > (1 << 63) - 2:
+                self._quarantine_clock_locked(clock_path)
                 previous = 0
             revision = max(previous + 1, observed + 1, time.time_ns())
+            if revision > (1 << 63) - 1:
+                raise StoreError(
+                    "state_clock_overflow", "local state clock is exhausted", 409)
             temp = self.path / f".state-clock.{uuid.uuid4().hex}.tmp"
             PersistentSaveOutbox._write_bytes(
                 temp, str(revision).encode("ascii"))
@@ -792,6 +800,22 @@ class PersistentStateOutbox:
                 except FileNotFoundError:
                     pass
         return revision
+
+    def _quarantine_clock_locked(self, clock_path: Path) -> None:
+        """Preserve a damaged clock before rebuilding it from a known high-water."""
+        try:
+            self.quarantine_path.mkdir(parents=True, exist_ok=True)
+            target = self.quarantine_path / (
+                f"state-clock.invalid-{time.time_ns()}-{uuid.uuid4().hex[:8]}")
+            os.replace(clock_path, target)
+            PersistentSaveOutbox._fsync_directory(self.quarantine_path)
+            PersistentSaveOutbox._fsync_directory(self.path)
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        self.quarantined_count += 1
+        self._update_notice()
 
     @contextmanager
     def _key_lock(self, key: str):
@@ -848,7 +872,9 @@ class PersistentStateOutbox:
     @classmethod
     def _operation(cls, key: str, method: str, args: tuple,
                    logical_revision: int,
-                   operation_id: Optional[str] = None) -> dict:
+                   operation_id: Optional[str] = None, *,
+                   components: Optional[list[dict]] = None,
+                   updated_at: Optional[float] = None) -> dict:
         if method not in cls.ALLOWED_METHODS:
             raise StoreError("invalid_state_operation", "unsupported state operation")
         if (type(logical_revision) is not int
@@ -868,17 +894,37 @@ class PersistentStateOutbox:
                 arguments.append(ruleset_version)
             else:
                 arguments[4] = ruleset_version
+        operation_id = operation_id or uuid.uuid4().hex
+        timestamp = time.time() if updated_at is None else float(updated_at)
         operation = {
             "schema_version": cls.SCHEMA_VERSION,
-            "operation_id": operation_id or uuid.uuid4().hex,
+            "operation_id": operation_id,
             "key": key,
             "kind": cls._kind(method),
             "method": method,
             "args": arguments,
             "ruleset_version": ruleset_version,
             "logical_revision": logical_revision,
-            "updated_at": time.time(),
+            "updated_at": timestamp,
+            "components": [],
         }
+        if method == "merge_progress":
+            if components is None:
+                component_semantic = {
+                    "operation_id": operation_id,
+                    "key": key,
+                    "method": method,
+                    "args": arguments,
+                    "ruleset_version": ruleset_version,
+                    "updated_at": timestamp,
+                }
+                components = [{
+                    "operation_id": operation_id,
+                    "payload_hash": cls._digest(component_semantic),
+                }]
+            operation["components"] = sorted(
+                (dict(component) for component in components),
+                key=lambda component: component["operation_id"])
         _validate_json_shape(operation)
         try:
             operation["payload_hash"] = cls._digest(operation)
@@ -895,10 +941,8 @@ class PersistentStateOutbox:
 
     @classmethod
     def with_revision(cls, operation: dict, revision: int) -> dict:
-        revised = cls._operation(
-            operation["key"], operation["method"], tuple(operation["args"]),
-            revision, operation["operation_id"])
-        revised["updated_at"] = operation["updated_at"]
+        revised = dict(operation)
+        revised["logical_revision"] = revision
         revised["payload_hash"] = cls._digest({
             key: value for key, value in revised.items()
             if key != "payload_hash"})
@@ -919,26 +963,40 @@ class PersistentStateOutbox:
                 game_id, key, existing["args"][3], incoming["args"][3])
         except ProgressPolicyError as exc:
             raise StoreError("invalid_progress", str(exc)) from exc
-        newest = max((existing, incoming), key=cls._order)
+        components_by_id: dict[str, str] = {}
+        for operation in (existing, incoming):
+            for component in operation["components"]:
+                component_id = component["operation_id"]
+                component_hash = component["payload_hash"]
+                prior_hash = components_by_id.get(component_id)
+                if prior_hash is not None and prior_hash != component_hash:
+                    raise StoreError(
+                        "state_operation_conflict",
+                        "progress component ID was reused with different data", 409)
+                components_by_id[component_id] = component_hash
+        components = [{"operation_id": component_id,
+                       "payload_hash": components_by_id[component_id]}
+                      for component_id in sorted(components_by_id)]
+        component_identity = cls._digest({
+            "key": incoming["key"], "components": components})
+        aggregate_id = f"aggregate-{component_identity[:48]}"
         merged = cls._operation(
             incoming["key"], "merge_progress",
             (*incoming["args"][:3], value, incoming["ruleset_version"]),
             max(existing["logical_revision"], incoming["logical_revision"]),
-            newest["operation_id"])
-        merged["updated_at"] = max(
-            existing["updated_at"], incoming["updated_at"])
-        unhashed = {key: value for key, value in merged.items()
-                    if key != "payload_hash"}
-        merged["payload_hash"] = cls._digest(unhashed)
+            aggregate_id, components=components,
+            updated_at=max(existing["updated_at"], incoming["updated_at"]))
         return merged
 
     def put(self, key: str, method: str, args: tuple, *,
             logical_revision: Optional[int] = None,
-            operation_id: Optional[str] = None) -> dict:
+            operation_id: Optional[str] = None,
+            components: Optional[list[dict]] = None,
+            updated_at: Optional[float] = None) -> dict:
         incoming = self._operation(
             key, method, args,
             time.time_ns() if logical_revision is None else logical_revision,
-            operation_id)
+            operation_id, components=components, updated_at=updated_at)
         published = True
         with self._lock, self._key_lock(key):
             target = self._target(key)
@@ -1041,6 +1099,23 @@ class PersistentStateOutbox:
                         if key != "payload_hash"}
             upgraded["payload_hash"] = cls._digest(unhashed)
             return upgraded
+        if value.get("schema_version") == 2:
+            expected_v2 = cls.FIELDS - {"components"}
+            if set(value) != expected_v2:
+                raise StoreError(
+                    "invalid_state_journal", "invalid pending local state")
+            legacy_hash = value.get("payload_hash")
+            if legacy_hash != cls._digest({
+                    key: child for key, child in value.items()
+                    if key != "payload_hash"}):
+                raise StoreError(
+                    "state_journal_hash_mismatch",
+                    "pending local state was modified")
+            upgraded = cls._operation(
+                value["key"], value["method"], tuple(value["args"]),
+                value["logical_revision"], value["operation_id"],
+                updated_at=value["updated_at"])
+            return upgraded
         try:
             derived_ruleset = cls._ruleset(
                 value.get("method"), value.get("args"))
@@ -1059,9 +1134,35 @@ class PersistentStateOutbox:
                 or type(value.get("logical_revision")) is not int
                 or value["logical_revision"] < 0
                 or type(value.get("updated_at")) not in (int, float)
-                or not math.isfinite(float(value["updated_at"]))):
+                or not math.isfinite(float(value["updated_at"]))
+                or not isinstance(value.get("components"), list)):
             raise StoreError(
                 "invalid_state_journal", "invalid pending local state")
+        components = value["components"]
+        if value["method"] == "merge_progress":
+            if not components:
+                raise StoreError(
+                    "invalid_state_journal", "progress components are missing")
+            component_ids = set()
+            for component in components:
+                if (not isinstance(component, dict)
+                        or set(component) != {"operation_id", "payload_hash"}
+                        or not isinstance(component["operation_id"], str)
+                        or not 1 <= len(component["operation_id"]) <= 128
+                        or component["operation_id"] in component_ids
+                        or not isinstance(component["payload_hash"], str)
+                        or len(component["payload_hash"]) != 64):
+                    raise StoreError(
+                        "invalid_state_journal", "invalid progress components")
+                component_ids.add(component["operation_id"])
+            if components != sorted(
+                    components, key=lambda component: component["operation_id"]):
+                raise StoreError(
+                    "invalid_state_journal", "progress components are unordered")
+        elif components:
+            raise StoreError(
+                "invalid_state_journal",
+                "non-progress state cannot contain components")
         payload_hash = value["payload_hash"]
         valid = cls._digest({key: child for key, child in value.items()
                              if key != "payload_hash"})
@@ -1398,6 +1499,7 @@ class LocalBackendClient:
                 legacy_outbox = None
         self.outbox = PersistentSaveOutbox(
             spool_path, legacy_path=legacy_outbox)
+        had_pending_scores = bool(self.outbox.list())
         self.state_outbox = PersistentStateOutbox(
             spool_path.with_name(f"{spool_path.name}-state"))
         notices = [self.recovery_notice,
@@ -1425,7 +1527,13 @@ class LocalBackendClient:
         self._state_status_refreshed_at: dict[str, float] = {}
         self._save_status_refreshed_at: dict[str, float] = {}
         self._slot_load_operations: dict[tuple[str, str, str], Future] = {}
-        self._last_state_revision = time.time_ns()
+        high_water = 0
+        if self.store is not None:
+            try:
+                high_water = self.store.state_high_water()
+            except (OSError, sqlite3.Error, StoreError):
+                high_water = 0
+        self._last_state_revision = max(time.time_ns(), high_water)
         self._retrying: set[str] = set()
         self._outbox_writable = self.outbox.probe_writable()
         self._state_outbox_writable = self.state_outbox.probe_writable()
@@ -1440,7 +1548,7 @@ class LocalBackendClient:
         self._next_auto_retry_at = 0.0
         if self.store is None and defer_initialization:
             self._read_worker.submit(self._try_reopen_store)
-        if self.outbox.path.is_dir() or self._pending_state_count:
+        if had_pending_scores or self._pending_state_count:
             self.retry_failed_saves()
         elif self.store is not None:
             self._worker.submit(self._run_maintenance)
@@ -1542,12 +1650,24 @@ class LocalBackendClient:
             self._last_reopen_error = None
             if reopened.migration_notice:
                 self.recovery_notice = reopened.migration_notice
+            try:
+                high_water = reopened.state_high_water()
+            except (OSError, sqlite3.Error, StoreError):
+                high_water = 0
+            with self._lock:
+                self._last_state_revision = max(
+                    self._last_state_revision, high_water)
         return True
 
     def _run_maintenance(self) -> None:
         try:
-            self.store.maintenance() if self.store is not None else None
-        except (sqlite3.Error, OSError):
+            protected = tuple(
+                component["operation_id"]
+                for operation in self.state_outbox.list_entries()
+                if operation["method"] == "merge_progress"
+                for component in operation.get("components", ()))
+            self.store.maintenance(protected) if self.store is not None else None
+        except (sqlite3.Error, OSError, StoreError):
             # Housekeeping is opportunistic and must never make records
             # unavailable. A later launch will try again.
             pass
@@ -1705,7 +1825,9 @@ class LocalBackendClient:
             receipt = self.state_outbox.put(
                 key, operation["method"], tuple(operation["args"]),
                 logical_revision=operation["logical_revision"],
-                operation_id=operation["operation_id"])
+                operation_id=operation["operation_id"],
+                components=operation.get("components"),
+                updated_at=operation.get("updated_at"))
         except (OSError, StoreError) as exc:
             journal_failure = (classify_os_error(exc) if isinstance(exc, OSError)
                                else exc)
@@ -2073,16 +2195,23 @@ class LocalBackendClient:
         try:
             operation = self.state_outbox.read_key(key)
             receipt = None
+            merge_applied = False
             if self.store is not None:
                 try:
                     receipt = self.store.get_state_receipt(key)
+                    if (operation is not None
+                            and operation["method"] == "merge_progress"):
+                        merge_applied = self.store.state_merge_components_applied(
+                            operation)
                 except (OSError, sqlite3.Error, StoreError):
                     pass
             receipt_order = (
                 (receipt["logical_revision"], receipt["operation_id"])
                 if receipt is not None else None)
             if (operation is not None
-                    and (receipt_order is None
+                    and ((operation["method"] == "merge_progress"
+                          and not merge_applied)
+                         or receipt_order is None
                          or PersistentStateOutbox._order(operation)
                          > receipt_order)):
                 event = LocalStateEvent(

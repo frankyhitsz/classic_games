@@ -2,6 +2,17 @@
 
 ## 未发布
 
+- 数据库升级为 schema v7，state receipt 绑定业务值 hash；旧库为已有档案、设置、进度和存档
+  建立基线，损坏回执可从业务行修复，业务行隔离时同步失效回执。
+- state journal 升级为 schema 3，单调进度按 component 幂等；聚合使用独立 ID，不再因
+  commit-before-unlink 后的晚到贡献改变 payload hash 而丢失进度。
+- state clock 损坏时保留原件并从数据库高水位恢复；merge component 回执加入索引、保留期和
+  pending 保护。
+- 2048 终局存档恢复原棋盘和结果页；自动存档 schema 4 使用 owner token，支持显式接管并拒绝
+  旧实例的延迟覆盖。
+- 修复 HTTP 调试启动器复用本机 default profile、延迟成绩重放刷新档案时间，以及推箱子/祖玛
+  写入进度后 HUD 未读取权威值的问题。
+- 增加本机数据状态、导出、导入预览与原子导入命令，以及统一 release 检查、依赖审计和机器结果文件。
 - 数据库升级为 schema v6：每个本机状态键在同一事务保存胜出 revision、operation ID 和回执；
   旧进程不能在新 journal 删除后把旧 setting、档案、进度或存档写回。
 - 状态重放改为幂等操作，保留原发生时间；被较新操作淘汰时报告 `SUPERSEDED`，不再冒充提交成功。

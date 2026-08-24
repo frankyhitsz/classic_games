@@ -797,6 +797,10 @@ class BaseGame(abc.ABC):
                 self.draw()
                 pygame.display.flip()
         finally:
+            try:
+                self.before_close()
+            except Exception:  # noqa: BLE001 - shutdown must still release SDL
+                pass
             if self._owns_backend:
                 close_backend = getattr(self.backend, "close", None)
                 if callable(close_backend):
@@ -808,6 +812,9 @@ class BaseGame(abc.ABC):
             # ~1 minute while SDL re-initialized and the font cache was
             # rebuilt from scratch.
             pygame.display.quit()
+
+    def before_close(self) -> None:
+        """Optional final persistence hook called after the game loop stops."""
 
     def update_overlay(self, dt: float) -> None:
         """Override to advance animations while a game-over/won overlay is

@@ -244,6 +244,8 @@ class Zuma(BaseGame):
             return
         if not isinstance(value, dict):
             return
+        if isinstance(value.get("value"), dict):
+            value = value["value"]
         unlocked = value.get("unlocked_level", 1)
         high_score = value.get("highest_score", 0)
         if type(unlocked) is int:

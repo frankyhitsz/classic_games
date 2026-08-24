@@ -14,3 +14,9 @@
 - `ninth-code-review-taskbook-zh.md`
 - `ninth-code-review-response-zh.md`
 - `ninth-optimization-matrix-zh.md`
+
+第十次审查对应文件：
+
+- `tenth-code-review-taskbook-zh.md`
+- `tenth-code-review-response-zh.md`
+- `tenth-optimization-matrix-zh.md`

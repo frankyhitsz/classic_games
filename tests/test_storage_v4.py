@@ -444,6 +444,8 @@ class LeaderboardSemanticsTests(unittest.TestCase):
             first.score = 512
             first._save_autosave_slot()
             self.assertTrue(backend.drain(5))
+            first.before_close()
+            self.assertTrue(backend.drain(5))
 
             restored = Game2048(
                 backend=backend, player="save",

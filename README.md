@@ -19,6 +19,8 @@ Flask API 作为可选适配器保留。
 中文、日文和韩文输入使用系统输入法的组合文本事件。2048 每次有效移动后自动保存
 当前棋盘；推箱子和祖玛会记录关卡进度。若自动存档读取失败或超时，2048 会保持输入门禁；
 可按 T 重试、按 N 两次确认新开，或按 Esc 返回菜单，不会把读取故障当成空存档。
+终局存档会恢复原棋盘和结果页，不会自动换成随机新局。同一档案已有另一个活动中的 2048
+窗口时，新窗口会停止写入；可按 K 明确接管，或按 Esc 返回。
 若启动器读取最近档案失败，点击游戏会重试读取；也可以按 G 明确改用 guest。
 
 ## 环境要求
@@ -111,6 +113,12 @@ python -m client.games.zuma
 pip install -e '.[dev]'
 ```
 
+正式发行验证使用固定的顶层版本：
+
+```bash
+pip install -c constraints-release.txt -e '.[dev]'
+```
+
 ```bash
 ./run_tests.sh
 ```
@@ -122,6 +130,12 @@ pip install -e '.[dev]'
 
 ```bash
 SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python -m tests.stress
+```
+
+三层检查也可以通过统一入口运行，并生成 CI 可读取的结果：
+
+```bash
+python -m tests.release release --junit release-results.xml --json release-results.json
 ```
 
 ## 目录结构
@@ -141,7 +155,8 @@ classic_games/
 │   ├── test_storage_v4.py
 │   ├── test_storage_v5.py
 │   ├── test_storage_v6.py
-│   └── test_storage_v7.py
+│   ├── test_storage_v7.py
+│   └── test_storage_v8.py
 ├── docs/               # 审查记录、设计决策和维护文档
 ├── pyproject.toml
 ├── environment.yml
@@ -163,11 +178,26 @@ classic_games/
 单个文件上限为 64 KiB，数量或总大小异常时启动器会提示。运行中的启动器也会
 发现其他实例后来写入的待保存文件。
 `pending-state/` 使用每个档案或存档键一个文件的状态日志，保存最新昵称、设置、关卡进度和
-自动存档。schema 2 日志冻结 ruleset，用跨进程文件锁串行同一 key，以持久 logical revision
-防止晚到旧值覆盖新值；progress 则按游戏规则做单调合并。数据库 schema v6 在同一事务保存
-状态值和胜出回执，因此 journal 已删除后晚到的旧进程也不能回写。数据库解除锁定后会自动
+自动存档。schema 3 日志冻结 ruleset，用跨进程文件锁串行同一 key，以持久 logical revision
+防止晚到旧值覆盖新值；progress 为每次贡献记录 component ID/hash 后按游戏规则单调合并。
+数据库 schema v7 在同一事务保存状态值、业务值 hash 和胜出回执；旧库升级先为既有状态建立
+基线，因此 journal 已删除、业务行隔离或时钟损坏后仍能按权威值恢复。数据库解除锁定后会自动
 补写，成功后仅在 hash 仍匹配时删除对应日志。损坏的状态文件移入
 `pending-state-quarantine/`；v1 升级原件保存在 `pending-state-migration-backup/`。
+
+查看和迁移本机数据时，可以先使用只读命令：
+
+```bash
+python -m game_service.data_cli status
+python -m game_service.data_cli export classic-games-backup.json --include-recovery
+python -m game_service.data_cli preview-import classic-games-backup.json
+```
+
+导入不会覆盖已有冲突行，执行前会保留数据库备份，并且必须显式确认：
+
+```bash
+python -m game_service.data_cli import classic-games-backup.json --apply
+```
 
 每次新游戏生成一个稳定的 attempt UUID。2048 的里程碑、最终分数和失败重放
 使用同一 UUID 与递增 revision，因此晚到的旧记录不会覆盖最终分数或生成第二局。

@@ -22,11 +22,13 @@ dev = [
     "requests>=2.31",
     "coverage>=7.6",
     "ruff>=0.6",
+    "pip-audit>=2.10,<3",
 ]
 
 [project.scripts]
 classic-games = "client.launcher:main"
 classic-games-api = "game_service.cli:api_main"
+classic-games-data = "game_service.data_cli:main"
 
 [tool.setuptools.packages.find]
 include = ["client*", "game_service*", "server*"]

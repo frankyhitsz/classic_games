@@ -400,7 +400,7 @@ class Game2048SlotTests(unittest.TestCase):
         self.assertEqual(game.slot_load_state, "failed")
         self.assertIn("超时", game.slot_load_error)
 
-    def test_v2_slot_restores_attempt_and_terminal_slot_does_not_resume(self):
+    def test_v2_slot_restores_attempt_and_terminal_board_for_review(self):
         from client.games.game_2048 import Game2048
         profile_id = "b" * 32
         ruleset = GAME_BY_ID["2048"].ruleset_version
@@ -428,8 +428,9 @@ class Game2048SlotTests(unittest.TestCase):
                                   "ruleset_version": ruleset}),
             profile_id=profile_id)
         terminal_game._poll_slot_load()
-        self.assertEqual(terminal_game.state, "playing")
-        self.assertNotEqual(terminal_game.score, 16)
+        self.assertEqual(terminal_game.state, "gameover")
+        self.assertEqual(terminal_game.score, 16)
+        self.assertEqual(terminal_game.grid[0][0].value, 2)
 
 
 if __name__ == "__main__":

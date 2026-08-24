@@ -1,61 +1,54 @@
-# 第九次审查修复规格
+# 第十次审查修复规格
 
 ## 目标
 
-核对第九次审查提出的状态并发、启动档案、2048 自动存档和工程门禁问题。状态日志与 SQLite
-必须共享同一套胜出顺序；读取、重放或进程时钟回拨都不能让旧值覆盖已经提交的新值。
+逐条核对第十次审查的 23 条发现和 118 项建议。优先保证崩溃残留 journal、业务行损坏隔离和
+旧数据库升级都不会丢失或回退本机状态；同时关闭已能在当前产品内完成的身份、进度 HUD、2048
+存档冲突、数据恢复和发行门禁问题。
 
 ## 范围
 
-- SQLite schema v6 增加 `state_receipts`，状态值与胜出 revision、operation ID、payload hash、
-  occurred time 在同一事务提交；单调 progress merge 另存 operation receipt，保证晚到增量只合并一次；
-- 跨进程持久逻辑时钟在后台写线程分配，旧 operation 返回 `SUPERSEDED`，重复 operation 为
-  不修改业务行的幂等重放；
-- 状态查询只读内存快照，journal 和 receipt 重建转移到 read worker，并提供按 key 直接读取；
-- state journal v1 升级保留原字节、迁移到规范 ruleset key，并使用固定兼容表而非未来 catalog；
-- 启动档案显式区分 loading、load-failed 和 resolved；未解析时只排队游戏，不创建 guest；
-  读取失败可重试，或由用户按 G 明确选择 guest；
-- 2048 校验 won/最大方块、playing/死局和 slot revision；ruleset 不兼容不当作损坏，隔离成功
-  前不显示“已隔离”；profile ensure 与 slot load 使用异步链和同 key 合并，不占用写 worker；
-- score receipt 过期后从 attempt 语义重建，相同请求保持幂等，不同 payload 返回稳定冲突；
-- setting、progress、slot 增加版本、时间、ruleset 等数据库约束；score/state outbox 分别报告健康；
-- gameplay 子进程进入 coverage 汇总，移除未使用的 pytest 依赖。
+- state journal schema 3 为每个单调 progress 贡献保存 component ID/hash，聚合使用独立 ID；
+- SQLite schema 7 把 state receipt 与业务引用、权威值 hash 绑定，并为旧 profile、setting、
+  progress、slot 建立 synthetic baseline；
+- duplicate 前验证业务行，损坏 receipt 从权威行修复，缺失或隔离业务行同步失效所有相关回执；
+- state clock 从数据库 high-water 恢复，损坏或超大时钟保留原件；merge receipt 建索引并按
+  365 天有界清理，仍在 journal 中的 component 不清理；
+- 延迟或重复 score 重放不刷新档案 `last_used`，有效写入使用真实 `occurred_at`；
+- HTTP 调试启动器不再携带本机 default profile ID；Sokoban/Zuma 解包 state result 的 `value`；
+- 2048 恢复终局棋盘，autosave schema 4 使用 owner token、released 状态和显式接管；
+- 提供数据状态检查、JSON 导出、导入预览和带备份的原子导入命令；
+- 增加 release 测试入口、JUnit/JSON 结果、只读 Actions 权限和顶层发行约束。
 
-## 非目标与约束
+## 约束
 
-- 不改变五款游戏的计分、关卡或 ruleset；
-- 不增加账号、云同步、联网对战、遥测或广告；
-- 不替仓库所有者选择 LICENSE、素材授权声明或商标结论；
-- 同一档案的两个独立 2048 进程仍共享 `autosave` 语义键。schema v6 可阻止旧 revision 回写，
-  但“两个仍活跃的实例如何选择所有者”需要可见的接管/多槽交互，不能静默猜测；
-- GitHub branch protection 是仓库设置。本次验证 workflow 和推送后的实际运行结果，但不把
-  本地文件当作 required-check 已开启的证明。
+- 保持默认本地运行，不增加账号、云同步、遥测、广告或联网对战；
+- 不改变五款游戏当前计分和 ruleset；需改变玩法的建议进入逐项矩阵，不能冒充本轮已完成；
+- 文件锁、SQLite 和 fsync 不进入 pygame 帧线程；跨进程 revision 仍在写线程持久分配；
+- 数据导入默认只预览，必须显式 `--apply`，执行前创建数据库备份，现有冲突行优先；
+- LICENSE 必须由权利人选择。本轮提供权利、素材、商标和版本清单，但不伪造授权结论；
+- branch protection 和 required checks 是仓库设置，未经单独授权不修改。
 
 ## 关键决策
 
-1. `(logical_revision, operation_id)` 是状态的全局确定顺序。revision 较大者胜出；相同 revision
-   用 operation ID 确定顺序；相同 operation 与 hash 是幂等重放，hash 不同是冲突。
-2. `apply_state_operation` 在 `BEGIN IMMEDIATE` 内比较 receipt、修改业务表并更新 receipt。旧
-   operation 不触碰 value、version、timestamp 或 profile last-used。
-   `merge_progress` 是例外：旧快照写入仍淘汰，较旧但尚未应用的单调 merge 会合并一次，且不
-   回退胜出 revision。
-3. operation 的发生时间由 journal 保存，重放使用该时间；后台持久时钟只决定顺序，不冒充
-   业务发生时间。
-4. getter 不访问文件或 SQLite。首次无缓存时返回 `None`，后台重建后通过同一状态缓存可见；
-   外部较新 pending 可按 revision 覆盖旧 committed 快照。
-5. v1 ruleset 兼容映射是版本化常量。升级前写入 migration-backup，规范 key 与旧 key 冲突时
-   仍按相同 revision 规则合并。
-6. 档案读取失败不是“没有档案”。只有明确 no-profile 才 ensure 默认 guest；错误状态只能重试
-   或由用户明确选择 guest。
-7. 2048 的坏槽删除是一个需要确认的异步动作。Future 未成功前保持玩法与自动写入门禁。
+1. progress component 是幂等最小单元，aggregate 只是可重建的传输封装。相同 component ID/hash
+   可重复，相同 ID 不同 hash 为冲突。
+2. receipt 不是业务事实本身。任何 duplicate、状态重建或状态查询都以当前业务行为权威来源；
+   回执缓存损坏时修回执，业务行缺失时删回执并保留 journal 的重建机会。
+3. baseline 的 revision 来自业务 `updated_at`，新本机操作同时比较发生时间和顺序。比基线更旧的
+   latest-value journal 被淘汰；单调 merge 仍可贡献尚未应用的 component。
+4. 2048 terminal slot 是可查看的完成记录，不自动替换。active autosave 需要同 owner 或显式声明
+   takeover，正常退出尽力写 released。
+5. 测试仍保留 unittest、gameplay runner 和 stress 三层；`tests.release` 只负责编排与机器结果，
+   不把现有测试强行改写成另一框架。
 
 ## 验收标准
 
-- F01–F28 逐项给出成立性、代码证据和未完成边界；132 项优化建议逐项标记；
-- setting、profile rename、set-progress 和 slot 的旧 operation 均无法覆盖已提交的新 operation；
-- crash-after-commit 重放不增加版本、不刷新时间；receipt 过期的 score 重试不产生第二条 attempt；
-- 主线程状态 getter 和状态提交入口不等待 journal 文件锁；时钟回拨后 revision 仍递增；
-- v1 原文件有备份并迁入规范 key；历史 state quarantine 重启后仍提示；
-- 启动 load 未完成时不 ensure guest，失败后不静默降级；queued launch 绑定最终档案；
-- 2048 不恢复矛盾 won 状态或死局 playing 状态，隔离文案等待真实确认；
-- 两轮独立复查完成，完整功能、存储、压力、静态检查、编译、coverage 和远端 CI 通过。
+- F01–F23 和 P0–P3 共 118 项均有成立性、处理状态和证据；
+- commit-before-unlink 后晚到 progress 贡献不丢，重复 component 不增加版本；
+- setting/progress/slot 被删或隔离后，有效 journal 可重建，坏 receipt JSON 不删除业务状态；
+- v6 既有新值升级后拒绝更旧 profile、setting 和 slot journal，新 revision 高于基线；
+- 晚到 merge 后 winner duplicate 返回当前合并值，未应用 stale merge 状态仍为 pending；
+- HTTP 身份、score 时间、Sokoban/Zuma HUD、2048 terminal/ownership 均有定向测试；
+- 完成两轮独立复查，完整 storage、gameplay、stress、Ruff、compile、wheel 和数据导入演练通过；
+- 提交推送后 release-gate、三平台和 Python 兼容 CI 通过。

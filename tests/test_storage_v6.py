@@ -122,14 +122,14 @@ class StateJournalV2Tests(unittest.TestCase):
             outbox.refresh_count()
             entry = outbox.list_entries()[0]
             ruleset = GAME_BY_ID["zuma"].ruleset_version
-            self.assertEqual(entry["schema_version"], 2)
+            self.assertEqual(entry["schema_version"], 3)
             self.assertEqual(entry["ruleset_version"], ruleset)
             self.assertEqual(entry["args"][4], ruleset)
             canonical = outbox._target(entry["key"])
             self.assertFalse(target.exists())
             self.assertEqual(
                 json.loads(canonical.read_text(
-                    encoding="utf-8"))["schema_version"], 2)
+                    encoding="utf-8"))["schema_version"], 3)
             self.assertTrue(any(outbox.migration_backup_path.iterdir()))
 
     def test_corrupt_state_is_quarantined_with_notice(self):
