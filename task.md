@@ -53,3 +53,6 @@
 - storage + stress 分支覆盖率 62%，通过 60% 门槛；
 - Ruff、Python 编译、shell 语法、whitespace、默认数据库指纹和 wheel 导入 smoke 通过；
 - `games_env` 未安装 coverage/build，最终检查从临时目录载入工具，没有修改用户环境。
+- 首次推送触发的 CI 暴露 Ruff 0.16 扩大隐式规则集造成的工具漂移；现显式固定项目既有
+  correctness 规则，并用 Ruff 0.12 与 0.16.4 双版本检查。GitHub Actions 升至 Node 24 的
+  v7 action，移除 runner 的 Node 20 弃用路径。

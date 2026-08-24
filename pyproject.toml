@@ -36,6 +36,12 @@ include = ["client*", "game_service*", "server*"]
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint]
+# Keep CI on the project's established correctness checks. Ruff 0.16 changed
+# its implicit rule set; new modernization/style families are adopted only
+# after a dedicated cleanup instead of turning an unrelated release red.
+select = ["E4", "E7", "E9", "F"]
+
 [tool.coverage.run]
 branch = true
 source = ["client", "game_service", "server"]
