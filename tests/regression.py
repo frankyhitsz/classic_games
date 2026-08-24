@@ -26,10 +26,13 @@ ENV = {
 }
 PASS, FAIL = 0, 0
 SUBPROCESS_TIMEOUT_SECONDS = 30
+ONLY_CHECK = os.environ.get("CLASSIC_GAMES_CHECK")
 
 
 def run(name: str, body: str) -> None:
     global PASS, FAIL
+    if ONLY_CHECK and name != ONLY_CHECK:
+        return
     src = dedent(body).strip()
     full = "import sys; sys.path.insert(0, %r)\n" % str(ROOT) + src
     started = time.perf_counter()
@@ -2457,8 +2460,10 @@ run("2048-async-score-update-order", """
     backend = DelayedBackend(); g = Game2048(backend=backend)
     g.score = 100; g._submit_score(extra={'won':True})
     g.score = 250; g._submit_score(extra={'final':True})
-    time.sleep(0.10); g._poll_score_submission()
-    time.sleep(0.10); g._poll_score_submission()
+    deadline = time.monotonic() + 5.0
+    while g.submitted_score != 250 and time.monotonic() < deadline:
+        g._poll_score_submission()
+        time.sleep(0.01)
     assert len(backend.calls) == 2, backend.calls
     assert backend.calls[0][1].get('submission_id') is None
     assert backend.calls[1][1].get('submission_id') == 42

@@ -55,3 +55,7 @@
 - gameplay parallel coverage 模式 107 项通过，独立汇总已覆盖 client/game_service/server，结果 60%；
 - Ruff、Python compileall、shell 语法、whitespace、28 条问题矩阵、132 条优化矩阵均通过；
 - 无 build 模块依赖，使用 `pip wheel --no-deps --no-build-isolation` 成功生成 130,988 字节 wheel。
+- 首次推送的 CI #18 在 macOS coverage 模式暴露 `2048-async-score-update-order` 使用两个固定
+  100 ms sleep；慢 runner 上第二个异步回执尚未完成。用例改为 5 秒 deadline 内轮询真实状态，
+  不放宽产品超时；普通和 coverage 单项模式均通过。runner 同时支持 `CLASSIC_GAMES_CHECK`
+  选择单项，便于复现平台失败。
