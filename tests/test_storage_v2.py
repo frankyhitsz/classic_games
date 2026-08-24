@@ -368,16 +368,16 @@ class AttemptModelTests(unittest.TestCase):
             lock.execute("BEGIN IMMEDIATE")
             first = backend.submit_score_async(
                 "2048", "p", 100, request_id="milestone-request-00000001",
-                attempt_uuid=attempt, revision=1).result(timeout=1)
+                attempt_uuid=attempt, revision=1).result(timeout=5)
             self.assertTrue(first["durable_pending"])
             lock.rollback()
             lock.close()
             final = backend.submit_score_async(
                 "2048", "p", 200, request_id="final-request-00000000001",
-                attempt_uuid=attempt, revision=2).result(timeout=1)
+                attempt_uuid=attempt, revision=2).result(timeout=5)
             self.assertTrue(final["ok"])
-            backend.retry_failed_saves().result(timeout=1)
-            self.assertTrue(backend.drain(2))
+            backend.retry_failed_saves().result(timeout=5)
+            self.assertTrue(backend.drain(5))
             self.assertEqual(backend.store.attempt_count("2048"), 1)
             recent = backend.store.recent()
             self.assertEqual(recent[0]["score"], 200)

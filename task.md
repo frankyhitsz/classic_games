@@ -76,3 +76,6 @@
   同步保存 p95。游戏走另行验证的异步入队路径，因此 CI 的同步磁盘退化线改为 250 ms，本机
   16.7 ms 门槛不变。macOS stress 已通过，仅 gameplay step 仍失败，但测试进程内部的 workflow
   command 未被 runner 收录；workflow 现从 shell 外层发布失败用例名。
+- CI #11 在 macOS 复现后台持久化完成超过测试固定 1 秒、Windows 复现 16 个直连写者在慢 fsync
+  下耗尽 2 秒 busy timeout。两项都不是前台延迟约束：后台 Future 等待改为 5 秒；仅测试使用的
+  Windows 多写者完整性场景允许 60 秒锁等待，提交返回速度仍由独立的异步入队 p99 断言约束。
