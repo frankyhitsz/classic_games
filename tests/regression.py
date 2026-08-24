@@ -704,6 +704,7 @@ print("\n=== 25. Launcher formats recent rows with the game name visible ===")
 run("launcher-recent-shows-game-name", """
     import os; os.environ['SDL_VIDEODRIVER']='dummy'; os.environ['GAMES_USE_HTTP']='1'
     import threading, time, pygame
+    import client.common.network as network
     from client.common.network import BackendClient
     import client.launcher as L
     captured_recent = []
@@ -713,7 +714,7 @@ run("launcher-recent-shows-game-name", """
             captured_recent.extend(entries)
         return orig(surf, rect, entries, title=title, **kw)
     L.draw_leaderboard = spy
-    class FakeLocal(BackendClient):
+    class FakeHTTP(BackendClient):
         def __init__(self, *a, **k): super().__init__()
         def health(self): return True
         def list_games(self, *a, **k): return []
@@ -722,9 +723,11 @@ run("launcher-recent-shows-game-name", """
             {'game_id':'tetris', 'player':'a', 'score':100},
             {'game_id':'snake', 'player':'b', 'score':200},
         ]
-    L.LocalBackendClient = FakeLocal
+    network.BackendClient = FakeHTTP
     def driver():
-        time.sleep(0.4)
+        deadline = time.monotonic() + 5.0
+        while not captured_recent and time.monotonic() < deadline:
+            time.sleep(0.02)
         pygame.event.post(pygame.event.Event(pygame.QUIT))
     threading.Thread(target=driver, daemon=True).start()
     L.main()
