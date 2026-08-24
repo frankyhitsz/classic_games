@@ -1,4 +1,4 @@
-"""Focused checks for the fourth-review storage and lifecycle boundaries."""
+"""Focused checks for local storage and lifecycle boundaries."""
 
 from __future__ import annotations
 
@@ -19,10 +19,35 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 
 from game_service.local_backend import (LocalBackendClient,
                                         PersistentSaveOutbox)
-from game_service.store import LocalGameStore, StoreError
+from game_service.catalog import GAMES
+from game_service.mutation import MAX_SQLITE_INTEGER
+from game_service.store import (LEGACY_RULESET_VERSION, LocalGameStore,
+                                StoreError)
 
 
 class LocalAsyncTests(unittest.TestCase):
+    def test_integrated_spool_conflict_never_reaches_empty_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = LocalBackendClient(
+                db_path=root / "games.db", outbox_path=root / "pending")
+            request_id = "integrated-conflict-request-001"
+            original = backend.outbox.add({
+                "game_id": "snake", "player": "p", "score": 10,
+                "request_id": request_id,
+            })
+            result = backend.submit_score(
+                "snake", "p", 20, request_id=request_id)
+            self.assertEqual(result["code"], "request_id_conflict")
+            self.assertFalse(result["retryable"])
+            self.assertEqual(result["existing_payload_hash"],
+                             original.payload_hash)
+            self.assertNotEqual(result["new_payload_hash"],
+                                original.payload_hash)
+            self.assertEqual(backend.store.attempt_count(), 0)
+            self.assertEqual(backend.outbox.list()[0]["score"], 10)
+            backend.close()
+
     def test_current_schema_startup_does_not_wait_for_write_lock(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -128,6 +153,47 @@ os._exit(0 if result.get('durable_pending') else 7)
 
 
 class SpoolTests(unittest.TestCase):
+    def test_no_hardlink_fallback_publishes_complete_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spool = PersistentSaveOutbox(root / "pending")
+            with mock.patch("game_service.local_backend.os.link",
+                            side_effect=OSError("unsupported")):
+                envelope = spool.add({
+                    "game_id": "tetris", "player": "p", "score": 7,
+                    "request_id": "fallback-request-000000001",
+                })
+            target = root / "pending" / f"{envelope.request_id}.json"
+            self.assertTrue(target.is_file())
+            self.assertEqual(spool.list()[0]["score"], 7)
+            self.assertEqual(list((root / "pending").glob("*.tmp")), [])
+
+    def test_misnamed_valid_file_is_restored_to_canonical_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spool = PersistentSaveOutbox(root / "pending")
+            envelope = spool.add({
+                "game_id": "zuma", "player": "p", "score": 8,
+                "request_id": "canonical-request-00000001",
+            })
+            canonical = root / "pending" / f"{envelope.request_id}.json"
+            wrong = root / "pending" / "wrong-name.json"
+            os.replace(canonical, wrong)
+            self.assertEqual(spool.list()[0]["score"], 8)
+            self.assertTrue(canonical.is_file())
+            self.assertFalse(wrong.exists())
+
+    def test_oversized_file_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pending = root / "pending"
+            pending.mkdir()
+            (pending / "oversized.json").write_bytes(b"{" + b"x" * 70000)
+            spool = PersistentSaveOutbox(pending)
+            self.assertEqual(spool.list(), [])
+            self.assertEqual(spool.quarantined_count, 1)
+            self.assertTrue(list((root / "pending-quarantine").iterdir()))
+
     def test_bad_item_is_quarantined_without_blocking_good_item(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -209,6 +275,87 @@ class SpoolTests(unittest.TestCase):
 
 
 class AttemptModelTests(unittest.TestCase):
+    def test_expired_receipt_replays_derived_attempt_without_duplicate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalGameStore(Path(directory) / "games.db")
+            request_id = "expired-receipt-request-0001"
+            first = store.record_score(
+                "snake", "p", 12, request_id=request_id)
+            with store.connection() as connection:
+                connection.execute(
+                    "DELETE FROM save_requests WHERE request_id=?", (request_id,))
+                connection.commit()
+            replay = store.record_score(
+                "snake", "p", 12, request_id=request_id)
+            self.assertEqual(replay["id"], first["id"])
+            self.assertTrue(replay["no_op"])
+            self.assertEqual(store.attempt_count(), 1)
+
+    def test_corrupt_receipt_is_rebuilt_from_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalGameStore(Path(directory) / "games.db")
+            request_id = "corrupt-receipt-request-0001"
+            first = store.record_score(
+                "snake", "p", 13, request_id=request_id)
+            with store.connection() as connection:
+                connection.execute(
+                    "UPDATE save_requests SET response_json='{' "
+                    "WHERE request_id=?", (request_id,))
+                connection.commit()
+            replay = store.record_score(
+                "snake", "p", 13, request_id=request_id)
+            self.assertEqual(replay["id"], first["id"])
+            self.assertEqual(store.attempt_count(), 1)
+            with store.connection() as connection:
+                value = connection.execute(
+                    "SELECT response_json FROM save_requests WHERE request_id=?",
+                    (request_id,)).fetchone()[0]
+            self.assertTrue(json.loads(value)["ok"])
+
+    def test_revision_policy_rejects_mixed_score_metadata_and_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalGameStore(Path(directory) / "games.db")
+            attempt = "monotonic-policy-attempt-00001"
+            store.record_score(
+                "2048", "p", 100, extra={"tile": 16}, attempt_uuid=attempt,
+                revision=1, request_id="policy-origin-request-00001")
+            with self.assertRaises(StoreError) as lower:
+                store.record_score(
+                    "2048", "p", 90, extra={"tile": 32},
+                    attempt_uuid=attempt, revision=2,
+                    request_id="policy-lower-request-000001")
+            self.assertEqual(lower.exception.code, "score_regression")
+            with self.assertRaises(StoreError) as status:
+                store.record_score(
+                    "2048", "p", 110, status="practice",
+                    attempt_uuid=attempt, revision=2,
+                    request_id="policy-status-request-00001")
+            self.assertEqual(status.exception.code, "attempt_status_conflict")
+            with self.assertRaises(StoreError) as final_only:
+                final_attempt = "final-policy-attempt-0000001"
+                store.record_score(
+                    "snake", "p", 5, attempt_uuid=final_attempt, revision=1,
+                    request_id="final-policy-origin-0000001")
+                store.record_score(
+                    "snake", "p", 6, attempt_uuid=final_attempt, revision=2,
+                    request_id="final-policy-update-0000001")
+            self.assertEqual(final_only.exception.code, "attempt_finalized")
+
+    def test_empty_transport_ids_and_oversized_integers_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = LocalGameStore(Path(directory) / "games.db")
+            for field, kwargs, code in (
+                ("request", {"request_id": ""}, "invalid_request_id"),
+                ("attempt", {"attempt_uuid": ""}, "invalid_attempt_uuid"),
+                ("revision", {"revision": MAX_SQLITE_INTEGER + 1},
+                 "invalid_revision"),
+                ("submission", {"submission_id": MAX_SQLITE_INTEGER + 1},
+                 "invalid_submission_id"),
+            ):
+                with self.subTest(field=field), self.assertRaises(StoreError) as raised:
+                    store.record_score("tetris", "p", 1, **kwargs)
+                self.assertEqual(raised.exception.code, code)
+
     def test_pending_milestone_final_and_replay_are_one_attempt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -317,6 +464,42 @@ class AttemptModelTests(unittest.TestCase):
 
 
 class RecoveryAndBoundaryTests(unittest.TestCase):
+    def test_2048_same_score_final_metadata_is_not_dropped(self):
+        import pygame
+        from client.games.game_2048 import Game2048
+
+        pygame.init()
+
+        class Backend:
+            def __init__(self):
+                self.calls = []
+                self.futures = [Future(), Future()]
+
+            def submit_score_reliable_async(self, *_args, **kwargs):
+                self.calls.append(kwargs)
+                return self.futures[len(self.calls) - 1]
+
+            def leaderboard_async(self, *_args, **_kwargs):
+                future = Future()
+                future.set_result([])
+                return future
+
+        backend = Backend()
+        game = Game2048(backend=backend)
+        game.score = 100
+        game._submit_score(extra={"won": True})
+        game._submit_score(extra={"won": True, "final": True})
+        backend.futures[0].set_result({"ok": True, "id": 1, "score": 100})
+        game._poll_score_submission()
+        self.assertEqual(len(backend.calls), 2)
+        self.assertEqual(backend.calls[1]["extra"],
+                         {"won": True, "final": True})
+        backend.futures[1].set_result({"ok": True, "id": 1, "score": 100})
+        game._poll_score_submission()
+        self.assertEqual(game.submitted_extra,
+                         {"won": True, "final": True})
+        pygame.quit()
+
     def test_failed_schema_migration_rolls_back_schema_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "v1.db"
@@ -362,7 +545,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
             self.assertEqual(store.attempt_count(), 0)
             self.assertIn("缺少字段", store.migration_notice)
 
-    def test_corrupt_legacy_rows_are_skipped_individually(self):
+    def test_corrupt_legacy_metadata_recovers_base_score(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             legacy = root / "legacy.db"
@@ -375,8 +558,168 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
                 connection.execute(
                     "INSERT INTO scores VALUES (2,'zuma','bad',60,'{',2.0)")
             store = LocalGameStore(root / "games.db", legacy_db_path=legacy)
-            self.assertEqual(store.attempt_count("zuma"), 1)
-            self.assertIn("1 条无效记录", store.migration_notice)
+            self.assertEqual(store.attempt_count("zuma"), 2)
+            self.assertIn("成绩已恢复", store.migration_notice)
+
+    def test_python_repr_legacy_extra_is_imported_under_legacy_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "legacy.db"
+            with sqlite3.connect(legacy) as connection:
+                connection.execute(
+                    "CREATE TABLE scores (id INTEGER PRIMARY KEY, game_id TEXT, "
+                    "player TEXT, score, extra TEXT, created_at REAL)")
+                connection.execute(
+                    "INSERT INTO scores VALUES "
+                    "(1,'tetris','old',88,\"{'lines': 4, 'level': 2}\",1.0)")
+            store = LocalGameStore(root / "games.db", legacy_db_path=legacy)
+            self.assertEqual(store.leaderboard("tetris"), [])
+            legacy_board = store.leaderboard(
+                "tetris", ruleset_version=LEGACY_RULESET_VERSION)
+            self.assertEqual(legacy_board[0]["score"], 88)
+            with store.connection() as connection:
+                extra = connection.execute(
+                    "SELECT extra_json FROM attempts").fetchone()[0]
+            self.assertEqual(json.loads(extra), {"lines": 4, "level": 2})
+
+    def test_current_ruleset_versions_are_explicit(self):
+        self.assertEqual(
+            {game.id: game.ruleset_version for game in GAMES},
+            {"tetris": "tetris-assist-2", "snake": "snake-classic-1",
+             "2048": "2048-classic-2",
+             "sokoban": "sokoban-campaign-2",
+             "zuma": "zuma-classic-2"})
+
+    def test_same_version_missing_index_is_backed_up_and_repaired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "games.db"
+            LocalGameStore(database)
+            with sqlite3.connect(database) as connection:
+                connection.execute("DROP INDEX idx_attempts_best")
+            repaired = LocalGameStore(database)
+            self.assertIsNotNone(repaired.migration_backup)
+            self.assertTrue(repaired.migration_backup.is_file())
+            with repaired.connection() as connection:
+                indexes = {row["name"] for row in
+                           connection.execute("PRAGMA index_list(attempts)")}
+            self.assertIn("idx_attempts_best", indexes)
+
+    def test_changed_external_legacy_source_is_reimported_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "legacy.db"
+            with sqlite3.connect(legacy) as connection:
+                connection.execute(
+                    "CREATE TABLE scores (id INTEGER PRIMARY KEY, game_id TEXT, "
+                    "player TEXT, score, extra TEXT, created_at REAL)")
+                connection.execute(
+                    "INSERT INTO scores VALUES (1,'zuma','old',10,NULL,1.0)")
+            database = root / "games.db"
+            LocalGameStore(database, legacy_db_path=legacy)
+            with sqlite3.connect(legacy) as connection:
+                connection.execute(
+                    "INSERT INTO scores VALUES (2,'zuma','new',20,NULL,2.0)")
+            reopened = LocalGameStore(database, legacy_db_path=legacy)
+            self.assertEqual(reopened.attempt_count("zuma"), 2)
+            with reopened.connection() as connection:
+                marker = connection.execute(
+                    "SELECT value FROM schema_meta "
+                    "WHERE key LIKE 'legacy_scores_v3_%'").fetchone()[0]
+            report = json.loads(marker)
+            self.assertEqual((report["valid"], report["skipped"],
+                              report["imported"]), (2, 0, 1))
+
+    def test_different_legacy_sources_with_same_row_id_do_not_collide(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = [root / "first" / "legacy.db",
+                       root / "second" / "legacy.db"]
+            for index, source in enumerate(sources, start=1):
+                source.parent.mkdir()
+                with sqlite3.connect(source) as connection:
+                    connection.execute(
+                        "CREATE TABLE scores (id INTEGER PRIMARY KEY, "
+                        "game_id TEXT, player TEXT, score, extra TEXT, "
+                        "created_at REAL)")
+                    connection.execute(
+                        "INSERT INTO scores VALUES (1,'snake',?,?,NULL,?)",
+                        (f"p{index}", index * 10, float(index)))
+            database = root / "games.db"
+            LocalGameStore(database, legacy_db_path=sources[0])
+            store = LocalGameStore(database, legacy_db_path=sources[1])
+            self.assertEqual(store.attempt_count("snake"), 2)
+            board = store.leaderboard(
+                "snake", ruleset_version=LEGACY_RULESET_VERSION)
+            self.assertEqual({row["score"] for row in board}, {10, 20})
+
+    def test_same_version_missing_receipt_unique_index_is_repaired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "games.db"
+            LocalGameStore(database)
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "DROP INDEX idx_save_requests_request_id")
+            repaired = LocalGameStore(database)
+            self.assertIsNotNone(repaired.migration_backup)
+            with repaired.connection() as connection:
+                indexes = {row["name"] for row in
+                           connection.execute("PRAGMA index_list(save_requests)")}
+            self.assertIn("idx_save_requests_request_id", indexes)
+
+    def test_transient_initialization_lock_self_heals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "games.db"
+            store = LocalGameStore(database)
+            with store.connection() as connection:
+                connection.execute(
+                    "UPDATE schema_meta SET value='2' WHERE key='version'")
+                connection.commit()
+            blocker = sqlite3.connect(database)
+            blocker.execute("BEGIN IMMEDIATE")
+            backend = LocalBackendClient(
+                db_path=database, outbox_path=root / "pending")
+            self.assertIsNone(backend.store)
+            blocker.rollback()
+            blocker.close()
+            self.assertTrue(backend.storage_status().readable)
+            self.assertIsNotNone(backend.store)
+            backend.close()
+
+    def test_long_lived_client_discovers_external_pending_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            backend = LocalBackendClient(
+                db_path=root / "games.db", outbox_path=root / "pending")
+            PersistentSaveOutbox(root / "pending").add({
+                "game_id": "sokoban", "player": "other", "score": 22,
+                "request_id": "external-pending-request-0001",
+            })
+            self.assertEqual(backend.retry_failed_saves(), 1)
+            self.assertTrue(backend.drain(2))
+            self.assertEqual(backend.store.attempt_count("sokoban"), 1)
+            backend.close()
+
+    def test_local_sync_api_rejects_unknown_keyword(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend = LocalBackendClient(db_path=Path(directory) / "games.db")
+            with self.assertRaises(TypeError):
+                backend.submit_score("snake", "p", 1, unexpected=True)
+            backend.close()
+
+    def test_flask_leaderboard_rejects_profile_id_as_json(self):
+        try:
+            from server.app import create_app
+        except ImportError:
+            self.skipTest("Flask optional dependency is not installed")
+        with tempfile.TemporaryDirectory() as directory:
+            app = create_app({"TESTING": True,
+                              "DB_PATH": str(Path(directory) / "games.db")})
+            response = app.test_client().get(
+                "/api/leaderboard/tetris?profile_id=p")
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.get_json()["code"],
+                             "unsupported_query_parameter")
 
     def test_core_import_does_not_require_requests(self):
         code = """

@@ -36,10 +36,8 @@ def import_game_module(game_id: str):
 # crisply at the current card size; we don't depend on any external image
 # assets (which keeps the project self-contained).
 #
-# Design notes: tried pixel-art (per the pixel-art skill's principles) but
-# at 48-72px the block grid was too coarse to render recognizable shapes.
-# Settled on smooth vector shapes with strong silhouettes + accent
-# highlights, which read clearly even at small sizes.
+# Smooth vector shapes keep the icons recognizable at card size and avoid
+# introducing external image assets.
 # ---------------------------------------------------------------------------
 def draw_game_icon(surf, gid: str, cx: int, cy: int, size: int = 56) -> None:
     """Draw a small visual signature for each game centered at (cx, cy)."""
@@ -328,18 +326,20 @@ def main():
     # Animated hover lift: each card has a current lift value that we
     # ease toward its target (1.0 on hover, 0.0 otherwise) every frame.
     card_lift = {g["id"]: 0.0 for g in games_meta}
-    launch_error = (getattr(backend, "recovery_notice", None)
-                    or getattr(backend, "initialization_error", None))
+    launch_error = getattr(backend, "initialization_error", None)
     quit_with_unsaved_armed = False
+    quit_with_unsaved_deadline = 0.0
 
     def exit_confirmed() -> bool:
-        nonlocal quit_with_unsaved_armed
+        nonlocal quit_with_unsaved_armed, quit_with_unsaved_deadline
         durable = getattr(backend, "pending_saves_are_durable", False)
         if durable or backend.failed_save_count() == 0:
             return True
-        if quit_with_unsaved_armed:
+        now_ = time.monotonic()
+        if quit_with_unsaved_armed and now_ <= quit_with_unsaved_deadline:
             return True
         quit_with_unsaved_armed = True
+        quit_with_unsaved_deadline = now_ + 3.0
         return False
 
     running = True
@@ -347,6 +347,11 @@ def main():
     while running:
         frame_dt = clock.tick(60) / 1000.0
         now = time.monotonic()
+        if quit_with_unsaved_armed and now > quit_with_unsaved_deadline:
+            quit_with_unsaved_armed = False
+        poll_pending = getattr(backend, "poll_pending_saves", None)
+        if callable(poll_pending):
+            poll_pending()
         poll_network()
         if (health_future is None
                 and now - last_health_check >= HEALTH_REFRESH_SECS):
@@ -402,6 +407,7 @@ def main():
                 elif event.key == pygame.K_s and backend.failed_save_count():
                     backend.retry_failed_saves()
                     quit_with_unsaved_armed = False
+                    quit_with_unsaved_deadline = 0.0
                     continue
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if player_input_rect.collidepoint(event.pos):
@@ -552,16 +558,20 @@ def main():
                   f"玩家: {player.strip() or 'guest'}",
                   (WIDTH // 2, HEIGHT - 14), size=11,
                   color=COLORS["text_dim"], center=True)
+        recovery_notice = getattr(backend, "recovery_notice", None)
         if launch_error:
             draw_text(screen, launch_error, (WIDTH // 2, HEIGHT - 34),
                       size=12, color=COLORS["danger"], center=True)
         elif records_error:
             draw_text(screen, records_error, (WIDTH // 2, HEIGHT - 34),
                       size=12, color=COLORS["danger"], center=True)
+        elif recovery_notice:
+            draw_text(screen, recovery_notice, (WIDTH // 2, HEIGHT - 34),
+                      size=12, color=COLORS["accent"], center=True)
         failed_saves = backend.failed_save_count()
         if failed_saves:
             draw_text(screen,
-                      ("成绩未落盘 · 再次退出将放弃"
+                      ("成绩未落盘 · 3 秒内再次退出将放弃"
                        if quit_with_unsaved_armed
                        else f"有 {failed_saves} 条成绩尚未保存 · 按 S 重试"),
                       (WIDTH // 2, HEIGHT - 34), size=12,

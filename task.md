@@ -1,71 +1,64 @@
-# 第四次审查修复记录
+# 第五次审查修复记录
 
-## 当前状态
+## 状态
 
-- [x] 确认基线、远端和用户已有的任务书替换；
-- [x] 完整阅读第四次审查任务书并建立 F01–F19 核对表；
-- [x] 实现非阻塞 worker、durable spool 和统一 mutation；
-- [x] 完成 schema v2、attempt UUID/revision 和查询修复；
-- [x] 完成迁移、退出保护、类型状态和可选依赖修复；
-- [x] 增加第四轮边界与压力检查；
-- [x] 完成第一轮独立复核并重新验证；
-- [x] 完成第二轮独立复核并重新验证；
-- [x] 更新 README、规格和逐条审查答复。
+- [x] 核对第五次审查任务书 F01–F21；
+- [x] 修复 request ID、旧数据、规则版本和 attempt 合并问题；
+- [x] 完成 spool、schema、自恢复、worker、API 与 UI 边界修改；
+- [x] 增加第五轮存储和生命周期用例；
+- [x] 完成两轮独立复查并再次验证；
+- [x] 更新规格、README 和逐条审查结论；
+- [ ] 创建提交并推送远端。
 
-## 初步核对
+## 实现摘要
 
-- F01–F09、F12–F16 均能由当前控制流或最小复现证实；
-- F10 是已存在但未接入的数据维度，本轮随 schema v2 完整接入；
-- F11 的三张表没有任何 API 或 UI，选择删除空壳而不是虚构功能；
-- F17 是统计口径选择，README 改为“每次结算”，不擅自记录 abandoned；
-- F18 混合了可靠性缺陷和数据管理产品功能，只修复前者；
-- F19 的 LAN 风险成立，文档明确边界，不建设账号或复杂 token；
-- P2/P3 的输入、音频、玩法、编辑器、打包和社区文件保留为路线建议。
+- schema 升至 v3。当前规则版本分别为 `tetris-assist-2`、`snake-classic-1`、
+  `2048-classic-2`、`sokoban-campaign-2` 和 `zuma-classic-2`；旧库导入为
+  `legacy-v1`。
+- 待保存文件的 request 冲突在访问 SQLite 前返回 409，并带原、新 payload hash。
+- 旧附加信息依次尝试 JSON 和受限 `ast.literal_eval`；无法读取或超过限制时保留基础成绩。
+- schema 快路径核对 attempts 和 receipt 的命名索引；同版本修复也先备份。未使用但非空的
+  progress/save/settings 表改名存档，不直接删除。
+- 2048/推箱子 revision 不允许降低分数，三款 final-only 游戏不接受后续状态更新，attempt
+  状态不可从练习切换为完成或反向切换。
+- receipt 损坏时删除缓存并从 attempt 重建；receipt 过期后，派生 attempt UUID 仍参与查询。
+- spool fallback 使用逐 request 锁和原子替换，POSIX 发布与删除后同步目录；错名可恢复，坏文件
+  隔离，单文件限制 64 KiB，并有 10,000 文件和 64 MiB 告警线。
+- 读写 executor 分开，pending 每批最多处理 128 条，启动器每两秒在后台发现其他实例新增文件。
+  临时初始化失败会在健康检查、读取或保存时重开仓储。
+- `AttemptContext` 统一 game/profile/mode/ruleset/status、attempt UUID 和 revision。
+- Flask leaderboard 不再接收 `profile_id`，所有端点拒绝未知查询参数并返回 JSON 400；未预期异常
+  返回 JSON 500。本地同步保存也不再忽略未知关键字。
+- 未保存退出/重置确认 3 秒后失效；待保存提示改为“已写入待保存文件”。
 
-## 实现记录
+## 第一轮复查
 
-- `LocalWriteWorker` 以真实 Future 执行本地读写；SQLite busy timeout 从 5 秒缩短到 250 ms；
-- 当前 schema 启动使用只读快路径，回执维护在后台执行；
-- `ScoreMutation` 在 spool/SQLite/HTTP 前统一验证 extra、ID、维度和 revision；
-- 共享 JSON 改为逐 request spool 文件，使用唯一临时文件、fsync 和排他发布；
-- 坏 envelope 按原因移入唯一 quarantine，旧 JSON 数组可逐项迁移；
-- schema v2 加入 attempt UUID、revision、profile/mode/ruleset/status 和 `score_achieved_at`；
-- 2048 与 BaseGame 的重试复用 request ID、attempt UUID 和 revision；
-- strict submission ID、personal best rank、最佳 attempt tie 查询和 stale revision 已完成；
-- 外部旧库做列检查和逐行规范化，DDL 迁移使用显式事务；
-- 统一破坏性操作保护覆盖窗口关闭、Esc、返回按钮、重置和推箱子关卡切换；
-- `StorageStatus/DataResult/GameDataService` 解耦游戏与具体后端；
-- `pyproject.toml` 将 core、api、dev 依赖分开，HTTP 客户端延迟导入。
+- 发现不同路径旧库使用相同行号时仍可能产生相同 request ID；现改为按来源路径散列生成，新增
+  两个来源、相同行号的导入用例。
+- 发现回执表唯一约束未纳入 schema 快路径；增加命名唯一索引、重复回执清理和同版本修复用例。
+- 旧库 marker 补齐来源指纹、有效/跳过/仅恢复分数和新增数量。
+- `AttemptContext` 补齐 game、attempt UUID 与 revision，不再只封装查询维度。
+- pending 目录扫描移到只读 executor，关闭时取消未开始的普通读取，只等待必要写入。
 
-## 第一轮独立复核
+## 第二轮复查
 
-- 发现 schema DDL 使用 `executescript` 时不能证明整体回滚，改为显式事务，并增加注入失败测试；
-- 发现同分 extra-only 更新会改变 tie 时间，增加 `score_achieved_at`；
-- 发现 spool 的时间和计数字段会接受 bool/NaN，补严格有限数验证；
-- 发现永久 payload 冲突可能留在重试状态，改为保留原 spool、明确拒绝新 payload；
-- 修复后原有回归、18 项当时的边界套件和压力检查全部通过。
-
-## 第二轮独立复核
-
-- 发现已是当前 schema 的启动仍会争抢 5 秒写锁，增加只读 schema 快路径和后台维护；
-- 增加强制 `os._exit` 后的 durable spool 恢复；
-- 增加 UI 重试 attempt/revision 稳定性和持锁提交 p99 压力；
-- 验证 32 个独立进程并发写 spool，32 条均可解析；
-- 构建 `classic_games_hub-0.4.0` wheel 成功，清理并忽略本地构建产物；
-- 阻止 requests 导入时，launcher 和游戏 core 模块仍能加载；
-- shell 语法、compileall、Ruff 和 diff whitespace 检查通过。
+- 发现 2048 在首个请求仍在途时只比较分数，会丢掉“同分但最终元数据不同”的后续状态；现比较
+  score 与 extra，并增加异步用例。
+- 旧库 upsert 改为先按 source key、attempt UUID 或 request ID 找原记录，兼容早期 marker 写法，
+  修复来源后不会重复插入。
+- spool 增加总大小告警；标识符在长度检查前先做 NFC 规范化。
 
 ## 验证结果
 
-- 原有功能回归：107 PASS，0 失败；
-- 第四轮边界套件：21 项通过；
-- 固定 seed 玩法：20,000 步；
-- 渲染 p95：五款游戏约 2.3–4.7 ms；
-- 正常本地保存仍低于 16.7 ms 帧预算；持锁异步提交调用 p99 0.021 ms；
-- 100 次客户端创建/关闭后线程回到基线，FD 无持续增长；
-- 240 次并发 SQLite 写入完成，`PRAGMA integrity_check=ok`；
-- 测试前后仓库 `data/scores.db` 主文件 SHA-256 均为
-  `e0ae24d4f1361b98e009c7d158f060beff01a8e6b41bed9fa3b2c4c539ec42ca`；
-- 逐条判断与未采纳项见 `classic_games_fourth_code_review_response_zh.md`。
+- 功能检查：107 项通过；
+- 第五轮存储与生命周期用例：40 项通过；
+- 固定输入：20,000 步；
+- 渲染 p95：Tetris 2.315 ms、Snake 2.223 ms、2048 1.543 ms、Sokoban 1.118 ms、
+  Zuma 4.338 ms；
+- 本地保存 p95 1.968 ms、p99 2.251 ms；持锁异步提交 p99 0.029 ms；
+- 100 次客户端创建/关闭后 FD 19→19；
+- SQLite 并发写入 240 次，`integrity_check=ok`；
+- Ruff 和 whitespace 检查通过；仓库 `data/scores.db` SHA-256 仍为
+  `e0ae24d4f1361b98e009c7d158f060beff01a8e6b41bed9fa3b2c4c539ec42ca`。
 
-GitHub 交付状态以实际远端提交为准，不在提交前写成已推送。
+详细判断见 `classic_games_fifth_code_review_response_zh.md`。GitHub 状态只在实际推送后更新。

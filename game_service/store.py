@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -15,16 +16,17 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from .catalog import GAME_BY_ID, VALID_GAME_IDS
-from .mutation import (MutationError, ScoreMutation, canonical_json,
-                       normalize_score_mutation)
+from .mutation import (ATTEMPT_STATUSES, MutationError, ScoreMutation,
+                       canonical_json, normalize_score_mutation)
 from .service import StorageStatus
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # The render thread never waits on this budget. A quarter second gives the
 # optional Flask adapter and direct maintenance callers room to serialize
 # ordinary bursts while still falling back far sooner than the old 5 s wait.
 DEFAULT_BUSY_TIMEOUT_MS = 250
 RECEIPT_RETENTION_DAYS = 180
+LEGACY_RULESET_VERSION = "legacy-v1"
 LEGACY_REQUIRED_COLUMNS = {
     "id", "game_id", "player", "score", "extra", "created_at"
 }
@@ -34,16 +36,17 @@ class StoreError(Exception):
     """Stable error contract for local callers and the Flask adapter."""
 
     def __init__(self, code: str, message: str, status: int = 400,
-                 retryable: bool = False):
+                 retryable: bool = False, details: Optional[dict] = None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
         self.retryable = retryable
+        self.details = details or {}
 
     def result(self) -> dict:
         return {"ok": False, "code": self.code, "error": self.message,
-                "retryable": self.retryable}
+                "retryable": self.retryable, **self.details}
 
     @classmethod
     def from_mutation(cls, exc: MutationError) -> "StoreError":
@@ -89,6 +92,7 @@ class LocalGameStore:
         self.migration_backup: Optional[Path] = None
         self.migration_notice: Optional[str] = None
         self._migration_messages: list[str] = []
+        self._legacy_summaries: dict[str, dict[str, int]] = {}
         if initialize:
             self.initialize()
 
@@ -120,10 +124,10 @@ class LocalGameStore:
                 and self._schema_is_current()):
             return
         if (self.db_path.is_file() and self.db_path.stat().st_size > 0
-                and existing_version < SCHEMA_VERSION):
+                and existing_version <= SCHEMA_VERSION):
             self.migration_backup = self._backup_database(existing_version)
 
-        with self.connection(timeout_ms=5000) as conn:
+        with self.connection(timeout_ms=max(250, self.busy_timeout_ms)) as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -136,7 +140,7 @@ class LocalGameStore:
                     "attempt_uuid TEXT UNIQUE, request_id TEXT NOT NULL UNIQUE, "
                     "profile_id TEXT, game_id TEXT NOT NULL, player TEXT NOT NULL, "
                     "mode TEXT NOT NULL DEFAULT 'classic', "
-                    "ruleset_version TEXT NOT NULL DEFAULT '1', "
+                    "ruleset_version TEXT NOT NULL DEFAULT 'legacy-v1', "
                     "status TEXT NOT NULL DEFAULT 'completed', "
                     "revision INTEGER NOT NULL DEFAULT 1, score INTEGER NOT NULL, "
                     "extra_json TEXT, started_at REAL, finished_at REAL, "
@@ -150,9 +154,23 @@ class LocalGameStore:
                     "expires_at REAL)")
                 self._ensure_v2_columns(conn)
                 self._migrate_attempt_rows(conn)
+                self._migrate_rulesets_v3(conn)
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_attempts_request_id "
+                    "ON attempts(request_id)")
                 conn.execute(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_attempts_uuid "
                     "ON attempts(attempt_uuid)")
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_attempts_source_key "
+                    "ON attempts(source_key) WHERE source_key IS NOT NULL")
+                conn.execute(
+                    "DELETE FROM save_requests WHERE request_id IN ("
+                    "SELECT request_id FROM save_requests GROUP BY request_id "
+                    "HAVING COUNT(*) > 1)")
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "idx_save_requests_request_id ON save_requests(request_id)")
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_attempts_best "
                     "ON attempts(profile_id, game_id, mode, "
@@ -160,8 +178,7 @@ class LocalGameStore:
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_attempts_recent "
                     "ON attempts(profile_id, updated_at DESC)")
-                for unused_table in ("progress", "save_slots", "settings"):
-                    conn.execute(f"DROP TABLE IF EXISTS {unused_table}")
+                self._archive_unused_tables(conn)
                 self._import_embedded_legacy_scores(conn)
                 conn.execute(
                     "INSERT INTO schema_meta(key, value) VALUES('version', ?) "
@@ -200,21 +217,40 @@ class LocalGameStore:
                 return False
             if not required_receipts <= self._table_columns(conn, "save_requests"):
                 return False
+            required_indexes = {
+                "idx_attempts_request_id": (True, ("request_id",)),
+                "idx_attempts_uuid": (True, ("attempt_uuid",)),
+                "idx_attempts_source_key": (True, ("source_key",)),
+                "idx_attempts_best": (False, (
+                    "profile_id", "game_id", "mode", "ruleset_version",
+                    "status", "score")),
+                "idx_attempts_recent": (False, ("profile_id", "updated_at")),
+            }
+            indexes = self._table_indexes(conn, "attempts")
+            if any(indexes.get(name) != expected
+                   for name, expected in required_indexes.items()):
+                return False
+            receipt_indexes = self._table_indexes(conn, "save_requests")
+            if receipt_indexes.get("idx_save_requests_request_id") != (
+                    True, ("request_id",)):
+                return False
             embedded = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='scores'"
             ).fetchone()
             if embedded is not None:
                 marker = conn.execute(
                     "SELECT 1 FROM schema_meta "
-                    "WHERE key='embedded_legacy_scores_v2'"
+                    "WHERE key='embedded_legacy_scores_v3'"
                 ).fetchone()
                 if marker is None:
                     return False
             if self.legacy_db_path is not None and self.legacy_db_path.is_file():
+                marker_key, fingerprint = self._legacy_marker(self.legacy_db_path)
                 marker = conn.execute(
-                    "SELECT 1 FROM schema_meta WHERE key='legacy_scores_v2'"
+                    "SELECT value FROM schema_meta WHERE key=?", (marker_key,)
                 ).fetchone()
-                if marker is None:
+                if marker is None or not self._legacy_marker_matches(
+                        marker["value"], fingerprint):
                     return False
         return True
 
@@ -233,13 +269,23 @@ class LocalGameStore:
         return {row["name"] for row in
                 conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
+    @staticmethod
+    def _table_indexes(conn: sqlite3.Connection, table: str) -> dict:
+        result = {}
+        for row in conn.execute(f"PRAGMA index_list({table})").fetchall():
+            name = row["name"]
+            columns = tuple(item["name"] for item in
+                            conn.execute(f"PRAGMA index_info({name})").fetchall())
+            result[name] = (bool(row["unique"]), columns)
+        return result
+
     def _ensure_v2_columns(self, conn: sqlite3.Connection) -> None:
         attempt_columns = self._table_columns(conn, "attempts")
         additions = {
             "attempt_uuid": "TEXT",
             "profile_id": "TEXT",
             "mode": "TEXT NOT NULL DEFAULT 'classic'",
-            "ruleset_version": "TEXT NOT NULL DEFAULT '1'",
+            "ruleset_version": "TEXT NOT NULL DEFAULT 'legacy-v1'",
             "status": "TEXT NOT NULL DEFAULT 'completed'",
             "revision": "INTEGER NOT NULL DEFAULT 1",
             "started_at": "REAL",
@@ -274,8 +320,6 @@ class LocalGameStore:
                 uuid.NAMESPACE_URL,
                 f"classic-games-v1:{self.db_path}:{row['id']}").hex
             player = row["player"] or "anonymous"
-            ruleset = (GAME_BY_ID[row["game_id"]].ruleset_version
-                       if row["game_id"] in GAME_BY_ID else "1")
             conn.execute(
                 "UPDATE attempts SET attempt_uuid=?, "
                 "profile_id=COALESCE(profile_id, ?), "
@@ -285,8 +329,40 @@ class LocalGameStore:
                 "finished_at=COALESCE(finished_at, updated_at), "
                 "score_achieved_at=COALESCE(score_achieved_at, created_at) "
                 "WHERE id=?",
-                (attempt_uuid, player, ruleset, row["id"]),
+                (attempt_uuid, player, LEGACY_RULESET_VERSION, row["id"]),
             )
+
+    @staticmethod
+    def _migrate_rulesets_v3(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "UPDATE attempts SET ruleset_version=? WHERE source_key IS NOT NULL",
+            (LEGACY_RULESET_VERSION,))
+        for game_id, descriptor in GAME_BY_ID.items():
+            conn.execute(
+                "UPDATE attempts SET ruleset_version=? WHERE game_id=? "
+                "AND source_key IS NULL AND ruleset_version IN ('1', 'legacy-v1')",
+                (descriptor.ruleset_version, game_id))
+
+    @staticmethod
+    def _archive_unused_tables(conn: sqlite3.Connection) -> None:
+        for table in ("progress", "save_slots", "settings"):
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)).fetchone()
+            if exists is None:
+                continue
+            count = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+            if count == 0:
+                conn.execute(f"DROP TABLE {table}")
+                continue
+            suffix = int(time.time())
+            archived = f"legacy_{table}_v3_{suffix}"
+            while conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name=?", (archived,)
+            ).fetchone() is not None:
+                suffix += 1
+                archived = f"legacy_{table}_v3_{suffix}"
+            conn.execute(f"ALTER TABLE {table} RENAME TO {archived}")
 
     def _existing_schema_version(self) -> int:
         if not self.db_path.is_file() or self.db_path.stat().st_size == 0:
@@ -428,18 +504,26 @@ class LocalGameStore:
                     raise StoreError(
                         "request_id_conflict",
                         "request_id was already used for another score", 409)
-                response = json.loads(prior["response_json"])
-                response["duplicate_request"] = True
-                conn.commit()
-                return response
+                try:
+                    response = json.loads(prior["response_json"])
+                    if not isinstance(response, dict) or response.get("ok") is not True:
+                        raise ValueError("invalid receipt response")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    # The attempt row is authoritative. A damaged response
+                    # cache must not make an otherwise valid retry fail.
+                    conn.execute(
+                        "DELETE FROM save_requests WHERE request_id=?",
+                        (mutation.request_id,))
+                else:
+                    response["duplicate_request"] = True
+                    conn.commit()
+                    return response
 
             best_before = self._personal_best(conn, mutation)
-            attempt = None
-            if mutation.attempt_uuid_provided:
-                attempt = conn.execute(
-                    "SELECT * FROM attempts WHERE attempt_uuid=?",
-                    (mutation.attempt_uuid,),
-                ).fetchone()
+            attempt = conn.execute(
+                "SELECT * FROM attempts WHERE attempt_uuid=?",
+                (mutation.attempt_uuid,),
+            ).fetchone()
 
             if mutation.submission_id is not None:
                 by_id = conn.execute(
@@ -505,10 +589,26 @@ class LocalGameStore:
                 stored_score = int(attempt["score"])
                 stored_revision = int(attempt["revision"])
                 stored_status = attempt["status"]
+                if mutation.status != stored_status:
+                    conn.rollback()
+                    raise StoreError(
+                        "attempt_status_conflict",
+                        "an attempt cannot change between practice and completed",
+                        409)
+                policy = GAME_BY_ID[mutation.game_id].score_policy
 
                 if legacy_update:
                     previous_score = stored_score
-                    candidate_score = max(stored_score, mutation.score)
+                    if policy == "final_only":
+                        conn.rollback()
+                        raise StoreError(
+                            "attempt_finalized",
+                            "this game records one final score per attempt", 409)
+                    if mutation.score < stored_score:
+                        conn.rollback()
+                        raise StoreError(
+                            "score_regression",
+                            "a later attempt revision cannot lower its score", 409)
                     effective = (mutation.score > stored_score
                                  or (mutation.score == stored_score
                                      and mutation.extra_json != attempt["extra_json"]))
@@ -518,11 +618,11 @@ class LocalGameStore:
                             "score_achieved_at=CASE WHEN ? > ? THEN ? "
                             "ELSE score_achieved_at END, "
                             "updated_at=?, finished_at=? WHERE id=?",
-                            (candidate_score, mutation.extra_json,
+                            (mutation.score, mutation.extra_json,
                              mutation.score, previous_score, now, now, now,
                              attempt_id),
                         )
-                        stored_score = candidate_score
+                        stored_score = mutation.score
                         updated = True
                     else:
                         no_op = True
@@ -540,16 +640,25 @@ class LocalGameStore:
                             "revision was already used for another attempt state", 409)
                     no_op = True
                 else:
+                    if policy == "final_only":
+                        conn.rollback()
+                        raise StoreError(
+                            "attempt_finalized",
+                            "this game records one final score per attempt", 409)
+                    if mutation.score < stored_score:
+                        conn.rollback()
+                        raise StoreError(
+                            "score_regression",
+                            "a later attempt revision cannot lower its score", 409)
                     previous_score = stored_score
-                    stored_score = max(stored_score, mutation.score)
+                    stored_score = mutation.score
                     stored_revision = mutation.revision
-                    stored_status = mutation.status
                     conn.execute(
-                        "UPDATE attempts SET score=?, extra_json=?, status=?, "
+                        "UPDATE attempts SET score=?, extra_json=?, "
                         "revision=?, score_achieved_at=CASE WHEN ? > ? THEN ? "
                         "ELSE score_achieved_at END, updated_at=?, "
                         "finished_at=? WHERE id=?",
-                        (stored_score, mutation.extra_json, stored_status,
+                        (stored_score, mutation.extra_json,
                          stored_revision, mutation.score, previous_score, now,
                          now, now, attempt_id),
                     )
@@ -600,6 +709,16 @@ class LocalGameStore:
                           status: str) -> tuple[str, tuple]:
         if game_id not in VALID_GAME_IDS:
             raise StoreError("unknown_game", f"unknown game_id: {game_id}", 404)
+        profile_id = LocalGameStore._query_identifier(
+            profile_id, "profile_id", 64, optional=True)
+        mode = LocalGameStore._query_identifier(mode, "mode", 32)
+        ruleset_version = LocalGameStore._query_identifier(
+            ruleset_version, "ruleset_version", 32, optional=True)
+        status = LocalGameStore._query_identifier(status, "status", 16)
+        if status not in ATTEMPT_STATUSES:
+            raise StoreError(
+                "invalid_status",
+                f"status must be one of: {', '.join(sorted(ATTEMPT_STATUSES))}")
         ruleset_version = ruleset_version or GAME_BY_ID[game_id].ruleset_version
         clauses = ["game_id=?", "mode=?", "ruleset_version=?", "status=?"]
         params: list = [game_id, mode, ruleset_version, status]
@@ -607,6 +726,20 @@ class LocalGameStore:
             clauses.append("profile_id=?")
             params.append(profile_id)
         return " AND ".join(clauses), tuple(params)
+
+    @staticmethod
+    def _query_identifier(value, field: str, maximum: int,
+                          optional: bool = False) -> Optional[str]:
+        if value is None and optional:
+            return None
+        if not isinstance(value, str):
+            raise StoreError(f"invalid_{field}", f"{field} must be a string")
+        value = value.strip()
+        if not 1 <= len(value) <= maximum or any(ord(ch) < 32 for ch in value):
+            raise StoreError(
+                f"invalid_{field}",
+                f"{field} must contain 1-{maximum} visible characters")
+        return value
 
     def leaderboard(self, game_id: str, limit: int = 10, *,
                     mode: str = "classic",
@@ -646,6 +779,16 @@ class LocalGameStore:
                status: str = "completed") -> list[dict]:
         if type(limit) is not int or not 1 <= limit <= 50:
             raise StoreError("invalid_limit", "limit must be between 1 and 50")
+        profile_id = self._query_identifier(
+            profile_id, "profile_id", 64, optional=True)
+        mode = self._query_identifier(mode, "mode", 32)
+        ruleset_version = self._query_identifier(
+            ruleset_version, "ruleset_version", 32, optional=True)
+        status = self._query_identifier(status, "status", 16)
+        if status not in ATTEMPT_STATUSES:
+            raise StoreError(
+                "invalid_status",
+                f"status must be one of: {', '.join(sorted(ATTEMPT_STATUSES))}")
         clauses = ["mode=?", "status=?"]
         params: list = [mode, status]
         if game_id is not None:
@@ -720,12 +863,18 @@ class LocalGameStore:
         ).fetchone()
         if table is None:
             self._migration_messages.append(f"{source}没有可导入的 scores 表")
+            self._legacy_summaries[source] = {
+                "valid": 0, "skipped": 0, "metadata_recovered": 0,
+            }
             return []
         columns = self._table_columns(legacy_conn, "scores")
         missing = sorted(LEGACY_REQUIRED_COLUMNS - columns)
         if missing:
             self._migration_messages.append(
                 f"{source}缺少字段，已跳过导入：{', '.join(missing)}")
+            self._legacy_summaries[source] = {
+                "valid": 0, "skipped": 0, "metadata_recovered": 0,
+            }
             return []
         updated_expr = ("COALESCE(updated_at, created_at)"
                         if "updated_at" in columns else "created_at")
@@ -735,52 +884,132 @@ class LocalGameStore:
         ).fetchall()
         valid = []
         skipped = 0
+        metadata_recovered = 0
         for row in rows:
             try:
                 row_id = row["id"]
                 if type(row_id) is not int or row_id <= 0:
                     raise ValueError("invalid id")
-                extra = json.loads(row["extra"]) if row["extra"] is not None else None
                 created_at = float(row["created_at"])
                 updated_at = float(row["updated_at"])
                 if (not math.isfinite(created_at)
                         or not math.isfinite(updated_at)
                         or created_at < 0 or updated_at < 0):
                     raise ValueError("invalid timestamp")
-                request_id = f"legacy-score-{row_id:016d}"
-                mutation = normalize_score_mutation(
+                source_hash = hashlib.sha256(
+                    source.encode("utf-8")).hexdigest()[:16]
+                request_id = f"legacy-{source_hash}-{row_id:016d}"
+                base_mutation = normalize_score_mutation(
                     row["game_id"], row["player"] or "anonymous",
-                    row["score"], extra=extra, request_id=request_id,
+                    row["score"], extra=None, request_id=request_id,
                     attempt_uuid=uuid.uuid5(
                         uuid.NAMESPACE_URL,
-                        f"classic-games-legacy:{source}:{row_id}").hex)
+                        f"classic-games-legacy:{source}:{row_id}").hex,
+                    ruleset_version=LEGACY_RULESET_VERSION)
+                extra, lost_metadata = self._decode_legacy_extra(row["extra"])
+                if lost_metadata:
+                    mutation = base_mutation
+                    metadata_recovered += 1
+                else:
+                    try:
+                        mutation = normalize_score_mutation(
+                            row["game_id"], row["player"] or "anonymous",
+                            row["score"], extra=extra, request_id=request_id,
+                            attempt_uuid=base_mutation.attempt_uuid,
+                            ruleset_version=LEGACY_RULESET_VERSION)
+                    except MutationError as exc:
+                        if exc.code not in {"invalid_extra", "extra_too_large"}:
+                            raise
+                        mutation = base_mutation
+                        metadata_recovered += 1
                 valid.append((mutation, created_at, updated_at, row_id))
             except (MutationError, ValueError, TypeError, json.JSONDecodeError):
                 skipped += 1
         if skipped:
             self._migration_messages.append(f"{source}有 {skipped} 条无效记录已跳过")
+        if metadata_recovered:
+            self._migration_messages.append(
+                f"{source}有 {metadata_recovered} 条成绩已恢复，附加信息无法读取")
+        self._legacy_summaries[source] = {
+            "valid": len(valid), "skipped": skipped,
+            "metadata_recovered": metadata_recovered,
+        }
         return valid
+
+    @classmethod
+    def _decode_legacy_extra(cls, raw) -> tuple[Optional[dict], bool]:
+        if raw is None:
+            return None, False
+        if not isinstance(raw, str):
+            return None, True
+        for decoder in (json.loads, ast.literal_eval):
+            try:
+                value = decoder(raw)
+            except (SyntaxError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+            if value is None:
+                return None, False
+            if not isinstance(value, dict) or not cls._legacy_value_is_safe(value):
+                return None, True
+            try:
+                encoded = canonical_json(value)
+            except MutationError:
+                return None, True
+            if len(encoded.encode("utf-8")) > 8 * 1024:
+                return None, True
+            return value, False
+        return None, True
+
+    @classmethod
+    def _legacy_value_is_safe(cls, value) -> bool:
+        if value is None or isinstance(value, (str, bool)):
+            return True
+        if type(value) in (int, float):
+            return type(value) is int or math.isfinite(value)
+        if isinstance(value, list):
+            return all(cls._legacy_value_is_safe(item) for item in value)
+        if isinstance(value, dict):
+            return all(isinstance(key, str)
+                       and cls._legacy_value_is_safe(item)
+                       for key, item in value.items())
+        return False
 
     @staticmethod
     def _insert_legacy_rows(conn: sqlite3.Connection, rows, source: str) -> int:
         imported = 0
         for mutation, created_at, updated_at, row_id in rows:
-            before = conn.total_changes
-            conn.execute(
-                "INSERT OR IGNORE INTO attempts "
-                "(attempt_uuid, request_id, profile_id, game_id, player, "
-                "mode, ruleset_version, status, revision, score, extra_json, "
-                "started_at, finished_at, score_achieved_at, created_at, "
-                "updated_at, source_key) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (mutation.attempt_uuid, mutation.request_id,
-                 mutation.profile_id, mutation.game_id, mutation.player,
-                 mutation.mode, mutation.ruleset_version, mutation.status,
-                 mutation.revision, mutation.score, mutation.extra_json,
-                 created_at, updated_at, created_at, created_at, updated_at,
-                 f"{source}:{row_id}"),
+            source_key = f"{source}:{row_id}"
+            existing = conn.execute(
+                "SELECT id FROM attempts WHERE source_key=? "
+                "OR attempt_uuid=? OR request_id=? LIMIT 1",
+                (source_key, mutation.attempt_uuid,
+                 mutation.request_id)).fetchone()
+            values = (
+                mutation.attempt_uuid, mutation.request_id,
+                mutation.profile_id, mutation.game_id, mutation.player,
+                mutation.mode, mutation.ruleset_version, mutation.status,
+                mutation.revision, mutation.score, mutation.extra_json,
+                created_at, updated_at, created_at, created_at, updated_at,
+                source_key,
             )
-            imported += int(conn.total_changes > before)
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO attempts "
+                    "(attempt_uuid, request_id, profile_id, game_id, player, "
+                    "mode, ruleset_version, status, revision, score, extra_json, "
+                    "started_at, finished_at, score_achieved_at, created_at, "
+                    "updated_at, source_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    values)
+                imported += 1
+                continue
+            conn.execute(
+                "UPDATE attempts SET attempt_uuid=?, request_id=?, profile_id=?, "
+                "game_id=?, player=?, mode=?, ruleset_version=?, status=?, "
+                "revision=?, score=?, extra_json=?, started_at=?, finished_at=?, "
+                "score_achieved_at=?, created_at=?, updated_at=?, source_key=? "
+                "WHERE id=?",
+                (*values, existing["id"]))
         return imported
 
     def _import_embedded_legacy_scores(self, conn: sqlite3.Connection) -> None:
@@ -791,7 +1020,7 @@ class LocalGameStore:
             return
         marker = conn.execute(
             "SELECT value FROM schema_meta "
-            "WHERE key='embedded_legacy_scores_v2'"
+            "WHERE key='embedded_legacy_scores_v3'"
         ).fetchone()
         if marker is not None:
             return
@@ -800,9 +1029,31 @@ class LocalGameStore:
         conn.execute(
             "INSERT INTO schema_meta(key, value) VALUES(?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            ("embedded_legacy_scores_v2",
+            ("embedded_legacy_scores_v3",
              canonical_json({"time": time.time(), "imported": imported})),
         )
+
+    @staticmethod
+    def _legacy_marker(path: Path) -> tuple[str, dict]:
+        resolved = str(path.resolve())
+        stat = path.stat()
+        path_hash = hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:24]
+        fingerprint = {
+            "path": resolved, "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "migration_version": SCHEMA_VERSION,
+        }
+        return f"legacy_scores_v3_{path_hash}", fingerprint
+
+    @staticmethod
+    def _legacy_marker_matches(value: str, fingerprint: dict) -> bool:
+        try:
+            marker = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return (isinstance(marker, dict)
+                and all(marker.get(key) == expected
+                        for key, expected in fingerprint.items()))
 
     def _import_legacy_scores(self) -> None:
         legacy = self.legacy_db_path
@@ -813,17 +1064,23 @@ class LocalGameStore:
                 return
         except OSError:
             return
+        try:
+            marker_key, fingerprint = self._legacy_marker(legacy)
+        except OSError:
+            self._migration_messages.append("旧成绩库状态无法读取，已跳过")
+            return
         with self.connection() as conn:
             marker = conn.execute(
-                "SELECT value FROM schema_meta WHERE key='legacy_scores_v2'"
+                "SELECT value FROM schema_meta WHERE key=?", (marker_key,)
             ).fetchone()
-        if marker is not None:
+        if marker is not None and self._legacy_marker_matches(
+                marker["value"], fingerprint):
             return
         try:
             legacy_conn = sqlite3.connect(f"file:{legacy}?mode=ro", uri=True)
             legacy_conn.row_factory = sqlite3.Row
             try:
-                rows = self._legacy_rows(legacy_conn, legacy.name)
+                rows = self._legacy_rows(legacy_conn, str(legacy.resolve()))
             finally:
                 legacy_conn.close()
         except (sqlite3.Error, OSError) as exc:
@@ -832,11 +1089,15 @@ class LocalGameStore:
             return
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            imported = self._insert_legacy_rows(conn, rows, f"legacy:{legacy}")
+            imported = self._insert_legacy_rows(
+                conn, rows, f"legacy:{legacy.resolve()}")
+            summary = self._legacy_summaries.get(str(legacy.resolve()), {})
             conn.execute(
                 "INSERT INTO schema_meta(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                ("legacy_scores_v2",
-                 canonical_json({"time": time.time(), "imported": imported})),
+                (marker_key, canonical_json({
+                    **fingerprint, **summary, "imported": imported,
+                    "imported_at": time.time(),
+                })),
             )
             conn.commit()

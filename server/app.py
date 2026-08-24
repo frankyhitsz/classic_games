@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 
 from flask import Flask, g, jsonify, request
-from werkzeug.exceptions import BadRequest, RequestEntityTooLarge
+from werkzeug.exceptions import BadRequest, HTTPException, RequestEntityTooLarge
 
 from game_service.catalog import VALID_GAME_IDS, public_games
 from game_service.store import LocalGameStore, StoreError, default_database_path
@@ -61,13 +61,19 @@ def create_app(config: dict | None = None) -> Flask:
                 "invalid_limit", "limit must be between 1 and 50")
         return limit, None
 
-    def query_dimensions() -> dict:
+    def query_dimensions(allowed: set[str]) -> tuple[dict, object | None]:
+        accepted = allowed | {"limit"}
+        unknown = sorted(set(request.args) - accepted)
+        if unknown:
+            return {}, api_error(
+                "unsupported_query_parameter",
+                f"unsupported query parameters: {', '.join(unknown)}")
         dimensions = {}
-        for key in ("profile_id", "mode", "ruleset_version", "status"):
+        for key in allowed:
             value = request.args.get(key)
             if value is not None:
                 dimensions[key] = value
-        return dimensions
+        return dimensions, None
 
     @app.errorhandler(RequestEntityTooLarge)
     def too_large(_exc):
@@ -79,6 +85,13 @@ def create_app(config: dict | None = None) -> Flask:
         return api_error("database_unavailable",
                          "score database is temporarily unavailable", 503,
                          retryable=True)
+
+    @app.errorhandler(Exception)
+    def unexpected_error(exc):
+        if isinstance(exc, HTTPException):
+            return exc
+        app.logger.exception("unexpected API error", exc_info=exc)
+        return api_error("internal_error", "unexpected server error", 500)
 
     @app.before_request
     def before_request() -> None:
@@ -156,14 +169,24 @@ def create_app(config: dict | None = None) -> Flask:
         limit, error = parse_limit(10)
         if error is not None:
             return error
-        return jsonify({"game_id": game_id,
-                        "leaderboard": store.leaderboard(
-                            game_id, limit, **query_dimensions())})
+        dimensions, error = query_dimensions(
+            {"mode", "ruleset_version", "status"})
+        if error is not None:
+            return error
+        try:
+            rows = store.leaderboard(game_id, limit, **dimensions)
+        except StoreError as exc:
+            return api_error(exc.code, exc.message, exc.status, exc.retryable)
+        return jsonify({"game_id": game_id, "leaderboard": rows})
 
     @app.route("/api/stats/<game_id>")
     def stats(game_id: str):
+        dimensions, error = query_dimensions(
+            {"profile_id", "mode", "ruleset_version", "status"})
+        if error is not None:
+            return error
         try:
-            return jsonify(store.stats(game_id, **query_dimensions()))
+            return jsonify(store.stats(game_id, **dimensions))
         except StoreError as exc:
             return api_error(exc.code, exc.message, exc.status, exc.retryable)
 
@@ -172,8 +195,15 @@ def create_app(config: dict | None = None) -> Flask:
         limit, error = parse_limit(20)
         if error is not None:
             return error
-        dimensions = query_dimensions()
-        return jsonify({"recent": store.recent(limit, **dimensions)})
+        dimensions, error = query_dimensions(
+            {"profile_id", "game_id", "mode", "ruleset_version", "status"})
+        if error is not None:
+            return error
+        try:
+            rows = store.recent(limit, **dimensions)
+        except StoreError as exc:
+            return api_error(exc.code, exc.message, exc.status, exc.retryable)
+        return jsonify({"recent": rows})
 
     return app
 

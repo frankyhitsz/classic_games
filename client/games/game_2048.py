@@ -119,8 +119,10 @@ class Game2048(BaseGame):
         self.score_submitted = False
         self.score_submission_id: Optional[int] = None
         self.submitted_score: Optional[int] = None
+        self.submitted_extra = None
         self._score_submission_future = None
         self._score_submission_inflight_score: Optional[int] = None
+        self._score_submission_inflight_extra = None
         self._queued_score_submission = None
         self.state = "playing"
         self.overlay_buttons = []
@@ -346,16 +348,17 @@ class Game2048(BaseGame):
         # update this session's existing backend row instead of either
         # losing the final score or creating a duplicate leaderboard entry.
         self._poll_score_submission()
-        if self.score_submitted and self.submitted_score == self.score:
+        if (self.score_submitted and self.submitted_score == self.score
+                and self.submitted_extra == extra):
             return
         if self._score_submission_future is not None:
             # The final score may arrive while the 2048 milestone request is
             # still in flight. Keep only the newest pending value; once the
             # first response supplies an id, the queued value updates it.
-            self._score_attempt_revision += 1
+            revision = self._next_score_revision()
             self._queued_score_submission = (
                 self.score, extra, uuid.uuid4().hex,
-                self._score_attempt_revision)
+                revision)
             return
         self._begin_score_submission(self.score, extra)
 
@@ -371,8 +374,7 @@ class Game2048(BaseGame):
         self._discard_unsaved_armed = False
         request_id = request_id or uuid.uuid4().hex
         if revision is None:
-            self._score_attempt_revision += 1
-            revision = self._score_attempt_revision
+            revision = self._next_score_revision()
         self._last_score_payload = {"score": score, "extra": extra,
                                     "request_id": request_id,
                                     "attempt_uuid": self._score_attempt_uuid,
@@ -388,8 +390,10 @@ class Game2048(BaseGame):
                     replace=True, submission_id=self.score_submission_id,
                     request_id=request_id,
                     attempt_uuid=self._score_attempt_uuid,
-                    revision=revision)
+                    revision=revision,
+                    **self.attempt_context.as_submit_kwargs())
                 self._score_submission_inflight_score = score
+                self._score_submission_inflight_extra = extra
             except Exception as exc:  # noqa: BLE001
                 self.score_save_state = SAVE_FAILED
                 self.score_save_error = str(exc)
@@ -400,14 +404,15 @@ class Game2048(BaseGame):
                 submission_id=self.score_submission_id,
                 request_id=request_id,
                 attempt_uuid=self._score_attempt_uuid,
-                revision=revision)
+                revision=revision,
+                **self.attempt_context.as_submit_kwargs())
         except Exception as exc:  # noqa: BLE001
             self.score_save_state = SAVE_FAILED
             self.score_save_error = str(exc)
             return
-        self._record_score_submission(result, score)
+        self._record_score_submission(result, score, extra)
 
-    def _record_score_submission(self, result, score: int) -> None:
+    def _record_score_submission(self, result, score: int, extra=None) -> None:
         row_id, error = parse_score_response(result)
         if row_id is None:
             durable_pending = bool(
@@ -417,8 +422,9 @@ class Game2048(BaseGame):
                 self.score_save_error = None
                 self.score_save_retryable = True
                 self.score_save_durable_pending = True
-                self.score_save_message = "待保存记录已安全落盘"
+                self.score_save_message = "已写入待保存文件"
                 self._destructive_action_armed = None
+                self._destructive_action_deadline = 0
                 self._discard_unsaved_armed = False
                 return
             self.score_save_state = SAVE_FAILED
@@ -438,11 +444,13 @@ class Game2048(BaseGame):
         self.submitted_score = max(
             confirmed_score,
             self.submitted_score if self.submitted_score is not None else 0)
+        self.submitted_extra = extra
         self.score_save_state = SAVE_SAVED
         self.score_save_error = None
         self.score_save_durable_pending = False
         self._discard_unsaved_armed = False
         self._destructive_action_armed = None
+        self._destructive_action_deadline = 0
         if isinstance(result, dict) and result.get("attempt_recorded"):
             self.score_save_message = (
                 "本局已记录 · 新纪录" if result.get("new_personal_best")
@@ -459,15 +467,19 @@ class Game2048(BaseGame):
         submitted_score = (self._score_submission_inflight_score
                            if self._score_submission_inflight_score is not None
                            else self.score)
+        submitted_extra = self._score_submission_inflight_extra
         self._score_submission_inflight_score = None
+        self._score_submission_inflight_extra = None
         try:
             result = future.result()
         except Exception:  # noqa: BLE001 - optional API failure must not crash
             result = None
-        self._record_score_submission(result, submitted_score)
+        self._record_score_submission(result, submitted_score, submitted_extra)
         queued = self._queued_score_submission
         self._queued_score_submission = None
-        if queued is not None and queued[0] != self.submitted_score:
+        if (queued is not None
+                and (queued[0] != self.submitted_score
+                     or queued[1] != self.submitted_extra)):
             self._begin_score_submission(*queued)
 
     def retry_score_save(self) -> None:
@@ -491,7 +503,8 @@ class Game2048(BaseGame):
                          submission_id=self.score_submission_id,
                          request_id=queued[2],
                          attempt_uuid=self._score_attempt_uuid,
-                         revision=queued[3])
+                         revision=queued[3],
+                         **self.attempt_context.as_submit_kwargs())
 
     def _continue_after_win(self) -> None:
         self._queued_directions.clear()

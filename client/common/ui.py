@@ -15,9 +15,11 @@ from typing import Callable, List, Optional
 import pygame
 
 from game_service.local_backend import LocalBackendClient
-from game_service.service import GameDataService, parse_score_response
+from game_service.service import (AttemptContext, GameDataService,
+                                  parse_score_response)
 
 OVERLAY_INPUT_GUARD_MS = 180
+DESTRUCTIVE_CONFIRM_MS = 3000
 SAVE_IDLE = "idle"
 SAVE_SAVING = "saving"
 SAVE_SAVED = "saved"
@@ -380,6 +382,7 @@ class BaseGame(abc.ABC):
         self._owns_backend = backend is None
         self.backend = backend if backend is not None else LocalBackendClient()
         self.player = player
+        self.attempt_context = AttemptContext.for_game(self.game_id, player)
         self.running = True
         self.state = "playing"  # playing | paused | gameover | won
         self.score = 0
@@ -404,8 +407,8 @@ class BaseGame(abc.ABC):
         self._score_submit_active_payload = None
         self._last_score_payload = None
         self._score_submission_id: Optional[int] = None
-        self._score_attempt_uuid = uuid.uuid4().hex
-        self._score_attempt_revision = 0
+        self._score_attempt_uuid = self.attempt_context.attempt_uuid
+        self._score_attempt_revision = self.attempt_context.revision
         self.score_save_state = SAVE_IDLE
         self.score_save_error: Optional[str] = None
         self.score_save_retryable = True
@@ -413,6 +416,7 @@ class BaseGame(abc.ABC):
         self.score_save_durable_pending = False
         self._discard_unsaved_armed = False
         self._destructive_action_armed: Optional[str] = None
+        self._destructive_action_deadline = 0
         # Restart/continue buttons share the same mouse with some games.
         # Briefly swallow a rapid second click after an overlay action so a
         # double-click cannot fire a Zuma ball or begin a 2048 swipe.
@@ -498,8 +502,10 @@ class BaseGame(abc.ABC):
         self._score_submit_active_payload = None
         self._last_score_payload = None
         self._score_submission_id = None
-        self._score_attempt_uuid = uuid.uuid4().hex
-        self._score_attempt_revision = 0
+        self.attempt_context = AttemptContext.for_game(
+            self.game_id, self.player)
+        self._score_attempt_uuid = self.attempt_context.attempt_uuid
+        self._score_attempt_revision = self.attempt_context.revision
         self.score_save_state = SAVE_IDLE
         self.score_save_error = None
         self.score_save_retryable = True
@@ -507,6 +513,7 @@ class BaseGame(abc.ABC):
         self.score_save_durable_pending = False
         self._discard_unsaved_armed = False
         self._destructive_action_armed = None
+        self._destructive_action_deadline = 0
         self.invalidate_overlay_leaderboard()
 
     def request_destructive_action(self, name: str,
@@ -515,11 +522,17 @@ class BaseGame(abc.ABC):
         unsafe = (self.score_save_state == SAVE_SAVING
                   or (self.score_save_state == SAVE_FAILED
                       and not self.score_save_durable_pending))
-        if unsafe and self._destructive_action_armed != name:
+        now = pygame.time.get_ticks()
+        confirmation_active = (
+            self._destructive_action_armed == name
+            and now <= self._destructive_action_deadline)
+        if unsafe and not confirmation_active:
             self._destructive_action_armed = name
+            self._destructive_action_deadline = now + DESTRUCTIVE_CONFIRM_MS
             self._discard_unsaved_armed = True
             return False
         self._destructive_action_armed = None
+        self._destructive_action_deadline = 0
         self._discard_unsaved_armed = False
         action()
         return True
@@ -537,8 +550,7 @@ class BaseGame(abc.ABC):
         if not self.backend or not self.game_id:
             return
         if revision is None:
-            self._score_attempt_revision += 1
-            revision = self._score_attempt_revision
+            revision = self._next_score_revision()
         payload = {"score": score, "extra": extra,
                    "replace": self.submit_replaces_existing,
                    "request_id": request_id or uuid.uuid4().hex,
@@ -546,7 +558,8 @@ class BaseGame(abc.ABC):
                    "revision": revision,
                    "submission_id": (self._score_submission_id
                                      if self.submit_replaces_existing
-                                     else None)}
+                                     else None),
+                   **self.attempt_context.as_submit_kwargs()}
         self._last_score_payload = payload
         self._score_submit_generation += 1
         generation = self._score_submit_generation
@@ -569,7 +582,10 @@ class BaseGame(abc.ABC):
                     submission_id=payload["submission_id"],
                     request_id=payload["request_id"],
                     attempt_uuid=payload["attempt_uuid"],
-                    revision=payload["revision"])
+                    revision=payload["revision"],
+                    profile_id=payload["profile_id"], mode=payload["mode"],
+                    ruleset_version=payload["ruleset_version"],
+                    status=payload["status"])
                 self._score_submit_future_generation = generation
             except Exception as exc:  # noqa: BLE001
                 self._finish_score_submission(None, payload, generation,
@@ -582,7 +598,10 @@ class BaseGame(abc.ABC):
                     submission_id=payload["submission_id"],
                     request_id=payload["request_id"],
                     attempt_uuid=payload["attempt_uuid"],
-                    revision=payload["revision"])
+                    revision=payload["revision"],
+                    profile_id=payload["profile_id"], mode=payload["mode"],
+                    ruleset_version=payload["ruleset_version"],
+                    status=payload["status"])
             except Exception as exc:  # noqa: BLE001
                 self._finish_score_submission(None, payload, generation,
                                               str(exc))
@@ -616,8 +635,9 @@ class BaseGame(abc.ABC):
                 self.score_save_error = None
                 self.score_save_retryable = True
                 self.score_save_durable_pending = True
-                self.score_save_message = "待保存记录已安全落盘"
+                self.score_save_message = "已写入待保存文件"
                 self._destructive_action_armed = None
+                self._destructive_action_deadline = 0
                 self._discard_unsaved_armed = False
                 self.on_score_save_failed(payload, error)
                 return
@@ -637,6 +657,7 @@ class BaseGame(abc.ABC):
         self.score_save_durable_pending = False
         self._discard_unsaved_armed = False
         self._destructive_action_armed = None
+        self._destructive_action_deadline = 0
         if self.submit_replaces_existing:
             self._score_submission_id = row_id
         if isinstance(result, dict) and result.get("attempt_recorded"):
@@ -649,6 +670,11 @@ class BaseGame(abc.ABC):
         # Read the leaderboard only after the server has acknowledged the
         # score, otherwise the GET can race ahead of the POST.
         self.invalidate_overlay_leaderboard()
+
+    def _next_score_revision(self) -> int:
+        revision = self.attempt_context.next_revision()
+        self._score_attempt_revision = revision
+        return revision
 
     def retry_score_save(self) -> None:
         payload = self._last_score_payload
@@ -816,13 +842,13 @@ class BaseGame(abc.ABC):
                       size=14, color=COLORS["text_dim"], center=True)
 
         save_messages = {
-            SAVE_SAVING: (("保存尚未完成 · 再次操作将放弃"
+            SAVE_SAVING: (("保存尚未完成 · 3 秒内再次操作将放弃"
                            if self._discard_unsaved_armed
                            else "成绩保存中…"),
                           (COLORS["danger"] if self._discard_unsaved_armed
                            else COLORS["text_dim"])),
             SAVE_SAVED: (self.score_save_message or "成绩已保存", COLORS["ok"]),
-            SAVE_PENDING: (self.score_save_message or "待保存记录已安全落盘",
+            SAVE_PENDING: (self.score_save_message or "已写入待保存文件",
                            COLORS["accent2"]),
             SAVE_FAILED: (("保存失败 · 按 S 重试"
                            if (self.score_save_retryable

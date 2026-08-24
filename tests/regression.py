@@ -2637,9 +2637,9 @@ run("backend-monotonic-update-and-json-errors", """
             'game_id':'2048','player':'p','score':100}).get_json()
         lower=client.post('/api/scores',json={
             'game_id':'2048','player':'p','score':10,
-            'submission_id':first['id']}).get_json()
-        assert lower['score'] == 100, lower
-        assert lower['no_op'] is True, lower
+            'submission_id':first['id']})
+        assert lower.status_code == 409, lower.get_json()
+        assert lower.get_json()['code'] == 'score_regression'
         rows=client.get('/api/leaderboard/2048').get_json()['leaderboard']
         assert rows[0]['score'] == 100, rows
         stats=client.get('/api/stats/2048').get_json()
@@ -2774,9 +2774,11 @@ run("local-store-persists-and-recovers-outbox", """
                          "(1,'zuma','old-player',321,NULL,1.0)")
         legacy_before=legacy.read_bytes()
         migrated_store=LocalGameStore(migrated, legacy_db_path=legacy)
-        assert migrated_store.stats('zuma')['attempts'] == 1
+        assert migrated_store.stats(
+            'zuma', ruleset_version='legacy-v1')['attempts'] == 1
         migrated_store.initialize()
-        assert migrated_store.stats('zuma')['attempts'] == 1
+        assert migrated_store.stats(
+            'zuma', ruleset_version='legacy-v1')['attempts'] == 1
         assert legacy.read_bytes() == legacy_before
 
         embedded=root/'embedded-legacy.db'
@@ -2787,11 +2789,13 @@ run("local-store-persists-and-recovers-outbox", """
             conn.execute("INSERT INTO scores VALUES "
                          "(1,'snake','embedded',88,NULL,2.0)")
         embedded_store=LocalGameStore(embedded)
-        assert embedded_store.stats('snake')['attempts'] == 1
+        assert embedded_store.stats(
+            'snake', ruleset_version='legacy-v1')['attempts'] == 1
         assert embedded_store.migration_backup
         assert embedded_store.migration_backup.is_file()
         embedded_store.initialize()
-        assert embedded_store.stats('snake')['attempts'] == 1
+        assert embedded_store.stats(
+            'snake', ruleset_version='legacy-v1')['attempts'] == 1
 
         corrupt=root/'corrupt.db'; corrupt.write_bytes(b'not sqlite data')
         repaired=LocalBackendClient(
@@ -2947,11 +2951,16 @@ run("local-store-idempotency-attempts-and-recency", """
                     f'same request ID accepted different payload: {changes}')
 
         before=store.recent()[0]['ts']
-        lower=store.record_score(
-            '2048','p',10,submission_id=first['id'],
-            request_id='lower-noop-request-0001')
+        try:
+            store.record_score(
+                '2048','p',10,submission_id=first['id'],
+                request_id='lower-noop-request-0001')
+        except StoreError as exc:
+            assert exc.code == 'score_regression'
+        else:
+            raise AssertionError('lower revision score was accepted')
         after=store.recent()[0]['ts']
-        assert lower['no_op'] and before == after
+        assert before == after
 
         same='concurrent-request-id-0001'
         def write(_):

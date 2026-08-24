@@ -14,6 +14,7 @@ from .catalog import GAME_BY_ID, VALID_GAME_IDS
 
 MAX_EXTRA_BYTES = 8 * 1024
 MAX_SCORE = 2_147_483_647
+MAX_SQLITE_INTEGER = 2**63 - 1
 ATTEMPT_STATUSES = frozenset({"completed", "practice"})
 
 
@@ -40,7 +41,7 @@ def _identifier(value, field: str, *, minimum: int = 1,
         value = default
     if not isinstance(value, str):
         raise MutationError(f"invalid_{field}", f"{field} must be a string")
-    value = value.strip()
+    value = unicodedata.normalize("NFC", value).strip()
     if not minimum <= len(value) <= maximum:
         raise MutationError(
             f"invalid_{field}",
@@ -53,7 +54,8 @@ def _identifier(value, field: str, *, minimum: int = 1,
 
 def _transport_id(value: Optional[str], field: str) -> tuple[str, bool]:
     provided = value is not None
-    value = value or uuid.uuid4().hex
+    if value is None:
+        value = uuid.uuid4().hex
     if (not isinstance(value, str)
             or not 16 <= len(value) <= 64
             or not all(ch.isascii() and (ch.isalnum() or ch in "-_")
@@ -141,9 +143,11 @@ def normalize_score_mutation(
     if not isinstance(replace, bool):
         raise MutationError("invalid_replace", "replace must be boolean")
     if (submission_id is not None
-            and (type(submission_id) is not int or submission_id <= 0)):
+            and (type(submission_id) is not int or submission_id <= 0
+                 or submission_id > MAX_SQLITE_INTEGER)):
         raise MutationError(
-            "invalid_submission_id", "submission_id must be a positive integer")
+            "invalid_submission_id",
+            "submission_id must be a positive SQLite integer")
     request_id, _ = _transport_id(request_id, "request_id")
     attempt_uuid_provided = attempt_uuid is not None
     if attempt_uuid is None:
@@ -155,8 +159,10 @@ def normalize_score_mutation(
     attempt_uuid, _ = _transport_id(attempt_uuid, "attempt_uuid")
     revision_provided = revision is not None
     revision = 1 if revision is None else revision
-    if type(revision) is not int or revision <= 0:
-        raise MutationError("invalid_revision", "revision must be a positive integer")
+    if (type(revision) is not int or revision <= 0
+            or revision > MAX_SQLITE_INTEGER):
+        raise MutationError(
+            "invalid_revision", "revision must be a positive SQLite integer")
     mode = _identifier(mode, "mode", maximum=32, default="classic")
     ruleset_version = _identifier(
         ruleset_version, "ruleset_version", maximum=32,

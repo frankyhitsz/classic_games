@@ -2,8 +2,44 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+import uuid
+from dataclasses import asdict, dataclass, field
 from typing import Any, Optional, Protocol
+
+from .catalog import GAME_BY_ID
+
+
+@dataclass
+class AttemptContext:
+    """Dimensions fixed for the lifetime of one local game run."""
+
+    game_id: str
+    profile_id: str
+    mode: str
+    ruleset_version: str
+    status: str
+    attempt_uuid: str = field(default_factory=lambda: uuid.uuid4().hex)
+    revision: int = 0
+
+    @classmethod
+    def for_game(cls, game_id: str, player: str, *, mode: str = "classic",
+                 status: str = "completed") -> "AttemptContext":
+        return cls(
+            game_id=game_id,
+            profile_id=player,
+            mode=mode,
+            ruleset_version=GAME_BY_ID[game_id].ruleset_version,
+            status=status,
+        )
+
+    def as_submit_kwargs(self) -> dict[str, str]:
+        data = asdict(self)
+        return {key: data[key] for key in (
+            "profile_id", "mode", "ruleset_version", "status")}
+
+    def next_revision(self) -> int:
+        self.revision += 1
+        return self.revision
 
 
 @dataclass(frozen=True)
@@ -70,6 +106,8 @@ class GameDataService(Protocol):
     def failed_save_count(self) -> int: ...
 
     def retry_failed_saves(self) -> int: ...
+
+    def poll_pending_saves(self, interval_seconds: float = 2.0) -> int: ...
 
     def drain(self, timeout: Optional[float] = None) -> bool: ...
 
