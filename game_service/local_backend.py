@@ -1294,14 +1294,14 @@ class LocalWriteWorker:
             return True
 
     def close(self, *, cancel_pending: bool = False,
-              timeout: float = 2.0) -> bool:
+              timeout: float = 10.0) -> bool:
         with self._condition:
             if self._closed:
                 return True
             self._closed = True
         drained = self.drain(max(0.0, timeout))
         self._executor.shutdown(
-            wait=drained, cancel_futures=(cancel_pending or not drained))
+            wait=drained, cancel_futures=cancel_pending)
         return drained
 
 
@@ -2506,4 +2506,4 @@ class LocalBackendClient:
         # A running discovery scan can still enqueue a replay. Let it finish
         # while the writer is alive, then drain the resulting required write.
         self._read_worker.close(cancel_pending=True, timeout=2.0)
-        self._worker.close(timeout=2.0)
+        self._worker.close(timeout=10.0)

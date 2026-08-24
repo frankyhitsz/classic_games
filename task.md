@@ -44,14 +44,14 @@
   `quarantine_failed`，只允许重试或返回；隔离确认成功后才允许新开。
 - coverage runner 最初尝试把 inline `-c` 传给 coverage CLI，而 coverage 不支持该参数；runner 现在
   为每项生成临时脚本，并继承现有 PYTHONPATH。真实 coverage 模式下 107 项功能检查全部通过。
-- 新增两项边界回归后，第九轮定向用例为 15 项，完整 storage discover 为 105 项。
+- 新增三项边界回归后，第九轮定向用例为 16 项，完整 storage discover 为 106 项。
 
 ## 最终验证
 
-- `run_tests.sh`：107 项功能检查、105 项存储/迁移/生命周期用例全部通过；
+- `run_tests.sh`：107 项功能检查、106 项存储/迁移/生命周期用例全部通过；
 - 固定 seed 20,000 步、240 次并发写入 `integrity_check=ok`、100 次资源循环 FD 19→19；
-- 渲染 p95：Tetris 2.124 ms、Snake 2.036 ms、2048 1.386 ms、Sokoban 1.541 ms、
-  Zuma 3.999 ms；本机保存 p99 2.167 ms；持锁异步提交 p99 0.030 ms；
+- 渲染 p95：Tetris 2.151 ms、Snake 2.049 ms、2048 1.367 ms、Sokoban 1.501 ms、
+  Zuma 4.004 ms；本机保存 p99 2.103 ms；持锁异步提交 p99 0.029 ms；
 - gameplay parallel coverage 模式 107 项通过，独立汇总已覆盖 client/game_service/server，结果 60%；
 - Ruff、Python compileall、shell 语法、whitespace、28 条问题矩阵、132 条优化矩阵均通过；
 - 无 build 模块依赖，使用 `pip wheel --no-deps --no-build-isolation` 成功生成 130,988 字节 wheel。
@@ -59,3 +59,7 @@
   100 ms sleep；慢 runner 上第二个异步回执尚未完成。用例改为 5 秒 deadline 内轮询真实状态，
   不放宽产品超时；普通和 coverage 单项模式均通过。runner 同时支持 `CLASSIC_GAMES_CHECK`
   选择单项，便于复现平台失败。
+- CI #19 的 macOS gameplay 已不再报错；Windows 慢盘让 40 个关闭前提交超过 2 秒 worker 预算，
+  同时暴露超时分支会取消未开始写任务的风险。写 worker 现在最多等待 10 秒且绝不因超时取消；
+  read worker 仍可取消。Ubuntu 的 16 直连写者完整性测试在共享 CI 上也超过 2 秒锁预算，现与
+  Windows 一样使用 60 秒测试预算；前台异步入队 p99 门槛没有放宽。

@@ -42,7 +42,7 @@
 | CG9-P1-12 | 完成 | score/state outbox 健康状态独立报告。 |
 | CG9-P1-13 | 完成 | `LocalStateEvent` 可报告 SUPERSEDED。 |
 | CG9-P1-14 | 完成 | unexpected/cancelled Future callback 恢复 pending 并清 unpublished。 |
-| CG9-P1-15 | 完成 | worker close 有 2 秒 drain 上限，超时取消未开始任务。 |
+| CG9-P1-15 | 完成 | read worker 2 秒、write worker 10 秒 drain 上限；写超时不取消未完成任务。 |
 | CG9-P1-16 | 完成 | 2048 max tile 与 won 双向一致。 |
 | CG9-P1-17 | 完成 | playing 死局规范为 gameover，不恢复成可玩局。 |
 | CG9-P1-18 | 完成 | quarantine Future 成功后才显示已隔离。 |

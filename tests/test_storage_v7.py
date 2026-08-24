@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from concurrent.futures import Future
@@ -17,6 +18,7 @@ os.environ.setdefault("SDL_AUDIODRIVER", "dummy")
 from client.profile_controller import ProfileController
 from game_service.catalog import GAME_BY_ID
 from game_service.local_backend import (LocalBackendClient,
+                                        LocalWriteWorker,
                                         PersistentStateOutbox,
                                         completed_future)
 from game_service.service import SaveState
@@ -24,6 +26,15 @@ from game_service.store import LocalGameStore, StoreError
 
 
 class StateReceiptTests(unittest.TestCase):
+    def test_write_worker_timeout_never_cancels_unfinished_write(self):
+        worker = LocalWriteWorker("bounded-close-test")
+        release = threading.Event()
+        future = worker.submit(release.wait, 2)
+        self.assertFalse(worker.close(timeout=0.01))
+        self.assertFalse(future.cancelled())
+        release.set()
+        self.assertTrue(future.result(timeout=2))
+
     def test_stale_worker_cannot_overwrite_committed_newer_state(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

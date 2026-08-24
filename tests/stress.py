@@ -232,11 +232,11 @@ def storage_stress(root: Path) -> None:
     # This branch intentionally bypasses the desktop's one-writer executor
     # and starts 16 direct SQLite writers. Give that synthetic contention a
     # larger busy budget than the latency-sensitive desktop facade.
-    # Windows CI performs each durable commit through Defender and can spend
-    # about 100 ms in fsync. The desktop never starts these 16 direct writers,
-    # but this synthetic integrity check should wait for serialization rather
-    # than mistake slow storage for a locking bug.
-    direct_busy_timeout_ms = 60_000 if os.name == "nt" else 2_000
+    # Shared CI disks on every OS can pause under unrelated load. The desktop
+    # never starts these 16 direct writers; this synthetic integrity check
+    # should wait for serialization rather than mistake slow storage for a
+    # locking bug. Foreground submission latency has a separate assertion.
+    direct_busy_timeout_ms = 60_000 if os.environ.get("CI") else 2_000
     store = LocalGameStore(
         root / "concurrent.db", busy_timeout_ms=direct_busy_timeout_ms)
 
