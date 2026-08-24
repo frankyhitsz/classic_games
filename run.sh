@@ -18,7 +18,10 @@ mkdir -p data logs
 # Start backend in background
 GAMES_HOST="${GAMES_HOST:-127.0.0.1}"
 GAMES_PORT="${GAMES_PORT:-5000}"
-export GAMES_HOST GAMES_PORT
+GAMES_CLIENT_HOST="${GAMES_CLIENT_HOST:-127.0.0.1}"
+GAMES_API_URL="${GAMES_API_URL:-http://${GAMES_CLIENT_HOST}:${GAMES_PORT}}"
+GAMES_API_URL="${GAMES_API_URL%/}"
+export GAMES_HOST GAMES_PORT GAMES_API_URL
 
 echo "[run] starting backend on http://${GAMES_HOST}:${GAMES_PORT}"
 python -m server.app > logs/server.log 2>&1 &
@@ -33,7 +36,7 @@ trap cleanup EXIT INT TERM
 
 # Wait for backend
 BACKEND_READY=false
-HEALTH_URL="http://${GAMES_HOST}:${GAMES_PORT}/api/health"
+HEALTH_URL="${GAMES_API_URL}/api/health"
 health_ok() {
     python -c 'import json,sys,urllib.request as u; d=json.load(u.urlopen(sys.argv[1], timeout=.3)); sys.exit(0 if d.get("ok") and d.get("service")=="classic-games" else 1)' \
         "${HEALTH_URL}" >/dev/null 2>&1

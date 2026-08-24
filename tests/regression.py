@@ -1214,6 +1214,10 @@ run("snake-restart-and-turn-buffer", """
     press(pygame.K_LEFT)  # illegal relative to current Right; keep Up
     g.update(1 / g.move_speed)
     assert g.direction == (0, -1), f'legal Up turn was lost: {g.direction}'
+    g.reset(); old_head=g.body[0]
+    g.update(0.75)
+    assert g.body[0] == (old_head[0] + 1, old_head[1]), \
+        'a recovered frame replayed several invisible snake steps'
     pygame.quit()
 """)
 
@@ -1504,7 +1508,7 @@ run("tetris-corner-floor-cycle-aligned", """
 """)
 
 # ===========================================================================
-print("\n=== 55. 2048 buffers one direction during slide animation ===")
+print("\n=== 55. 2048 buffers an ordered input burst during animation ===")
 run("2048-input-buffer", """
     import os; os.environ['SDL_VIDEODRIVER']='dummy'
     import pygame; pygame.init()
@@ -1518,11 +1522,14 @@ run("2048-input-buffer", """
     g.tiles = [tile]; g.grid[0][0] = tile
     g._move('right')
     g._move('down')  # arrives while right-slide is animating
-    assert g._queued_direction == 'down'
+    g._move('left')
+    assert list(g._queued_directions) == ['down', 'left']
     g._tick_animations(1.0)
-    assert g._queued_direction is None
+    assert list(g._queued_directions) == ['left']
     assert (tile.row, tile.col) == (3, 3), (tile.row, tile.col)
     g._tick_animations(1.0)
+    assert not g._queued_directions
+    assert (tile.row, tile.col) == (3, 0), (tile.row, tile.col)
     pygame.quit()
 """)
 
@@ -2340,7 +2347,7 @@ run("zuma-timers-and-last-chance-hit", """
     assert spawned.spawned == 2, spawned.spawned
     assert abs(spawned.spawn_timer - spawned.spawn_interval * 0.5) < 1e-6
 
-    burst = Zuma(backend=Stub()); burst.spawned = burst.level_ball_count
+    burst = Zuma(backend=Stub())
     burst.shoot_cooldown = 0.05; burst.shot_queue = 3
     burst.update(0.20)
     assert len(burst.projectiles) == 3, len(burst.projectiles)
@@ -2404,6 +2411,225 @@ run("2048-async-score-update-order", """
     assert backend.calls[0][1].get('submission_id') is None
     assert backend.calls[1][1].get('submission_id') == 42
     assert g.submitted_score == 250 and g.score_submission_id == 42
+    pygame.quit()
+""")
+
+
+# ===========================================================================
+print("\n=== 91. Result saves gate leaderboard refresh and expose retry ===")
+run("result-save-state-and-leaderboard-order", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.common.ui import (BaseGame, SAVE_FAILED, SAVE_SAVED,
+                                  SAVE_SAVING)
+    class ManualFuture:
+        def __init__(self, result=None, done=False):
+            self.value=result; self.ready=done
+        def done(self): return self.ready
+        def result(self): return self.value
+    class Backend:
+        def __init__(self, futures):
+            self.futures=list(futures); self.submits=0; self.lb_calls=0
+        def submit_score_async(self, *a, **k):
+            self.submits += 1; return self.futures.pop(0)
+        def leaderboard_async(self, *a, **k):
+            self.lb_calls += 1; return ManualFuture([], True)
+    class Demo(BaseGame):
+        game_id='tetris'
+        def update(self, dt): pass
+        def draw(self): pass
+
+    pending=ManualFuture({'ok':True, 'id':7})
+    backend=Backend([pending]); g=Demo(260,260,backend=backend)
+    g.on_game_over(10); g.draw_gameover_overlay()
+    assert g.score_save_state == SAVE_SAVING
+    assert backend.lb_calls == 0, 'leaderboard raced ahead of score ACK'
+    pending.ready=True; g.draw_gameover_overlay()
+    assert g.score_save_state == SAVE_SAVED
+    assert backend.lb_calls == 1
+
+    backend=Backend([ManualFuture(None, True),
+                     ManualFuture({'ok':True, 'id':8}, True)])
+    g=Demo(260,260,backend=backend); g.on_game_over(20)
+    g.draw_gameover_overlay(); assert g.score_save_state == SAVE_FAILED
+    g.handle_event(pygame.event.Event(
+        pygame.KEYDOWN, {'key':pygame.K_s, 'unicode':'s'}))
+    g.draw_gameover_overlay()
+    assert g.score_save_state == SAVE_SAVED and backend.submits == 2
+    pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 92. Tetris tracks alias keys and stops catch-up at a new piece ===")
+run("tetris-physical-keys-and-piece-generation", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.tetris import Tetris, Piece, COLS, ROWS
+    class Stub:
+        def submit_score(self,*a,**k): return {'ok':True,'id':1}
+        def leaderboard(self,*a,**k): return []
+    def event(kind, key):
+        return pygame.event.Event(kind, {'key':key, 'unicode':''})
+
+    g=Tetris(backend=Stub())
+    g.handle_event(event(pygame.KEYDOWN, pygame.K_LEFT))
+    g.handle_event(event(pygame.KEYDOWN, pygame.K_a))
+    g.handle_event(event(pygame.KEYUP, pygame.K_a))
+    assert g.horizontal_hold == -1 and pygame.K_LEFT in g.pressed_keys
+    g.handle_event(event(pygame.KEYDOWN, pygame.K_DOWN))
+    g.handle_event(event(pygame.KEYDOWN, pygame.K_s))
+    g.handle_event(event(pygame.KEYUP, pygame.K_s))
+    assert g.soft_drop_held and pygame.K_DOWN in g.pressed_keys
+
+    g=Tetris(backend=Stub()); g.board=[[None]*COLS for _ in range(ROWS)]
+    g.piece=Piece('O'); g.piece.x=3; g.piece.y=18
+    old_generation=g.piece_generation
+    g.soft_drop_held=True; g.soft_drop_repeat_timer=0.0
+    g.update(0.5)
+    assert g.piece_generation == old_generation + 1
+    assert g.piece.y == -1, 'soft-drop remainder moved the new piece'
+
+    g=Tetris(backend=Stub()); g.board=[[None]*COLS for _ in range(ROWS)]
+    g.piece=Piece('O'); g.piece.x=3; g.piece.y=18
+    g.drop_timer=g.drop_interval
+    g.update(0.0)
+    assert g.piece.y == -1, 'gravity remainder moved the new piece'
+
+    class FalsyBoard(list):
+        def __bool__(self): return False
+    g=Tetris(backend=Stub()); g.board[0][0]='I'
+    alternate=FalsyBoard([[None]*COLS for _ in range(ROWS)])
+    assert not g._collides([(0,0)], board=alternate)
+    pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 93. Backend retries saves and closes shared resources ===")
+run("backend-reliable-save-and-close", """
+    from client.common.network import BackendClient
+    class RetryBackend(BackendClient):
+        def __init__(self): super().__init__(); self.calls=0; self.kwargs=[]
+        def submit_score(self, *a, **k):
+            self.calls += 1; self.kwargs.append(k)
+            if self.calls < 3: return None
+            return {'ok':True, 'id':9}
+    backend=RetryBackend()
+    backend._mark_unavailable('read')
+    assert backend._request_allowed('write'), 'read failure blocked a save'
+    failure_time=backend._last_failure_at['read']
+    blocked_until=backend._offline_until['read']
+    backend._mark_available('read', failure_time - 1.0)
+    assert backend._offline_until['read'] == blocked_until, \
+        'an older success erased a newer failure backoff'
+    future=backend.submit_score_reliable_async('tetris','p',10)
+    assert future.result(timeout=3)['id'] == 9
+    assert backend.calls == 3 and backend.drain(timeout=1)
+    request_ids={call.get('request_id') for call in backend.kwargs}
+    assert len(request_ids) == 1 and None not in request_ids, request_ids
+    backend.close(); assert backend._closed
+    backend.close()
+    try:
+        backend.health_async()
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError('closed client accepted new work')
+
+    class RecoveringBackend(BackendClient):
+        def __init__(self): super().__init__(); self.available=False
+        def submit_score(self,*a,**k):
+            return ({'ok':True,'id':11} if self.available else None)
+    backend=RecoveringBackend()
+    backend.submit_score_reliable_async('snake','p',20).result(timeout=3)
+    import time; time.sleep(0.02)
+    assert backend.failed_save_count() == 1
+    backend.available=True
+    assert backend.retry_failed_saves() == 1
+    backend.drain(timeout=3); time.sleep(0.02)
+    assert backend.failed_save_count() == 0
+    backend.close()
+
+    # A late failed milestone must not resurrect an error after a higher
+    # replace-style final score has already been confirmed.
+    backend=BackendClient()
+    class Done:
+        def __init__(self, value): self.value=value
+        def result(self): return self.value
+    low={'token':1, 'payload':{'game_id':'2048','player':'p','score':100,
+         'extra':None,'replace':True,'submission_id':None}}
+    high={'token':2, 'payload':{'game_id':'2048','player':'p','score':250,
+          'extra':None,'replace':True,'submission_id':None}}
+    backend._capture_score_save(Done({'ok':True,'id':5}), high)
+    backend._capture_score_save(Done(None), low)
+    assert backend.failed_save_count() == 0
+    backend.close()
+""")
+
+# ===========================================================================
+print("\n=== 94. Score API is monotonic and DB failures stay JSON ===")
+run("backend-monotonic-update-and-json-errors", """
+    import tempfile
+    from pathlib import Path
+    import server.app as server
+    with tempfile.TemporaryDirectory() as temp_dir:
+        server.DB_PATH=Path(temp_dir)/'scores.db'; server.init_db()
+        client=server.app.test_client()
+        first=client.post('/api/scores',json={
+            'game_id':'2048','player':'p','score':100}).get_json()
+        lower=client.post('/api/scores',json={
+            'game_id':'2048','player':'p','score':10,
+            'submission_id':first['id']}).get_json()
+        assert lower['score'] == 100, lower
+        rows=client.get('/api/leaderboard/2048').get_json()['leaderboard']
+        assert rows[0]['score'] == 100, rows
+        stats=client.get('/api/stats/2048').get_json()
+        assert stats['records'] == 1 and 'plays' not in stats, stats
+
+        request={'game_id':'tetris','player':'p','score':88,
+                 'request_id':'same-logical-save-0001'}
+        saved=client.post('/api/scores',json=request).get_json()
+        repeated=client.post('/api/scores',json=request).get_json()
+        assert repeated['id'] == saved['id']
+        assert repeated['duplicate_request'] is True
+        stats=client.get('/api/stats/tetris').get_json()
+        assert stats['records'] == 1, stats
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        server.DB_PATH=Path(temp_dir)
+        client=server.app.test_client()
+        requests=[
+            client.post('/api/scores',json={'game_id':'tetris','score':1}),
+            client.get('/api/leaderboard/tetris'),
+            client.get('/api/stats/tetris'),
+            client.get('/api/recent'),
+        ]
+        for response in requests:
+            assert response.status_code == 503
+            assert response.is_json
+            assert response.get_json()['code'] == 'database_unavailable'
+""")
+
+# ===========================================================================
+print("\n=== 95. Sokoban confirmation requires a valid save ACK ===")
+run("sokoban-confirmed-total-requires-ack", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.sokoban import Sokoban, LEVELS
+    class Future:
+        def __init__(self, value): self.value=value
+        def done(self): return True
+        def result(self): return self.value
+    class Backend:
+        def __init__(self): self.values=[None, {'ok':True,'id':12}]
+        def submit_score_async(self,*a,**k): return Future(self.values.pop(0))
+        def leaderboard_async(self,*a,**k): return Future([])
+    g=Sokoban(backend=Backend())
+    for level in range(len(LEVELS)):
+        g.load_level(level); g.boxes=set(g.targets); g._check_win()
+    g.draw()
+    assert g._confirmed_total == 0 and g._pending_total == g.total_score
+    g.retry_score_save(); g.draw()
+    assert g._confirmed_total == g.total_score and g._pending_total is None
     pygame.quit()
 """)
 

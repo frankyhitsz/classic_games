@@ -29,6 +29,7 @@ BOARD_Y = 20
 SNAKE_INITIAL_SPEED = 7.0  # grid steps/sec; old game started at 12
 SNAKE_MAX_SPEED = 20.0
 SNAKE_FOOD_PER_LEVEL = 5
+SNAKE_STALL_DT = 0.25
 BOARD_COLOR_A = (255, 248, 224)
 BOARD_COLOR_B = (248, 239, 207)
 
@@ -51,6 +52,7 @@ class Snake(BaseGame):
         self.reset()
 
     def reset(self):
+        self.begin_score_session()
         cx, cy = COLS // 2, ROWS // 2
         self.body: deque = deque([(cx, cy), (cx - 1, cy), (cx - 2, cy)])
         self.direction = (1, 0)
@@ -74,15 +76,23 @@ class Snake(BaseGame):
     def update(self, dt: float):
         if self.state != "playing":
             return
-        self.move_timer += dt
+        interval = 1.0 / self.move_speed
+        stalled = dt > SNAKE_STALL_DT
+        if stalled:
+            # After a visible application stall, advance once and discard the
+            # hidden backlog. Several unseen grid steps can otherwise kill the
+            # player before the first recovered frame is drawn.
+            self.move_timer = interval
+        else:
+            self.move_timer += dt
         # Cap catch-up work after a long stall, while retaining enough time
         # for ordinary low-frame-rate updates to produce every grid step.
-        self.move_timer = min(self.move_timer, 4.0 / self.move_speed)
+        self.move_timer = min(self.move_timer, 4.0 * interval)
         steps = 0
         while (self.state == "playing"
-               and self.move_timer >= 1.0 / self.move_speed
-               and steps < 4):
-            self.move_timer -= 1.0 / self.move_speed
+               and self.move_timer >= interval
+               and steps < (1 if stalled else 4)):
+            self.move_timer -= interval
             self._step()
             steps += 1
 

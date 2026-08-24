@@ -13,9 +13,13 @@ from typing import Callable, List, Optional
 
 import pygame
 
-from .network import BackendClient
+from .network import BackendClient, parse_score_response
 
 OVERLAY_INPUT_GUARD_MS = 180
+SAVE_IDLE = "idle"
+SAVE_SAVING = "saving"
+SAVE_SAVED = "saved"
+SAVE_FAILED = "failed"
 
 # ----------------------------------------------------------------------------
 # Palette
@@ -372,7 +376,8 @@ class BaseGame(abc.ABC):
         pygame.display.set_caption(self.title)
         self.clock = pygame.time.Clock()
         self.fps = fps
-        self.backend = backend or BackendClient()
+        self._owns_backend = backend is None
+        self.backend = backend if backend is not None else BackendClient()
         self.player = player
         self.running = True
         self.state = "playing"  # playing | paused | gameover | won
@@ -390,7 +395,15 @@ class BaseGame(abc.ABC):
         self._overlay_lb_key = None
         self._overlay_leaderboard: List[dict] = []
         self._overlay_lb_future = None
+        self._overlay_lb_generation = 0
+        self._overlay_lb_future_generation = 0
         self._score_submit_future = None
+        self._score_submit_generation = 0
+        self._score_submit_future_generation = 0
+        self._score_submit_active_payload = None
+        self._last_score_payload = None
+        self.score_save_state = SAVE_IDLE
+        self.score_save_error: Optional[str] = None
         # Restart/continue buttons share the same mouse with some games.
         # Briefly swallow a rapid second click after an overlay action so a
         # double-click cannot fire a Zuma ball or begin a 2048 swipe.
@@ -410,6 +423,12 @@ class BaseGame(abc.ABC):
         That prevents a click on a restart/continue overlay button from also
         reaching the newly-reset game underneath the overlay.
         """
+        self._poll_score_submission()
+        if (event.type == pygame.KEYDOWN and event.key == pygame.K_s
+                and self.state in ("gameover", "won")
+                and self.score_save_state == SAVE_FAILED):
+            self.retry_score_save()
+            return True
         if (event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP)
                 and getattr(event, "button", None) == 1
                 and pygame.time.get_ticks() < self._overlay_mouse_guard_until):
@@ -460,22 +479,96 @@ class BaseGame(abc.ABC):
         self._overlay_lb_key = None
         self._overlay_leaderboard = []
         self._overlay_lb_future = None
+        self._overlay_lb_generation += 1
+
+    def begin_score_session(self) -> None:
+        """Detach UI state from an older run without cancelling its save."""
+        self._score_submit_generation += 1
+        self._score_submit_future = None
+        self._score_submit_active_payload = None
+        self._last_score_payload = None
+        self.score_save_state = SAVE_IDLE
+        self.score_save_error = None
+        self.invalidate_overlay_leaderboard()
 
     def _submit_result_score(self, score: int, extra=None) -> None:
         if not self.backend or not self.game_id:
             return
-        submit_async = getattr(self.backend, "submit_score_async", None)
+        payload = {"score": score, "extra": extra,
+                   "replace": self.submit_replaces_existing}
+        self._last_score_payload = payload
+        self._score_submit_generation += 1
+        generation = self._score_submit_generation
+        self._score_submit_active_payload = payload
+        self.score_save_state = SAVE_SAVING
+        self.score_save_error = None
+        submit_async = getattr(
+            self.backend, "submit_score_reliable_async", None)
+        if not callable(submit_async):
+            submit_async = getattr(self.backend, "submit_score_async", None)
         if callable(submit_async):
-            self._score_submit_future = submit_async(
-                self.game_id, self.player, score, extra=extra,
-                replace=self.submit_replaces_existing)
+            try:
+                self._score_submit_future = submit_async(
+                    self.game_id, self.player, score, extra=extra,
+                    replace=self.submit_replaces_existing)
+                self._score_submit_future_generation = generation
+            except Exception as exc:  # noqa: BLE001
+                self._finish_score_submission(None, payload, generation,
+                                              str(exc))
         else:
-            # Lightweight test/custom backends may only implement the
-            # synchronous protocol. The real BackendClient always uses the
-            # non-blocking branch above.
-            self.backend.submit_score(
-                self.game_id, self.player, score, extra=extra,
-                replace=self.submit_replaces_existing)
+            try:
+                result = self.backend.submit_score(
+                    self.game_id, self.player, score, extra=extra,
+                    replace=self.submit_replaces_existing)
+            except Exception as exc:  # noqa: BLE001
+                self._finish_score_submission(None, payload, generation,
+                                              str(exc))
+            else:
+                self._finish_score_submission(result, payload, generation)
+
+    def _poll_score_submission(self) -> None:
+        future = self._score_submit_future
+        if future is None or not future.done():
+            return
+        generation = self._score_submit_future_generation
+        payload = self._score_submit_active_payload
+        self._score_submit_future = None
+        try:
+            result = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self._finish_score_submission(None, payload, generation, str(exc))
+        else:
+            self._finish_score_submission(result, payload, generation)
+
+    def _finish_score_submission(self, result, payload, generation: int,
+                                 exception_text: Optional[str] = None) -> None:
+        if generation != self._score_submit_generation:
+            return
+        row_id, error = parse_score_response(result)
+        if row_id is None:
+            self.score_save_state = SAVE_FAILED
+            self.score_save_error = exception_text or error or "保存失败"
+            self.on_score_save_failed(payload, self.score_save_error)
+            return
+        self.score_save_state = SAVE_SAVED
+        self.score_save_error = None
+        self.on_score_save_succeeded(result, payload)
+        # Read the leaderboard only after the server has acknowledged the
+        # score, otherwise the GET can race ahead of the POST.
+        self.invalidate_overlay_leaderboard()
+
+    def retry_score_save(self) -> None:
+        payload = self._last_score_payload
+        if self.score_save_state != SAVE_FAILED or not payload:
+            return
+        self._submit_result_score(payload["score"], payload.get("extra"))
+
+    def on_score_save_succeeded(self, result: dict, payload: dict) -> None:
+        """Hook for games that maintain their own confirmed-save state."""
+
+    def on_score_save_failed(self, payload: dict,
+                             error: Optional[str]) -> None:
+        """Hook for games that maintain their own pending-save state."""
 
     def on_game_over(self, score: int, extra=None) -> None:
         self.score = score
@@ -499,6 +592,7 @@ class BaseGame(abc.ABC):
         try:
             while self.running:
                 dt = self.clock.tick(self.fps) / 1000.0
+                self._poll_score_submission()
                 for event in pygame.event.get():
                     self.handle_event(event)
                 # 2048 keeps animating during won/gameover overlays, so we
@@ -514,6 +608,10 @@ class BaseGame(abc.ABC):
                 self.draw()
                 pygame.display.flip()
         finally:
+            if self._owns_backend:
+                close_backend = getattr(self.backend, "close", None)
+                if callable(close_backend):
+                    close_backend()
             # CRITICAL: only tear down the *display* — not all of pygame.
             # This keeps pygame.font, pygame.time, etc. initialized so the
             # launcher can resume instantly (just recreates the window).
@@ -581,6 +679,7 @@ class BaseGame(abc.ABC):
     def draw_gameover_overlay(self, message: str = "游戏结束",
                               buttons: Optional[List[Button]] = None,
                               detail: Optional[str] = None) -> None:
+        self._poll_score_submission()
         # Store buttons so handle_event can route clicks to them on the
         # next event loop iteration. Drawing must not pump events itself.
         self.overlay_buttons = list(buttons) if buttons else []
@@ -621,12 +720,24 @@ class BaseGame(abc.ABC):
             draw_text(self.screen, detail, (panel.centerx, panel.y + 114),
                       size=14, color=COLORS["text_dim"], center=True)
 
+        save_messages = {
+            SAVE_SAVING: ("成绩保存中…", COLORS["text_dim"]),
+            SAVE_SAVED: ("成绩已保存", COLORS["ok"]),
+            SAVE_FAILED: ("保存失败 · 按 S 重试", COLORS["danger"]),
+        }
+        save_line = save_messages.get(self.score_save_state)
+        if save_line:
+            draw_text(self.screen, save_line[0],
+                      (panel.centerx, panel.y + 132), size=13,
+                      color=save_line[1], center=True)
+
         # Try to fetch leaderboard (cached by BackendClient per call site).
         # Render up to 3 entries as STACKED lines (one per entry) so the
         # text can never overflow the panel horizontally — even on narrow
         # windows like Tetris (560) or 2048 (460).
         lb_key = (self.game_id, self.state, self.score, repr(self.extra))
-        if lb_key != self._overlay_lb_key:
+        if (self.score_save_state != SAVE_SAVING
+                and lb_key != self._overlay_lb_key):
             self._overlay_lb_key = lb_key
             self._overlay_leaderboard = []
             self._overlay_lb_future = None
@@ -637,6 +748,8 @@ class BaseGame(abc.ABC):
                     if callable(leaderboard_async):
                         self._overlay_lb_future = leaderboard_async(
                             self.game_id, limit=3)
+                        self._overlay_lb_future_generation = (
+                            self._overlay_lb_generation)
                     else:
                         self._overlay_leaderboard = self.backend.leaderboard(
                             self.game_id, limit=3)
@@ -644,16 +757,22 @@ class BaseGame(abc.ABC):
                     self._overlay_leaderboard = []
         if (self._overlay_lb_future is not None
                 and self._overlay_lb_future.done()):
+            generation = self._overlay_lb_future_generation
             try:
                 result = self._overlay_lb_future.result()
-                self._overlay_leaderboard = (result
-                                             if isinstance(result, list)
-                                             else [])
+                if generation == self._overlay_lb_generation:
+                    self._overlay_leaderboard = (result
+                                                 if isinstance(result, list)
+                                                 else [])
             except Exception:  # noqa: BLE001 - offline play must survive
                 self._overlay_leaderboard = []
             self._overlay_lb_future = None
         lb = self._overlay_leaderboard
-        if lb:
+        if self.score_save_state == SAVE_SAVING:
+            draw_text(self.screen, "（保存后更新排行）",
+                      (panel.centerx, panel.y + 154), size=13,
+                      color=COLORS["text_dim"], center=True)
+        elif lb:
             f13 = font(13)
             for i, e in enumerate(lb):
                 line = f"#{e.get('rank', i+1)} {(e.get('player') or 'anon')[:10]}: {e.get('score', 0)}"
@@ -661,15 +780,15 @@ class BaseGame(abc.ABC):
                 max_w = panel.w - 40
                 line = fit_text(line, f13, max_w)
                 draw_text(self.screen, line,
-                          (panel.centerx, panel.y + 132 + i * 16),
+                          (panel.centerx, panel.y + 150 + i * 16),
                           size=13, color=COLORS["text_dim"], center=True)
         elif self._overlay_lb_future is not None:
             draw_text(self.screen, "（排行加载中…）",
-                      (panel.centerx, panel.y + 138), size=13,
+                      (panel.centerx, panel.y + 154), size=13,
                       color=COLORS["text_dim"], center=True)
         else:
             draw_text(self.screen, "（暂无排行）",
-                      (panel.centerx, panel.y + 138), size=13,
+                      (panel.centerx, panel.y + 154), size=13,
                       color=COLORS["text_dim"], center=True)
 
         # Buttons row/stack

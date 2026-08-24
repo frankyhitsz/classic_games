@@ -78,6 +78,16 @@ def init_db() -> None:
                 payload TEXT,
                 created_at REAL NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS score_requests (
+                request_id TEXT PRIMARY KEY,
+                score_id INTEGER NOT NULL,
+                game_id TEXT NOT NULL,
+                player TEXT NOT NULL,
+                requested_score INTEGER NOT NULL,
+                response_score INTEGER NOT NULL,
+                created_at REAL NOT NULL
+            );
             """
         )
         columns = {row["name"] for row in
@@ -119,6 +129,13 @@ def _too_large(_exc):
     return api_error("body_too_large", "request body exceeds 64 KiB", 413)
 
 
+@app.errorhandler(sqlite3.Error)
+def _database_error(exc):
+    app.logger.exception("score database operation failed", exc_info=exc)
+    return api_error("database_unavailable",
+                     "score database is temporarily unavailable", 503)
+
+
 @app.before_request
 def _before() -> None:
     g.started = time.time()
@@ -157,7 +174,7 @@ def submit_score():
     if not isinstance(body, dict):
         return api_error("invalid_body", "JSON body must be an object")
     allowed_fields = {"game_id", "player", "score", "extra", "replace",
-                      "submission_id"}
+                      "submission_id", "request_id"}
     unknown_fields = sorted(set(body) - allowed_fields)
     if unknown_fields:
         return api_error("unknown_fields",
@@ -212,25 +229,74 @@ def submit_score():
         if type(submission_id) is not int or submission_id <= 0:
             return api_error("invalid_submission_id",
                              "submission_id must be a positive integer")
+    request_id = body.get("request_id")
+    if request_id is not None:
+        if (not isinstance(request_id, str)
+                or not 16 <= len(request_id) <= 64
+                or not all(ch.isascii() and (ch.isalnum() or ch in "-_")
+                           for ch in request_id)):
+            return api_error(
+                "invalid_request_id",
+                "request_id must be 16-64 ASCII letters, digits, - or _")
 
     if game_id not in VALID_GAME_IDS:
         return api_error("unknown_game", f"unknown game_id: {game_id}")
 
     with db_conn() as conn:
+        if request_id is not None:
+            prior_request = conn.execute(
+                "SELECT score_id, game_id, player, requested_score, "
+                "response_score FROM score_requests "
+                "WHERE request_id=?", (request_id,),
+            ).fetchone()
+            if prior_request is not None:
+                if (prior_request["game_id"] != game_id
+                        or prior_request["player"] != player
+                        or prior_request["requested_score"] != score):
+                    return api_error(
+                        "request_id_conflict",
+                        "request_id was already used for another score", 409)
+                prior_rank = conn.execute(
+                    "SELECT COUNT(*) + 1 FROM scores "
+                    "WHERE game_id=? AND score > ?",
+                    (game_id, prior_request["response_score"]),
+                ).fetchone()[0]
+                return jsonify({
+                    "ok": True,
+                    "id": prior_request["score_id"],
+                    "rank": prior_rank,
+                    "replaced": 0,
+                    "updated": False,
+                    "preserved": False,
+                    "score": prior_request["response_score"],
+                    "duplicate_request": True,
+                    "submitted_from": get_remote_ip(),
+                })
         deleted = 0
         updated = False
         preserved = False
         row_id = None
         stored_score = score
         if submission_id is not None:
-            cur = conn.execute(
-                "UPDATE scores SET score=?, extra=?, updated_at=? "
+            existing_update = conn.execute(
+                "SELECT score FROM scores "
                 "WHERE id=? AND game_id=? AND player=?",
-                (score, extra_json, time.time(),
-                 submission_id, game_id, player),
-            )
-            updated = cur.rowcount > 0
-            if updated:
+                (submission_id, game_id, player),
+            ).fetchone()
+            if existing_update is not None:
+                stored_score = max(existing_update["score"], score)
+                if score < existing_update["score"]:
+                    conn.execute(
+                        "UPDATE scores SET score=?, updated_at=? WHERE id=?",
+                        (stored_score, time.time(), submission_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE scores SET score=?, extra=?, updated_at=? "
+                        "WHERE id=?",
+                        (stored_score, extra_json, time.time(), submission_id),
+                    )
+                updated = True
                 row_id = submission_id
         if not updated and replace:
             # Running-total games submit intermediate milestones. Preserve a
@@ -264,6 +330,14 @@ def submit_score():
             "SELECT COUNT(*) + 1 FROM scores WHERE game_id=? AND score > ?",
             (game_id, stored_score),
         ).fetchone()[0]
+        if request_id is not None:
+            conn.execute(
+                "INSERT INTO score_requests "
+                "(request_id, score_id, game_id, player, requested_score, "
+                "response_score, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (request_id, row_id, game_id, player, score, stored_score,
+                 time.time()),
+            )
 
     return jsonify(
         {
@@ -319,7 +393,9 @@ def stats(game_id: str):
     return jsonify(
         {
             "game_id": game_id,
-            "plays": row["n"],
+            # These rows are retained score records, not actual launch/play
+            # attempts: 2048 updates one row and Sokoban replaces older runs.
+            "records": row["n"],
             "best": row["best"] if row["best"] is not None else 0,
             "avg": round(row["avg"], 2) if row["avg"] is not None else 0,
         }

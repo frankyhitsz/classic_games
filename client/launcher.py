@@ -1,10 +1,7 @@
-"""Game launcher / hub.
-
-Shows all games fetched from the backend, lets the user pick one, then
-imports and launches the corresponding client module in this same process.
-"""
+"""Game launcher / hub for the five locally installed games."""
 from __future__ import annotations
 
+import atexit
 import importlib
 import sys
 import time
@@ -185,6 +182,7 @@ def main():
     clock = pygame.time.Clock()
 
     backend = BackendClient()
+    atexit.register(backend.close)
     # Paint the launcher immediately from local metadata while the localhost
     # health check runs in the background. A stopped backend can otherwise
     # freeze the very first frame for the full HTTP timeout.
@@ -338,6 +336,7 @@ def main():
     # Animated hover lift: each card has a current lift value that we
     # ease toward its target (1.0 on hover, 0.0 otherwise) every frame.
     card_lift = {g["id"]: 0.0 for g in games_meta}
+    launch_error = None
 
     running = True
     mouse_pos = pygame.mouse.get_pos()
@@ -390,9 +389,12 @@ def main():
                         editing_player = False
                     elif event.key == pygame.K_BACKSPACE:
                         player = player[:-1]
-                    elif (event.unicode and len(player) < 16
+                    elif (event.unicode and len(player) < 32
                           and event.unicode.isprintable()):
                         player += event.unicode
+                    continue
+                elif event.key == pygame.K_s and backend.failed_save_count():
+                    backend.retry_failed_saves()
                     continue
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if player_input_rect.collidepoint(event.pos):
@@ -405,10 +407,13 @@ def main():
                         0, -int(card_lift[gid] * 6))
                     if visible_rect.collidepoint(event.pos):
                         try:
+                            launch_error = None
                             mod = import_game_module(gid)
                             mod.run_game(backend=backend,
                                          player=player.strip() or "guest")
                         except Exception as e:  # noqa: BLE001
+                            launch_error = (
+                                f"{card['meta']['name']}启动失败，请查看终端日志")
                             print(f"[launcher] failed to launch {gid}: {e}")
                         screen = reset_after_subgame()
                         lb_cache_ts[gid] = 0.0
@@ -493,7 +498,7 @@ def main():
             draw_text(screen, card["meta"]["name"],
                       (lifted_rect.centerx, lifted_rect.y + 118),
                       size=20, color=accent, bold=True, center=True)
-            # Description (wrap to 2 lines if needed)
+            # Descriptions are deliberately kept to one short line.
             draw_text(screen, card["meta"]["description"],
                       (lifted_rect.centerx, lifted_rect.y + 145),
                       size=11, color=COLORS["text_dim"], center=True)
@@ -535,13 +540,23 @@ def main():
                          game_names=lb_title_map)
 
         draw_text(screen,
-                  f"Esc 退出 · 状态: {'在线' if online else '离线'} · "
+                  f"Esc 退出 · 成绩服务: {'可用' if online else '不可用'} · "
                   f"玩家: {player.strip() or 'guest'}",
                   (WIDTH // 2, HEIGHT - 14), size=11,
                   color=COLORS["text_dim"], center=True)
+        if launch_error:
+            draw_text(screen, launch_error, (WIDTH // 2, HEIGHT - 34),
+                      size=12, color=COLORS["danger"], center=True)
+        failed_saves = backend.failed_save_count()
+        if failed_saves:
+            draw_text(screen,
+                      f"有 {failed_saves} 条成绩尚未保存 · 按 S 重试",
+                      (WIDTH // 2, HEIGHT - 34), size=12,
+                      color=COLORS["danger"], center=True)
 
         pygame.display.flip()
 
+    backend.close()
     pygame.quit()
 
 

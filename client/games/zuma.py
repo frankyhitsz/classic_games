@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import math
 import random
-import time
 from bisect import bisect_left
 from typing import List, Optional, Tuple
 
@@ -193,6 +192,7 @@ class Zuma(BaseGame):
     # ------------------------------------------------------------------
     def reset(self):
         """Start a fresh five-level run."""
+        self.begin_score_session()
         self.level_idx = 0
         self.score = 0
         self.cleared_balls = 0
@@ -234,6 +234,7 @@ class Zuma(BaseGame):
         self.match_particles: List[dict] = []
         self.chain_banner_timer = 0.0
         self.chain_banner_depth = 0
+        self.visual_time = 0.0
         self.state = "playing"
         self.extra = None
         self.current_color = random.randint(0, NUM_COLORS - 1)
@@ -254,6 +255,7 @@ class Zuma(BaseGame):
     def update(self, dt: float):
         if self.state != "playing":
             return
+        self.visual_time += dt
         self.shoot_cooldown -= dt
         while self.shoot_cooldown <= 0.0 and self.shot_queue > 0:
             overdue = -self.shoot_cooldown
@@ -326,6 +328,7 @@ class Zuma(BaseGame):
         if (self.spawned >= self.level_ball_count
                 and not self.chain
                 and not self.incoming):
+            self.projectiles.clear()
             self.level_bonus = LEVEL_CLEAR_BONUS * (self.level_idx + 1)
             self.score += self.level_bonus
             completed_all = self.level_idx == len(ZUMA_LEVELS) - 1
@@ -693,7 +696,7 @@ class Zuma(BaseGame):
         # always appear here and slide forward along the track.
         sx, sy = self.path_pts[0]
         # Pulsing accent ring so the spawn point is obvious.
-        pulse = 0.5 + 0.5 * math.sin(time.time() * 3.0)
+        pulse = 0.5 + 0.5 * math.sin(self.visual_time * 3.0)
         ring_r = int(BALL_R + 6 + pulse * 3)
         pygame.draw.circle(self.screen, COLORS["accent"],
                            (int(sx), int(sy)), ring_r, 2)

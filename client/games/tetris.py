@@ -42,6 +42,7 @@ HORIZONTAL_DAS = 0.16  # delay before held left/right starts repeating
 HORIZONTAL_ARR = 0.045  # repeat interval after DAS
 SOFT_DROP_DAS = 0.12
 SOFT_DROP_ARR = 0.045
+MAX_FRAME_DT = 0.25
 TETRIS_LINES_PER_LEVEL = 10
 TETRIS_INITIAL_DROP_INTERVAL = 0.8
 TETRIS_MIN_DROP_INTERVAL = 0.08
@@ -167,6 +168,7 @@ class Tetris(BaseGame):
 
     # ------------------------------------------------------------------
     def reset(self):
+        self.begin_score_session()
         self.board: List[List[Optional[str]]] = [
             [None] * COLS for _ in range(ROWS)]
         self.piece: Optional[Piece] = None
@@ -177,7 +179,8 @@ class Tetris(BaseGame):
         self.drop_timer = 0.0
         self.drop_interval = tetris_drop_interval(self.level)
         self.horizontal_hold = 0
-        self.horizontal_pressed: List[int] = []
+        self.pressed_keys: set[int] = set()
+        self._horizontal_press_order: List[int] = []
         self.horizontal_repeat_timer = 0.0
         self.soft_drop_held = False
         self.soft_drop_repeat_timer = 0.0
@@ -190,9 +193,11 @@ class Tetris(BaseGame):
         # of J/L/T return to the original aligned cell instead of drifting
         # one row up (and often one column left) along the floor.
         self._rotation_lift_debt = 0
+        self.piece_generation = 0
         self._spawn()
 
     def _spawn(self):
+        self.piece_generation += 1
         self._rotation_lift_debt = 0
         self.piece = Piece(self.next_kind)
         self.next_kind = random.choice(SHAPE_KEYS)
@@ -202,7 +207,8 @@ class Tetris(BaseGame):
                                                   "level": self.level})
 
     def _collides(self, cells, board=None) -> bool:
-        board = board or self.board
+        if board is None:
+            board = self.board
         for x, y in cells:
             if x < 0 or x >= COLS or y >= ROWS:
                 return True
@@ -354,6 +360,7 @@ class Tetris(BaseGame):
     def update(self, dt: float):
         if self.state != "playing":
             return
+        dt = max(0.0, min(dt, MAX_FRAME_DT))
         if self.horizontal_hold:
             self.horizontal_repeat_timer -= dt
             repeats = 0
@@ -362,11 +369,18 @@ class Tetris(BaseGame):
                 self.horizontal_repeat_timer += HORIZONTAL_ARR
                 repeats += 1
         if self.soft_drop_held:
+            generation = self.piece_generation
             self.soft_drop_repeat_timer -= dt
             repeats = 0
             while (self.soft_drop_repeat_timer <= 0.0
                    and repeats < ROWS and self.state == "playing"):
                 self._soft_drop()
+                if self.piece_generation != generation:
+                    # The remaining accumulator belongs to the locked piece,
+                    # never to the newly spawned one.
+                    self.soft_drop_repeat_timer = 0.0
+                    self.drop_timer = 0.0
+                    return
                 self.soft_drop_repeat_timer += SOFT_DROP_ARR
                 repeats += 1
         self.drop_timer += dt
@@ -379,52 +393,81 @@ class Tetris(BaseGame):
                 self._rotation_lift_debt = max(
                     0, self._rotation_lift_debt - 1)
             else:
+                generation = self.piece_generation
                 self._lock()
+                if self.piece_generation != generation:
+                    self.drop_timer = 0.0
+                    break
             gravity_steps += 1
+
+    @staticmethod
+    def _horizontal_direction_for_key(key: int) -> int:
+        if key in (pygame.K_LEFT, pygame.K_a):
+            return -1
+        if key in (pygame.K_RIGHT, pygame.K_d):
+            return 1
+        return 0
+
+    def _refresh_held_actions(self) -> None:
+        active_order = [key for key in self._horizontal_press_order
+                        if key in self.pressed_keys]
+        self._horizontal_press_order = active_order
+        self.horizontal_hold = (
+            self._horizontal_direction_for_key(active_order[-1])
+            if active_order else 0)
+        self.soft_drop_held = bool(
+            self.pressed_keys.intersection((pygame.K_DOWN, pygame.K_s)))
 
     def handle_event(self, event):
         if (event.type == getattr(pygame, "WINDOWFOCUSLOST", -1)
                 or (event.type == pygame.KEYDOWN
                     and event.key == pygame.K_p)):
             self.horizontal_hold = 0
-            self.horizontal_pressed = []
+            self.pressed_keys.clear()
+            self._horizontal_press_order = []
             self.soft_drop_held = False
+            self.horizontal_repeat_timer = 0.0
+            self.soft_drop_repeat_timer = 0.0
+            self.drop_timer = 0.0
         if event.type == pygame.KEYUP:
-            released = None
-            if event.key in (pygame.K_LEFT, pygame.K_a):
-                released = -1
-            elif event.key in (pygame.K_RIGHT, pygame.K_d):
-                released = 1
-            if released is not None:
-                self.horizontal_pressed = [
-                    d for d in self.horizontal_pressed if d != released]
-                self.horizontal_hold = (self.horizontal_pressed[-1]
-                                        if self.horizontal_pressed else 0)
+            was_horizontal = bool(
+                self._horizontal_direction_for_key(event.key))
+            self.pressed_keys.discard(event.key)
+            self._horizontal_press_order = [
+                key for key in self._horizontal_press_order
+                if key != event.key]
+            self._refresh_held_actions()
+            if was_horizontal:
                 if self.horizontal_hold:
                     self.horizontal_repeat_timer = HORIZONTAL_ARR
-            if event.key in (pygame.K_DOWN, pygame.K_s):
-                self.soft_drop_held = False
         if super().handle_event(event):
             return
         if event.type == pygame.KEYDOWN and self.state == "playing":
             if event.key in (pygame.K_LEFT, pygame.K_a):
-                self._move(-1)
-                self.horizontal_pressed = [
-                    d for d in self.horizontal_pressed if d != -1]
-                self.horizontal_pressed.append(-1)
-                self.horizontal_hold = -1
-                self.horizontal_repeat_timer = HORIZONTAL_DAS
+                is_new = event.key not in self.pressed_keys
+                self.pressed_keys.add(event.key)
+                if is_new:
+                    self._horizontal_press_order.append(event.key)
+                    self._move(-1)
+                self._refresh_held_actions()
+                if is_new:
+                    self.horizontal_repeat_timer = HORIZONTAL_DAS
             elif event.key in (pygame.K_RIGHT, pygame.K_d):
-                self._move(1)
-                self.horizontal_pressed = [
-                    d for d in self.horizontal_pressed if d != 1]
-                self.horizontal_pressed.append(1)
-                self.horizontal_hold = 1
-                self.horizontal_repeat_timer = HORIZONTAL_DAS
+                is_new = event.key not in self.pressed_keys
+                self.pressed_keys.add(event.key)
+                if is_new:
+                    self._horizontal_press_order.append(event.key)
+                    self._move(1)
+                self._refresh_held_actions()
+                if is_new:
+                    self.horizontal_repeat_timer = HORIZONTAL_DAS
             elif event.key in (pygame.K_DOWN, pygame.K_s):
-                self._soft_drop()
-                self.soft_drop_held = True
-                self.soft_drop_repeat_timer = SOFT_DROP_DAS
+                is_new = event.key not in self.pressed_keys
+                self.pressed_keys.add(event.key)
+                self._refresh_held_actions()
+                if is_new:
+                    self._soft_drop()
+                    self.soft_drop_repeat_timer = SOFT_DROP_DAS
             elif event.key in (pygame.K_UP, pygame.K_x):
                 self._rotate(1)
             elif event.key == pygame.K_z:

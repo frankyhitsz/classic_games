@@ -22,15 +22,16 @@ Controls:
 from __future__ import annotations
 
 import random
+from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional
 
 import pygame
 
-from client.common.network import BackendClient
-from client.common.ui import (COLORS, BaseGame, Button, draw_gradient_bg,
-                              draw_text, ease_out_back,
-                              ease_out_cubic)
+from client.common.network import BackendClient, parse_score_response
+from client.common.ui import (COLORS, SAVE_FAILED, SAVE_SAVED, SAVE_SAVING,
+                              BaseGame, Button, draw_gradient_bg, draw_text,
+                              ease_out_back, ease_out_cubic)
 
 GRID = 4
 TILE = 90
@@ -106,6 +107,8 @@ class Game2048(BaseGame):
 
     # ------------------------------------------------------------------
     def reset(self):
+        self._detach_queued_score_submission()
+        self.begin_score_session()
         self.tiles: List[Tile] = []
         self.grid: List[List[Optional[Tile]]] = [
             [None] * GRID for _ in range(GRID)]
@@ -120,10 +123,8 @@ class Game2048(BaseGame):
         self.state = "playing"
         self.overlay_buttons = []
         self.anim_t = 1.0  # 1.0 = no animation in progress
-        self._pending_state: Optional[str] = None
-        # Keep one direction pressed during a slide. Without this buffer,
-        # normal quick play silently dropped inputs for ANIM_DURATION.
-        self._queued_direction: Optional[str] = None
+        # Retain a short ordered burst during the slide animation.
+        self._queued_directions: deque[str] = deque(maxlen=2)
         self._won_announced = False  # only pop the win overlay once
         self._swipe_start: Optional[tuple] = None  # (x, y) on MOUSEBUTTONDOWN
         self._spawn_tile()
@@ -186,7 +187,10 @@ class Game2048(BaseGame):
             raise ValueError(f"unknown 2048 direction: {direction}")
         # Refuse input mid-slide so the animation can finish cleanly.
         if self.anim_t < 1.0:
-            self._queued_direction = direction
+            if (len(self._queued_directions) < self._queued_directions.maxlen
+                    and (not self._queued_directions
+                         or self._queued_directions[-1] != direction)):
+                self._queued_directions.append(direction)
             return
 
         # Reset per-move animation state.
@@ -319,10 +323,8 @@ class Game2048(BaseGame):
             # Start the one buffered move immediately after this slide has
             # settled and its new tile has spawned. This feels responsive but
             # still keeps merge calculations strictly one move at a time.
-            queued = self._queued_direction
-            self._queued_direction = None
-            if queued and self.state == "playing":
-                self._move(queued)
+            if self._queued_directions and self.state == "playing":
+                self._move(self._queued_directions.popleft())
 
         # Decay pop / grow spawn timers.
         for t in self.tiles:
@@ -350,27 +352,44 @@ class Game2048(BaseGame):
     def _begin_score_submission(self, score: int, extra=None) -> None:
         if not self.backend or not self.game_id:
             return
-        submit_async = getattr(self.backend, "submit_score_async", None)
+        self.score_save_state = SAVE_SAVING
+        self.score_save_error = None
+        self._last_score_payload = {"score": score, "extra": extra}
+        submit_async = getattr(
+            self.backend, "submit_score_reliable_async", None)
+        if not callable(submit_async):
+            submit_async = getattr(self.backend, "submit_score_async", None)
         if callable(submit_async):
-            self._score_submission_future = submit_async(
-                self.game_id, self.player, score, extra=extra,
-                submission_id=self.score_submission_id)
-            self._score_submission_inflight_score = score
+            try:
+                self._score_submission_future = submit_async(
+                    self.game_id, self.player, score, extra=extra,
+                    replace=True, submission_id=self.score_submission_id)
+                self._score_submission_inflight_score = score
+            except Exception as exc:  # noqa: BLE001
+                self.score_save_state = SAVE_FAILED
+                self.score_save_error = str(exc)
             return
-        result = self.backend.submit_score(
-            self.game_id, self.player, score, extra=extra,
-            submission_id=self.score_submission_id)
+        try:
+            result = self.backend.submit_score(
+                self.game_id, self.player, score, extra=extra, replace=True,
+                submission_id=self.score_submission_id)
+        except Exception as exc:  # noqa: BLE001
+            self.score_save_state = SAVE_FAILED
+            self.score_save_error = str(exc)
+            return
         self._record_score_submission(result, score)
 
     def _record_score_submission(self, result, score: int) -> None:
-        # ``None`` is the BackendClient's explicit offline/failure result.
-        # Do not turn a failed attempt into permanent session state.
-        if not result:
+        row_id, error = parse_score_response(result)
+        if row_id is None:
+            self.score_save_state = SAVE_FAILED
+            self.score_save_error = error
             return
-        if isinstance(result, dict) and result.get("id") is not None:
-            self.score_submission_id = int(result["id"])
+        self.score_submission_id = row_id
         self.score_submitted = True
         self.submitted_score = score
+        self.score_save_state = SAVE_SAVED
+        self.score_save_error = None
         self.invalidate_overlay_leaderboard()
 
     def _poll_score_submission(self) -> None:
@@ -392,6 +411,23 @@ class Game2048(BaseGame):
         if queued is not None and queued[0] != self.submitted_score:
             self._begin_score_submission(*queued)
 
+    def retry_score_save(self) -> None:
+        payload = self._last_score_payload
+        if self.score_save_state == SAVE_FAILED and payload:
+            self._begin_score_submission(payload["score"],
+                                         payload.get("extra"))
+
+    def _detach_queued_score_submission(self) -> None:
+        """Keep a final score alive when reset detaches the game object."""
+        queued = getattr(self, "_queued_score_submission", None)
+        if not queued or not self.backend:
+            return
+        submit_async = getattr(
+            self.backend, "submit_score_reliable_async", None)
+        if callable(submit_async):
+            submit_async(self.game_id, self.player, queued[0],
+                         extra=queued[1], replace=True)
+
     def _continue_after_win(self) -> None:
         self.state = "playing"
         self.overlay_buttons = []
@@ -406,7 +442,7 @@ class Game2048(BaseGame):
                 or (event.type == pygame.KEYDOWN
                     and event.key == pygame.K_p)):
             self._swipe_start = None
-            self._queued_direction = None
+            self._queued_directions.clear()
         if super().handle_event(event):
             return
         # Mouse swipe support: press → drag → release triggers a slide

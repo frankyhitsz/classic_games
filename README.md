@@ -43,6 +43,18 @@ pip install -r requirements.txt
 ./run.sh
 ```
 
+如需更换端口，启动脚本会让后端、健康检查和客户端使用同一个地址：
+
+```bash
+GAMES_PORT=5010 ./run.sh
+```
+
+监听局域网地址时，可分别指定服务端监听地址和客户端连接地址：
+
+```bash
+GAMES_HOST=0.0.0.0 GAMES_CLIENT_HOST=127.0.0.1 GAMES_PORT=5010 ./run.sh
+```
+
 分别启动：
 
 ```bash

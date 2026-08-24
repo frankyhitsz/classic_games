@@ -14,6 +14,11 @@ TEST_RUNTIME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/classic-games-tests.XXXXXX")
 TEST_PORT=$(python -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
 TEST_API_URL="http://127.0.0.1:${TEST_PORT}"
 
+default_db_fingerprint() {
+    python -c 'import hashlib,pathlib; p=pathlib.Path("data"); print("|".join(f"{x.name}:{hashlib.sha256(x.read_bytes()).hexdigest()}" for x in sorted(p.glob("scores.db*")) if x.is_file()) or "absent")'
+}
+DEFAULT_DB_BEFORE=$(default_db_fingerprint)
+
 health_ok() {
     python -c 'import json,sys,urllib.request as u; d=json.load(u.urlopen(sys.argv[1], timeout=.3)); sys.exit(0 if d.get("ok") and d.get("service")=="classic-games" else 1)' \
         "${TEST_API_URL}/api/health" >/dev/null 2>&1
@@ -39,5 +44,15 @@ if ! health_ok; then
     exit 1
 fi
 
-env GAMES_API_URL="${TEST_API_URL}" SDL_VIDEODRIVER=dummy \
-    SDL_AUDIODRIVER=dummy python -m tests.regression
+TEST_STATUS=0
+env GAMES_API_URL="${TEST_API_URL}" \
+    GAMES_DB="${TEST_RUNTIME_DIR}/direct-import.db" \
+    SDL_VIDEODRIVER=dummy \
+    SDL_AUDIODRIVER=dummy python -m tests.regression || TEST_STATUS=$?
+
+DEFAULT_DB_AFTER=$(default_db_fingerprint)
+if [[ "${DEFAULT_DB_BEFORE}" != "${DEFAULT_DB_AFTER}" ]]; then
+    echo "tests modified the default score database" >&2
+    exit 1
+fi
+exit "${TEST_STATUS}"

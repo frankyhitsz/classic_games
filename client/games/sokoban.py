@@ -223,8 +223,8 @@ LEVELS: List[List[str]] = [
 def parse_level(text: List[str]):
     """Returns (walls, targets, boxes, player, floors).
 
-    ``floors`` is the set of every cell that is reachable by the player —
-    i.e. every non-wall cell explicitly written in the level string. We
+    ``floors`` is the set of every designed non-wall cell explicitly written
+    in the level string. It is a map boundary, not a reachability proof. We
     use it to (a) prevent the player from walking off the map and
     (b) only render floor tiles inside the designed level area.
     """
@@ -262,6 +262,8 @@ def parse_level(text: List[str]):
         raise ValueError(f"level must contain exactly one player, got {len(players)}")
     if len(boxes) != len(targets):
         raise ValueError("level must contain the same number of boxes and targets")
+    if not boxes:
+        raise ValueError("level must contain at least one box and target")
     return walls, targets, boxes, players[0], floors
 
 
@@ -285,7 +287,8 @@ class Sokoban(BaseGame):
         self.level_scores: dict[int, int] = {}
         self.completed_levels: set[int] = set()
         self.practice_mode = False
-        self._submitted_total: Optional[int] = None
+        self._confirmed_total = 0
+        self._pending_total: Optional[int] = None
         w, h = level_bounds(LEVELS[0])
         super().__init__(max(500, w * CELL + 40), max(380, h * CELL + 132),
                          fps=60, backend=backend, player=player)
@@ -310,11 +313,13 @@ class Sokoban(BaseGame):
         # per-level ledger so replaying a level can improve its score without
         # adding the same level twice.
         if idx == 0:
+            self.begin_score_session()
             self.total_score = 0
             self.level_scores = {}
             self.completed_levels = set()
             self.practice_mode = False
-            self._submitted_total = None
+            self._confirmed_total = 0
+            self._pending_total = None
         w, h = level_bounds(level)
         # Recreate window to fit
         new_w = max(500, w * CELL + 40)
@@ -420,9 +425,9 @@ class Sokoban(BaseGame):
                       "practice": self.practice_mode,
                       "completed_all": completed_all}
             if (completed_all
-                    and (self._submitted_total is None
-                         or self.total_score > self._submitted_total)):
-                self._submitted_total = self.total_score
+                    and self.total_score > self._confirmed_total
+                    and self.total_score != self._pending_total):
+                self._pending_total = self.total_score
                 self.on_win(self.total_score, extra=result)
             else:
                 # Intermediate/practice clears get the same result overlay,
@@ -430,6 +435,14 @@ class Sokoban(BaseGame):
                 self.extra = result
                 self.state = "won"
                 self.invalidate_overlay_leaderboard()
+
+    def on_score_save_succeeded(self, result: dict, payload: dict) -> None:
+        self._confirmed_total = max(self._confirmed_total, payload["score"])
+        self._pending_total = None
+
+    def on_score_save_failed(self, payload: dict,
+                             error: Optional[str]) -> None:
+        self._pending_total = payload["score"]
 
     def _advance_after_win(self) -> None:
         next_idx = (self.level_idx + 1) % len(LEVELS)
