@@ -71,4 +71,8 @@
 - CI #9 确认 Windows 文件占用已消失，并暴露旧 v2 数据在低精度系统时钟下可能让 guest 与
   有成绩档案得到相同 `last_used`。迁移现沿用源记录时间，平局时优先有游玩记录的档案；对应
   两项升级用例通过。macOS 的 stress 属共享 runner 性能抖动：本地仍执行 16.7 ms 帧/保存和
-  2 ms 入队门槛，CI 使用 50/50/10 ms 的退化保护，并把失败尾部公开为 annotation。
+  2 ms 入队门槛，CI 使用独立退化保护，并把失败尾部公开为 annotation。
+- CI #10 中 Windows 的身份迁移用例已通过，随后在 Defender 介入 SQLite fsync 时录得 100 ms
+  同步保存 p95。游戏走另行验证的异步入队路径，因此 CI 的同步磁盘退化线改为 250 ms，本机
+  16.7 ms 门槛不变。macOS stress 已通过，仅 gameplay step 仍失败，但测试进程内部的 workflow
+  command 未被 runner 收录；workflow 现从 shell 外层发布失败用例名。
