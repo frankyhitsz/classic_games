@@ -28,6 +28,22 @@ def workflow_error(title: str, detail: str) -> None:
     print(f"::error title={title}::{escaped}")
 
 
+def failure_context(output: str, *, limit: int = 8,
+                    following: int = 12) -> str:
+    """Return failing check lines together with their captured assertions."""
+    lines = output.splitlines()
+    blocks: list[str] = []
+    for index, line in enumerate(lines):
+        if "FAIL:" not in line:
+            continue
+        block = "\n".join(lines[index:index + following + 1])
+        if block not in blocks:
+            blocks.append(block)
+        if len(blocks) >= limit:
+            break
+    return "\n\n".join(blocks)
+
+
 def wait_for_server(url: str, server_thread: threading.Thread,
                     timeout: float = SERVER_START_TIMEOUT_SECONDS) -> bool:
     deadline = time.monotonic() + timeout
@@ -83,11 +99,7 @@ def main() -> int:
                 output, encoding="utf-8")
             print(output, end="" if output.endswith("\n") else "\n")
             if result.returncode:
-                lines = output.splitlines()
-                failures = [line.strip() for line in lines
-                            if "FAIL:" in line]
-                detail = "\n".join(
-                    failures[:8] + ["", *lines[-12:]])
+                detail = failure_context(output)
                 workflow_error("Gameplay regression failures", detail)
                 summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
                 if summary_path:

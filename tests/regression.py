@@ -1807,9 +1807,13 @@ run("backend-score-validation", """
 # ===========================================================================
 print("\n=== 65. Sokoban records each run while preserving personal best ===")
 run("backend-records-run-and-preserves-best", """
-    import os
+    import uuid
     from client.common.network import BackendClient
-    be = BackendClient(); player = f'best_{os.getpid()}'
+    # This is an API correctness check, not the launcher's fast-failure
+    # latency check.  Coverage-instrumented Windows runners can take longer
+    # than the product's deliberately short local-network timeout.
+    be = BackendClient(timeout=(1.0, 5.0))
+    player = f'best_{uuid.uuid4().hex[:12]}'
     high = be.submit_score('sokoban', player, 3900, replace=True)
     low = be.submit_score('sokoban', player, 900, replace=True)
     assert high and low, (high, low)
@@ -1826,9 +1830,9 @@ run("backend-records-run-and-preserves-best", """
 # ===========================================================================
 print("\n=== 66. Leaderboard reports equal ranks for tied scores ===")
 run("backend-tie-ranks", """
-    import os
+    import uuid
     from client.common.network import BackendClient
-    be = BackendClient(); suffix = os.getpid()
+    be = BackendClient(timeout=(1.0, 5.0)); suffix = uuid.uuid4().hex[:12]
     score = 2_147_000_000
     a = f'tie_a_{suffix}'; b = f'tie_b_{suffix}'
     assert be.submit_score('snake', a, score)
