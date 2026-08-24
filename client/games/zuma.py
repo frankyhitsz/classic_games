@@ -27,7 +27,7 @@ from typing import List, Optional, Tuple
 
 import pygame
 
-from client.common.network import BackendClient
+from game_service.service import GameDataService
 from client.common.ui import (COLORS, BaseGame, Button, draw_gradient_bg,
                               draw_panel, draw_text)
 
@@ -184,7 +184,7 @@ class Zuma(BaseGame):
     game_id = "zuma"
     title = "祖玛"
 
-    def __init__(self, backend: Optional[BackendClient] = None,
+    def __init__(self, backend: Optional[GameDataService] = None,
                  player: str = "anonymous"):
         super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player)
         self.reset()
@@ -618,7 +618,7 @@ class Zuma(BaseGame):
             self.advance_level()
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_r:
-                self.reset()
+                self.request_reset()
 
     def _set_aim(self, pos) -> None:
         dx = pos[0] - SHOOTER_POS[0]
@@ -802,9 +802,9 @@ class Zuma(BaseGame):
         elif self.state == "gameover":
             btns = [
                 Button(pygame.Rect(0, 0, 150, 36), "重新开始 (R)",
-                       self.reset, primary=True),
+                       self.request_reset, primary=True),
                 Button(pygame.Rect(0, 0, 150, 36), "返回菜单 (Esc)",
-                       lambda: setattr(self, "running", False)),
+                       self.request_exit),
             ]
             detail = (f"止步第 {self.level_idx + 1}/{len(ZUMA_LEVELS)} 关"
                       f"  ·  共消除 {self.cleared_balls} 球")
@@ -816,9 +816,9 @@ class Zuma(BaseGame):
                 msg = "全部通关！"
                 btns = [
                     Button(pygame.Rect(0, 0, 150, 36), "再玩一轮 (R)",
-                           self.reset, primary=True),
+                           self.request_reset, primary=True),
                     Button(pygame.Rect(0, 0, 150, 36), "返回菜单 (Esc)",
-                           lambda: setattr(self, "running", False)),
+                           self.request_exit),
                 ]
             else:
                 msg = f"通过第 {self.level_idx + 1} 关！"
@@ -826,9 +826,9 @@ class Zuma(BaseGame):
                     Button(pygame.Rect(0, 0, 150, 36), "下一关 (N)",
                            self.advance_level, primary=True),
                     Button(pygame.Rect(0, 0, 150, 36), "从头开始 (R)",
-                           self.reset),
+                           self.request_reset),
                     Button(pygame.Rect(0, 0, 150, 36), "返回菜单 (Esc)",
-                           lambda: setattr(self, "running", False)),
+                           self.request_exit),
                 ]
             detail = (f"本关奖励 +{self.level_bonus}  ·  "
                       f"累计消除 {self.cleared_balls} 球")
@@ -909,7 +909,7 @@ class Zuma(BaseGame):
                   size=10, color=COLORS["text_dim"], center=True)
 
 
-def run_game(backend: Optional[BackendClient] = None,
+def run_game(backend: Optional[GameDataService] = None,
              player: str = "anonymous") -> None:
     Zuma(backend=backend, player=player).run()
 

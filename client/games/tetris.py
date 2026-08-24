@@ -26,7 +26,7 @@ from typing import List, Optional, Tuple
 
 import pygame
 
-from client.common.network import BackendClient
+from game_service.service import GameDataService
 from client.common.ui import (COLORS, BaseGame, Button, draw_gradient_bg,
                               draw_panel, draw_text)
 
@@ -161,7 +161,7 @@ class Tetris(BaseGame):
     game_id = "tetris"
     title = "俄罗斯方块"
 
-    def __init__(self, backend: Optional[BackendClient] = None,
+    def __init__(self, backend: Optional[GameDataService] = None,
                  player: str = "anonymous"):
         super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player)
         self.reset()
@@ -476,7 +476,7 @@ class Tetris(BaseGame):
                 self._hard_drop()
         elif event.type == pygame.KEYDOWN and self.state == "gameover":
             if event.key == pygame.K_r:
-                self.reset()
+                self.request_reset()
 
     # ------------------------------------------------------------------
     def draw(self):
@@ -517,9 +517,9 @@ class Tetris(BaseGame):
         elif self.state == "gameover":
             btns = [
                 Button(pygame.Rect(0, 0, 130, 36), "重新开始 (R)",
-                       self.reset, primary=True),
+                       self.request_reset, primary=True),
                 Button(pygame.Rect(0, 0, 130, 36), "返回菜单 (Esc)",
-                       lambda: setattr(self, "running", False)),
+                       self.request_exit),
             ]
             # Overlay auto-sizes panel + positions buttons.
             self.draw_gameover_overlay("游戏结束", buttons=btns)
@@ -590,7 +590,7 @@ class Tetris(BaseGame):
                   color=COLORS["text_dim"])
 
 
-def run_game(backend: Optional[BackendClient] = None,
+def run_game(backend: Optional[GameDataService] = None,
              player: str = "anonymous") -> None:
     Tetris(backend=backend, player=player).run()
 

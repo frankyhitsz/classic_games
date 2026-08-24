@@ -16,7 +16,6 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from client.common.network import BackendClient  # noqa: E402
 from client.common.ui import (  # noqa: E402
                               COLORS, draw_card, draw_playroom_backdrop,
                               draw_leaderboard, draw_text, font)
@@ -178,7 +177,15 @@ def main():
     clock = pygame.time.Clock()
 
     use_http = os.environ.get("GAMES_USE_HTTP") == "1"
-    backend = BackendClient() if use_http else LocalBackendClient()
+    if use_http:
+        try:
+            from client.common.network import BackendClient
+        except ImportError as exc:
+            raise RuntimeError(
+                "HTTP 调试模式需要安装可选依赖：pip install '.[api]'") from exc
+        backend = BackendClient()
+    else:
+        backend = LocalBackendClient()
     atexit.register(backend.close)
     # Paint the launcher immediately from local metadata while the localhost
     # health check runs in the background. A stopped backend can otherwise
@@ -224,6 +231,7 @@ def main():
     recent_ts = 0.0
     leaderboard_futures: dict = {}
     recent_future = None
+    records_error = None
     current_lb_game = "tetris"
     if games_meta:
         current_lb_game = games_meta[0]["id"]
@@ -251,12 +259,16 @@ def main():
 
     def poll_network() -> None:
         nonlocal online, health_future, recent_cache, recent_ts, recent_future
+        nonlocal records_error
         if health_future is not None and health_future.done():
             was_online = online
             try:
                 online = bool(health_future.result())
             except Exception:  # noqa: BLE001
                 online = False
+                records_error = "本机记录暂时不可读"
+            if not online and getattr(backend, "last_read_error", None):
+                records_error = backend.last_read_error
             health_future = None
             if online and not was_online:
                 for game in games_meta:
@@ -269,15 +281,16 @@ def main():
                 result = future.result()
                 lb_cache[gid] = result if isinstance(result, list) else []
             except Exception:  # noqa: BLE001
-                lb_cache.setdefault(gid, [])
+                records_error = "本机记录暂时不可读"
             lb_cache_ts[gid] = time.monotonic()
             del leaderboard_futures[gid]
         if recent_future is not None and recent_future.done():
             try:
                 result = recent_future.result()
                 recent_cache = result if isinstance(result, list) else []
+                records_error = None
             except Exception:  # noqa: BLE001
-                pass
+                records_error = "本机记录暂时不可读"
             recent_ts = time.monotonic()
             recent_future = None
 
@@ -541,6 +554,9 @@ def main():
                   color=COLORS["text_dim"], center=True)
         if launch_error:
             draw_text(screen, launch_error, (WIDTH // 2, HEIGHT - 34),
+                      size=12, color=COLORS["danger"], center=True)
+        elif records_error:
+            draw_text(screen, records_error, (WIDTH // 2, HEIGHT - 34),
                       size=12, color=COLORS["danger"], center=True)
         failed_saves = backend.failed_save_count()
         if failed_saves:

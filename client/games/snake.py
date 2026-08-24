@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 
 import pygame
 
-from client.common.network import BackendClient
+from game_service.service import GameDataService
 from client.common.ui import (COLORS, BaseGame, Button, draw_gradient_bg,
                               draw_text)
 
@@ -43,7 +43,7 @@ class Snake(BaseGame):
     game_id = "snake"
     title = "贪吃蛇"
 
-    def __init__(self, backend: Optional[BackendClient] = None,
+    def __init__(self, backend: Optional[GameDataService] = None,
                  player: str = "anonymous"):
         # Render and process input at 60 FPS; movement has its own timer.
         # Tying both to the old 12 FPS movement rate made early input feel
@@ -170,7 +170,7 @@ class Snake(BaseGame):
                 self.pending_direction = candidate
         elif event.type == pygame.KEYDOWN and self.state in ("gameover", "won"):
             if event.key == pygame.K_r:
-                self.reset()
+                self.request_reset()
 
     def draw(self):
         draw_gradient_bg(self.screen)
@@ -231,9 +231,9 @@ class Snake(BaseGame):
         elif self.state in ("gameover", "won"):
             btns = [
                 Button(pygame.Rect(0, 0, 130, 36), "重新开始 (R)",
-                       self.reset, primary=True),
+                       self.request_reset, primary=True),
                 Button(pygame.Rect(0, 0, 130, 36), "返回菜单 (Esc)",
-                       lambda: setattr(self, "running", False)),
+                       self.request_exit),
             ]
             message = "全盘吃满，胜利！" if self.state == "won" else "游戏结束"
             self.draw_gameover_overlay(message, buttons=btns)
@@ -266,7 +266,7 @@ class Snake(BaseGame):
                   color=COLORS["text_dim"])
 
 
-def run_game(backend: Optional[BackendClient] = None,
+def run_game(backend: Optional[GameDataService] = None,
              player: str = "anonymous") -> None:
     Snake(backend=backend, player=player).run()
 

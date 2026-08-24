@@ -8,6 +8,11 @@ if command -v conda >/dev/null 2>&1; then
     conda activate games_env
 fi
 
+python -c 'import flask, pygame, requests' 2>/dev/null || {
+    echo "[tests] missing development dependencies; run: pip install -e '.[dev]'" >&2
+    exit 1
+}
+
 # Always use an isolated backend so repeated test runs neither depend on nor
 # pollute the player's real leaderboard database.
 TEST_RUNTIME_DIR=$(mktemp -d "${TMPDIR:-/tmp}/classic-games-tests.XXXXXX")
@@ -49,6 +54,13 @@ env GAMES_API_URL="${TEST_API_URL}" \
     GAMES_DB="${TEST_RUNTIME_DIR}/direct-import.db" \
     SDL_VIDEODRIVER=dummy \
     SDL_AUDIODRIVER=dummy python -m tests.regression || TEST_STATUS=$?
+
+if [[ "${TEST_STATUS}" -eq 0 ]]; then
+    env GAMES_DB="${TEST_RUNTIME_DIR}/review4-default.db" \
+        SDL_VIDEODRIVER=dummy \
+        SDL_AUDIODRIVER=dummy python -m unittest tests.test_storage_v2 \
+        || TEST_STATUS=$?
+fi
 
 if [[ "${TEST_STATUS}" -eq 0 ]]; then
     env GAMES_DB="${TEST_RUNTIME_DIR}/stress-default.db" \

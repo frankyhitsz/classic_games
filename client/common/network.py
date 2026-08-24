@@ -15,26 +15,16 @@ from typing import Any, Dict, Optional
 
 import requests
 
+from game_service.service import parse_score_response
+
 DEFAULT_BASE = os.environ.get("GAMES_API_URL", "http://127.0.0.1:5000")
 TIMEOUT = (0.30, 0.70)  # local connect/read timeouts
 FAILURE_BACKOFF_SECS = 2.0
 SCORE_SAVE_RETRY_DELAYS = (0.0, 0.15, 0.40)
 
 
-def parse_score_response(result) -> tuple[Optional[int], Optional[str]]:
-    """Validate the score API acknowledgement used by every game."""
-    if not isinstance(result, dict):
-        return None, "保存服务没有返回有效结果"
-    if result.get("ok") is not True:
-        return None, str(result.get("error") or result.get("code")
-                         or "保存失败")
-    row_id = result.get("id")
-    if type(row_id) is not int or row_id <= 0:
-        return None, "保存服务返回了无效记录编号"
-    return row_id, None
-
-
 class BackendClient:
+    is_local = False
     pending_saves_are_durable = False
 
     def __init__(self, base_url: str = DEFAULT_BASE, timeout=TIMEOUT):
@@ -211,6 +201,12 @@ class BackendClient:
                      extra=None, replace: bool = False,
                      submission_id: Optional[int] = None,
                      request_id: Optional[str] = None,
+                     attempt_uuid: Optional[str] = None,
+                     revision: Optional[int] = None,
+                     profile_id: Optional[str] = None,
+                     mode: str = "classic",
+                     ruleset_version: Optional[str] = None,
+                     status: str = "completed",
                      _bypass_backoff: bool = False):
         """Submit a score.
 
@@ -227,13 +223,28 @@ class BackendClient:
             payload["submission_id"] = submission_id
         if request_id is not None:
             payload["request_id"] = request_id
+        if attempt_uuid is not None:
+            payload["attempt_uuid"] = attempt_uuid
+        if revision is not None:
+            payload["revision"] = revision
+        if profile_id is not None:
+            payload["profile_id"] = profile_id
+        payload["mode"] = mode
+        if ruleset_version is not None:
+            payload["ruleset_version"] = ruleset_version
+        payload["status"] = status
         return self._post("/api/scores", payload,
                           bypass_backoff=_bypass_backoff)
 
     def _submit_score_with_retries(
             self, game_id: str, player: str, score: int, extra=None,
             replace: bool = False, submission_id: Optional[int] = None,
-            request_id: Optional[str] = None):
+            request_id: Optional[str] = None,
+            attempt_uuid: Optional[str] = None,
+            revision: Optional[int] = None,
+            profile_id: Optional[str] = None, mode: str = "classic",
+            ruleset_version: Optional[str] = None,
+            status: str = "completed"):
         last_result = None
         for delay in SCORE_SAVE_RETRY_DELAYS:
             if delay:
@@ -241,6 +252,9 @@ class BackendClient:
             last_result = self.submit_score(
                 game_id, player, score, extra=extra, replace=replace,
                 submission_id=submission_id, request_id=request_id,
+                attempt_uuid=attempt_uuid, revision=revision,
+                profile_id=profile_id, mode=mode,
+                ruleset_version=ruleset_version, status=status,
                 _bypass_backoff=True)
             row_id, _error = parse_score_response(last_result)
             if row_id is not None:
@@ -276,21 +290,42 @@ class BackendClient:
 
     def submit_score_async(self, game_id: str, player: str, score: int,
                            extra=None, replace: bool = False,
-                           submission_id: Optional[int] = None) -> Future:
+                           submission_id: Optional[int] = None,
+                           request_id: Optional[str] = None,
+                           attempt_uuid: Optional[str] = None,
+                           revision: Optional[int] = None,
+                           profile_id: Optional[str] = None,
+                           mode: str = "classic",
+                           ruleset_version: Optional[str] = None,
+                           status: str = "completed") -> Future:
         return self._run_async(
             self.submit_score, game_id, player, score, extra=extra,
-            replace=replace, submission_id=submission_id)
+            replace=replace, submission_id=submission_id,
+            request_id=request_id, attempt_uuid=attempt_uuid,
+            revision=revision, profile_id=profile_id, mode=mode,
+            ruleset_version=ruleset_version, status=status)
 
     def submit_score_reliable_async(
             self, game_id: str, player: str, score: int,
             extra=None, replace: bool = False,
             submission_id: Optional[int] = None,
-            request_id: Optional[str] = None) -> Future:
+            request_id: Optional[str] = None,
+            attempt_uuid: Optional[str] = None,
+            revision: Optional[int] = None,
+            profile_id: Optional[str] = None, mode: str = "classic",
+            ruleset_version: Optional[str] = None,
+            status: str = "completed") -> Future:
         request_id = request_id or uuid.uuid4().hex
         payload = {"game_id": game_id, "player": player, "score": score,
                    "extra": extra, "replace": replace,
                    "submission_id": submission_id,
-                   "request_id": request_id}
+                   "request_id": request_id,
+                   "attempt_uuid": attempt_uuid,
+                   "revision": revision,
+                   "profile_id": profile_id,
+                   "mode": mode,
+                   "ruleset_version": ruleset_version,
+                   "status": status}
         with self._lock:
             self._save_sequence += 1
             save_record = {"token": self._save_sequence, "payload": payload}
@@ -298,6 +333,9 @@ class BackendClient:
             self._submit_score_with_retries, game_id, player, score,
             extra=extra, replace=replace, submission_id=submission_id,
             request_id=payload["request_id"],
+            attempt_uuid=attempt_uuid, revision=revision,
+            profile_id=profile_id, mode=mode,
+            ruleset_version=ruleset_version, status=status,
             _completion=lambda completed: self._capture_score_save(
                 completed, save_record))
 

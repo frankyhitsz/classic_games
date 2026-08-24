@@ -2720,11 +2720,11 @@ run("local-store-persists-and-recovers-outbox", """
         class FailOnceStore(LocalGameStore):
             def __init__(self, path):
                 super().__init__(path); self.fail=True
-            def record_score(self, *args, **kwargs):
+            def record_mutation(self, mutation):
                 if self.fail:
                     self.fail=False
                     raise sqlite3.OperationalError('locked')
-                return super().record_score(*args, **kwargs)
+                return super().record_mutation(mutation)
         pending_db=root/'pending.db'; pending_outbox=root/'pending-saves.json'
         failed=LocalBackendClient(
             store=FailOnceStore(pending_db), outbox_path=pending_outbox)
@@ -2732,10 +2732,12 @@ run("local-store-persists-and-recovers-outbox", """
             'snake','p',45,request_id='outbox-save-request-001')
         assert not result['ok'] and result['retryable']
         assert result['durable_pending'] is True
-        assert failed.failed_save_count() == 1 and pending_outbox.exists()
+        assert failed.failed_save_count() == 1
+        assert pending_outbox.with_suffix('').is_dir()
         failed.close()
         recovered=LocalBackendClient(
             db_path=pending_db, outbox_path=pending_outbox)
+        assert recovered.drain(timeout=2)
         assert recovered.failed_save_count() == 0
         assert recovered.stats('snake')['attempts'] == 1
         recovered.close()
@@ -2756,6 +2758,7 @@ run("local-store-persists-and-recovers-outbox", """
               "from pathlib import Path\\n"
               f"c=LocalBackendClient(Path({str(cross_db)!r}), "
               f"outbox_path=Path({str(cross_outbox)!r}))\\n"
+              "assert c.drain(timeout=2)\\n"
               "assert c.stats('zuma')['attempts']==1\\n"
               "assert c.failed_save_count()==0\\n")
         result=subprocess.run([sys.executable,'-c',code],

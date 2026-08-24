@@ -1,7 +1,7 @@
 # Classic Games Hub
 
 基于 pygame 的经典小游戏合集，包含俄罗斯方块、贪吃蛇、2048、推箱子和祖玛。
-项目提供统一启动器，默认直接使用本机 SQLite 保存每次游玩记录和个人最佳；
+项目提供统一启动器，默认直接使用本机 SQLite 保存每次结算记录和个人最佳；
 Flask API 作为可选适配器保留。
 
 ## 游戏列表
@@ -18,8 +18,6 @@ Flask API 作为可选适配器保留。
 
 - Python 3.11
 - pygame
-- Flask
-- requests
 
 推荐使用 Conda：
 
@@ -33,7 +31,7 @@ conda activate games_env
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .
 ```
 
 ## 启动
@@ -47,7 +45,17 @@ pip install -r requirements.txt
 `run.sh` 和单独启动的游戏都会使用本机记录。首次启动会只读导入旧的
 `data/scores.db`，旧文件不会被修改。
 
+安装后也可以直接运行：
+
+```bash
+classic-games
+```
+
 如需调试 Flask API，可分别启动服务端和使用 HTTP 的启动器：
+
+```bash
+pip install -e '.[api]'
+```
 
 ```bash
 GAMES_PORT=5010 ./run_server.sh
@@ -62,6 +70,10 @@ GAMES_USE_HTTP=1 GAMES_API_URL=http://127.0.0.1:5010 ./run_launcher.sh
 ```bash
 GAMES_HOST=0.0.0.0 GAMES_PORT=5010 ./run_server.sh
 ```
+
+该调试 API 没有身份验证。绑定 `0.0.0.0` 时，同一网络中的其他设备也可能
+写入记录；只应在可信开发网络中临时使用，并由系统防火墙限制访问。正常游玩
+无需开启它。
 
 单独启动某个游戏：
 
@@ -84,6 +96,12 @@ python -m client.games.zuma
 | 祖玛 | 鼠标瞄准，左键发射，右键或 S 切换备弹 | N/回车下一关，R 重开，P 暂停，Esc 返回菜单 |
 
 ## 测试
+
+先安装开发依赖：
+
+```bash
+pip install -e '.[dev]'
+```
 
 ```bash
 ./run_tests.sh
@@ -110,7 +128,9 @@ classic_games/
 ├── server/
 │   └── app.py         # 可选 Flask 适配器
 ├── tests/
-│   └── regression.py
+│   ├── regression.py
+│   └── test_storage_v2.py
+├── pyproject.toml
 ├── environment.yml
 ├── requirements.txt
 └── run.sh
@@ -124,7 +144,17 @@ classic_games/
   `~/.local/share/classic-games/games.db`
 
 可用 `GAMES_DATA_DIR` 指定数据目录，或用 `GAMES_DB` 指定数据库文件。
-同目录下的 `pending_saves.json` 只在本地事务失败时保存待重试记录。
+同目录下的 `pending/` 保存尚未写入数据库的记录，每个请求使用一个独立 JSON
+文件。文件带版本、payload hash、attempt UUID 和 revision，可由多个进程安全
+写入；无法解析的文件会原样移入 `pending-quarantine/`，不会阻止游戏启动。
+
+每次新游戏生成一个稳定的 attempt UUID。2048 的里程碑、最终分数和失败重放
+使用同一 UUID 与递增 revision，因此晚到的旧记录不会覆盖最终分数或生成第二局。
+“最近游戏”和“本机最佳”只统计已结算的 classic 记录；中途重开或返回目前不计
+作一次结算。
+
+数据库 schema 升级前会创建唯一备份。幂等请求回执保留 180 天；游戏结算历史
+不会自动删除。旧库缺字段或包含坏行时，新库仍会启动，并在界面显示跳过提示。
 
 ## 可选 Flask API
 

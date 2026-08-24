@@ -1,51 +1,55 @@
-# 第三次审查修复规格
+# 第四次审查修复规格
 
 ## 目标
 
-核实 `classic_games_third_code_review_local_first_taskbook_zh.md` 的每项判断，
-修复可由当前代码或本机运行证实的问题。默认桌面入口改为进程内本地存储，
-Flask 保留为可选适配器；未经确认的玩法扩展和发行功能不作为现有缺陷。
+核实 `classic_games_fourth_code_review_local_first_taskbook_zh.md` 的 F01–F19，
+关闭本地保存的阻塞、损坏启动、跨进程丢记录和同局重复 attempt 问题。保留
+默认离线、单机、本地 SQLite 的产品边界；没有真实需求的玩法和发行建议不冒充
+当前缺陷。
 
-## 本轮范围
+## 范围
 
-- 2048 无效果输入、胜利/暂停/重置边界和保存生命周期；
-- 同一次逻辑保存的稳定 ID、人工重试、失败分类和退出收尾；
-- 本机 SQLite attempts、个人最佳、最近游玩和真实记录数；
-- 默认启动不依赖端口、HTTP 或 Flask，独立游戏同样保存到本机；
-- Flask app factory 和共享仓储，import 不创建目录或数据库；
-- 完整幂等负载校验、响应快照、低分 no-op 及并发重放；
-- 可选 HTTP 客户端的 drain、永久错误和重试调度边界；
-- 旧仓库成绩库的一次性、幂等导入和 schema version；
-- 对审查中的性能、测试数字、结构和产品建议提供可复现证据。
+- 本地读写全部移出 pygame 线程，SQLite 写锁不能冻结画面；
+- 统一成绩规范化、幂等 payload 和类型化保存/存储状态；
+- 版本化、逐请求、跨进程安全的 durable spool 与 quarantine；
+- schema v2 的 stable attempt UUID、revision、profile/mode/ruleset/status；
+- stale revision、旧 submission ID、个人最佳 rank 和 tie 时间；
+- 外部/内嵌旧库逐行容错、唯一备份和事务迁移；
+- QUIT、Esc、鼠标返回、R/重置使用同一未保存保护；
+- core/api/dev 可选依赖和中立 `GameDataService` 协议；
+- 锁竞争、多进程、强制退出、坏数据和迁移失败验证。
 
 ## 非目标
 
-- 不引入账号、公网排行、赛季、反作弊、云服务或遥测；
-- 不把 7-bag、hold、撤销、音频、手柄、IME、编辑器或新游戏冒充 Bug；
-- 不在没有发行需求时加入打包、自动发布和任意覆盖率门槛；
-- 不用缓存或大规模 UI 重写替代真实性能测量；
-- 保留现有 Flask API，避免破坏需要单独启动服务端的教学和接口用途。
+- 不建设账号、云端排行、匹配、反作弊、遥测或公网 API；
+- 不默认增加 progress/save slot/settings，功能有 UI 和迁移设计后再建表；
+- 不把中途放弃算作 attempt；当前统计口径是已结算成绩；
+- 不在本轮加入音效、IME、手柄、缩放、编辑器、撤销或新游戏；
+- 不擅自选择 LICENSE，不提供会删除/覆盖用户历史的导入清理 UI；
+- 不为可选 LAN 调试建设复杂鉴权，默认仍只监听 loopback。
 
 ## 关键决策
 
-1. `LocalGameStore` 是成绩事实来源；每个结算对应一条 attempt，2048 同一局可更新同一 attempt。
-2. 个人最佳由 attempts 聚合，不再通过删除较低记录表达；最近游玩按真实 attempt 活动排序。
-3. 同一次保存的自动和人工重试复用稳定 request ID；幂等表保存 canonical payload hash 与响应快照。
-4. 桌面端先执行短 SQLite 事务再返回完成 Future，避免进程退出前任务尚未进入持久层。
-5. 默认数据目录使用操作系统用户数据目录；测试必须显式注入临时目录，旧 `data/scores.db` 只读导入。
-6. Flask 通过 `create_app(config)` 显式创建和初始化；模块 import 不写磁盘。
-7. 可选 HTTP 客户端保留，但网络失败队列不再承担默认桌面保存职责。
+1. `LocalWriteWorker` 是桌面 I/O 的唯一执行线程；异步入口立即返回真实 Future。
+2. spool 使用 `pending/<request_id>.json`，每个文件先完整写入、fsync，再排他发布。
+3. `ScoreMutation` 是本地、spool 和 HTTP 的共同请求模型；非法数据不进入磁盘队列。
+4. 新局开始生成 attempt UUID；新状态递增 revision；低 revision 永不覆盖高 revision。
+5. `submission_id` 只保留兼容性，显式 stale/mismatch 必须返回 404/409。
+6. 排榜单位是 profile 的个人最佳；达到最佳分数的时间与普通 attempt 更新时间分开。
+7. schema v2 只保留实际接入的 attempts 和 request receipts；回执保留 180 天。
+8. `completed` 表示成绩已结算，不等同于胜利；`practice` 不进入默认最佳。
+9. core 只依赖 pygame；Flask/requests 由 `[api]` extra 安装并延迟导入。
 
 ## 验收标准
 
-- CG3-F01 至 F13 均有“修复、部分成立或反驳”及直接证据；
-- 不启动 Flask 也能保存、重启后读取成绩、个人最佳和最近游玩；
-- 2048 无效果方向不会滞留，win/pause/reset/gameover 不保留旧输入；
-- 初次失败、结算页重试和启动器重试不会生成第二条逻辑记录；
-- `drain()` 返回时完成回调已经归档，时序检查不使用 sleep；
-- 永久 4xx 不进入可重试队列，调度失败不丢待重试项；
-- 相同 request ID 的不同完整负载返回冲突；已删除旧行不影响响应重放；
-- 低分 no-op 不改变 attempt 的活动时间；
-- Flask import 不创建文件，app factory 可注入临时数据库；
-- 完整检查、静态检查、迁移、并发、随机压力和两轮独立复查通过；
-- 默认成绩库在验证前后不变化；完成后提交并推送到 GitHub。
+- F01–F19 每条都有修复、部分采纳或带证据的反驳；
+- 持有 SQLite 写锁时，`submit_score_async()` 调用 p99 不高于 2 ms；
+- 锁冲突返回 durable pending，重启和强制退出后可以恢复；
+- 32 进程并发 spool 不丢记录、不覆盖不同 payload；
+- malformed/unsupported/hash mismatch 单项隔离且不阻断好记录；
+- 同一 2048 milestone/final/replay 最终只有一条 attempt；
+- stale revision、stale/mismatched submission ID、rank/tie 均有确定性测试；
+- QUIT、Esc、鼠标按钮和重置遵循同一未保存确认；
+- core 导入不需要 Flask/requests，wheel 能构建；
+- 原有 107 项回归、第四轮边界套件、固定 seed 压力、静态检查全部通过；
+- 测试不改动仓库旧成绩库；完成后只提交本次相关变更并推送 GitHub。

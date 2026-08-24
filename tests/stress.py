@@ -170,6 +170,32 @@ def storage_stress(root: Path) -> None:
     print(f"local-save: median={statistics.median(samples):.3f}ms "
           f"p95={p95:.3f}ms p99={p99:.3f}ms")
 
+    locked = LocalBackendClient(
+        db_path=root / "locked-latency.db",
+        outbox_path=root / "locked-pending")
+    blocker = sqlite3.connect(root / "locked-latency.db")
+    blocker.execute("BEGIN IMMEDIATE")
+    submit_samples = []
+    futures = []
+    for index in range(20):
+        started = time.perf_counter()
+        futures.append(locked.submit_score_async(
+            "snake", f"locked-{index}", index,
+            request_id=f"locked-stress-request-{index:016d}"))
+        submit_samples.append((time.perf_counter() - started) * 1000)
+    first = futures[0].result(timeout=1)
+    assert first["durable_pending"]
+    blocker.rollback()
+    blocker.close()
+    assert locked.drain(5)
+    locked.retry_failed_saves()
+    assert locked.drain(5)
+    assert locked.store.attempt_count("snake") == 20
+    submit_p99 = sorted(submit_samples)[int(len(submit_samples) * 0.99) - 1]
+    assert submit_p99 <= 2.0, submit_p99
+    locked.close()
+    print(f"locked-submit: p99={submit_p99:.3f}ms, durable fallback=ok")
+
     before_threads = {thread.ident for thread in threading.enumerate()}
     fd_path = Path("/dev/fd")
     before_fds = len(list(fd_path.iterdir())) if fd_path.is_dir() else None

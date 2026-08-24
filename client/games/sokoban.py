@@ -16,7 +16,7 @@ from typing import List, Optional, Tuple
 
 import pygame
 
-from client.common.network import BackendClient
+from game_service.service import GameDataService
 from client.common.ui import (COLORS, BaseGame, Button, draw_gradient_bg,
                               draw_panel, draw_text)
 
@@ -280,7 +280,7 @@ class Sokoban(BaseGame):
     # by replaying a level update that run's attempt instead of adding one.
     submit_replaces_existing = True
 
-    def __init__(self, backend: Optional[BackendClient] = None,
+    def __init__(self, backend: Optional[GameDataService] = None,
                  player: str = "anonymous"):
         self.level_idx = 0
         self.total_score = 0
@@ -342,14 +342,16 @@ class Sokoban(BaseGame):
             return
         # R (reset current level) works in any state.
         if event.key == pygame.K_r:
-            self.load_level(self.level_idx)
+            self.request_destructive_action(
+                "reset", lambda: self.load_level(self.level_idx))
             return
         # N advances normally from a win overlay. During active play it is an
         # explicit practice/skip action and cannot create a ranked clear.
         if event.key == pygame.K_n:
             if (self.state == "won"
                     and self.level_idx in self.completed_levels):
-                self._advance_after_win()
+                self.request_destructive_action(
+                    "advance", self._advance_after_win)
                 return
             next_idx = (self.level_idx + 1) % len(LEVELS)
             self.load_level(next_idx)
@@ -515,11 +517,13 @@ class Sokoban(BaseGame):
             next_label = "返回第 1 关" if last else "下一关 (N)"
             btns = [
                 Button(pygame.Rect(0, 0, 150, 36), next_label,
-                       self._advance_after_win, primary=True),
+                       lambda: self.request_destructive_action(
+                           "advance", self._advance_after_win), primary=True),
                 Button(pygame.Rect(0, 0, 140, 36), "重玩本关 (R)",
-                       lambda: self.load_level(self.level_idx)),
+                       lambda: self.request_destructive_action(
+                           "reset", lambda: self.load_level(self.level_idx))),
                 Button(pygame.Rect(0, 0, 140, 36), "返回菜单 (Esc)",
-                       lambda: setattr(self, "running", False)),
+                       self.request_exit),
             ]
             completed_all = bool(self.extra
                                  and self.extra.get("completed_all"))
@@ -602,7 +606,7 @@ class Sokoban(BaseGame):
         pygame.draw.circle(self.screen, (10, 28, 35), (px + 4, py - 2), 2)
 
 
-def run_game(backend: Optional[BackendClient] = None,
+def run_game(backend: Optional[GameDataService] = None,
              player: str = "anonymous") -> None:
     Sokoban(backend=backend, player=player).run()
 

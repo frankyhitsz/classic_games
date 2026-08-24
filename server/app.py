@@ -61,6 +61,14 @@ def create_app(config: dict | None = None) -> Flask:
                 "invalid_limit", "limit must be between 1 and 50")
         return limit, None
 
+    def query_dimensions() -> dict:
+        dimensions = {}
+        for key in ("profile_id", "mode", "ruleset_version", "status"):
+            value = request.args.get(key)
+            if value is not None:
+                dimensions[key] = value
+        return dimensions
+
     @app.errorhandler(RequestEntityTooLarge)
     def too_large(_exc):
         return api_error("body_too_large", "request body exceeds 64 KiB", 413)
@@ -85,13 +93,15 @@ def create_app(config: dict | None = None) -> Flask:
     @app.route("/api/health")
     def health():
         try:
-            store.health()
+            status = store.storage_status(outbox_writable=False)
         except sqlite3.Error:
             return api_error("database_unavailable",
                              "score database unavailable", 503,
                              retryable=True)
-        return jsonify({"ok": True, "service": "classic-games",
-                        "storage": "local-sqlite", "ts": time.time()})
+        response = status.to_dict()
+        response.update({"service": "classic-games",
+                         "storage": "local-sqlite", "ts": time.time()})
+        return jsonify(response), (200 if status.readable else 503)
 
     @app.route("/api/games")
     def games():
@@ -110,7 +120,9 @@ def create_app(config: dict | None = None) -> Flask:
         if not isinstance(body, dict):
             return api_error("invalid_body", "JSON body must be an object")
         allowed = {"game_id", "player", "score", "extra", "replace",
-                   "submission_id", "request_id"}
+                   "submission_id", "request_id", "attempt_uuid",
+                   "revision", "profile_id", "mode", "ruleset_version",
+                   "status"}
         unknown = sorted(set(body) - allowed)
         if unknown:
             return api_error("unknown_fields",
@@ -125,6 +137,12 @@ def create_app(config: dict | None = None) -> Flask:
                 replace=body.get("replace", False),
                 submission_id=body.get("submission_id"),
                 request_id=body.get("request_id"),
+                attempt_uuid=body.get("attempt_uuid"),
+                revision=body.get("revision"),
+                profile_id=body.get("profile_id"),
+                mode=body.get("mode", "classic"),
+                ruleset_version=body.get("ruleset_version"),
+                status=body.get("status", "completed"),
             )
         except StoreError as exc:
             return api_error(exc.code, exc.message, exc.status, exc.retryable)
@@ -139,12 +157,13 @@ def create_app(config: dict | None = None) -> Flask:
         if error is not None:
             return error
         return jsonify({"game_id": game_id,
-                        "leaderboard": store.leaderboard(game_id, limit)})
+                        "leaderboard": store.leaderboard(
+                            game_id, limit, **query_dimensions())})
 
     @app.route("/api/stats/<game_id>")
     def stats(game_id: str):
         try:
-            return jsonify(store.stats(game_id))
+            return jsonify(store.stats(game_id, **query_dimensions()))
         except StoreError as exc:
             return api_error(exc.code, exc.message, exc.status, exc.retryable)
 
@@ -153,7 +172,8 @@ def create_app(config: dict | None = None) -> Flask:
         limit, error = parse_limit(20)
         if error is not None:
             return error
-        return jsonify({"recent": store.recent(limit)})
+        dimensions = query_dimensions()
+        return jsonify({"recent": store.recent(limit, **dimensions)})
 
     return app
 

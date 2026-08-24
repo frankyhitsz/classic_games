@@ -14,13 +14,14 @@ from typing import Callable, List, Optional
 
 import pygame
 
-from .network import BackendClient, parse_score_response
 from game_service.local_backend import LocalBackendClient
+from game_service.service import GameDataService, parse_score_response
 
 OVERLAY_INPUT_GUARD_MS = 180
 SAVE_IDLE = "idle"
 SAVE_SAVING = "saving"
 SAVE_SAVED = "saved"
+SAVE_PENDING = "pending"
 SAVE_FAILED = "failed"
 
 # ----------------------------------------------------------------------------
@@ -369,7 +370,7 @@ class BaseGame(abc.ABC):
     submit_replaces_existing: bool = False
 
     def __init__(self, width: int, height: int, fps: int = 60,
-                 backend: Optional[BackendClient] = None,
+                 backend: Optional[GameDataService] = None,
                  player: str = "anonymous"):
         pygame.init()
         self.screen = pygame.display.set_mode((width, height))
@@ -393,6 +394,7 @@ class BaseGame(abc.ABC):
         # result here so drawing 60 FPS does not also issue 60 data reads.
         self._overlay_lb_key = None
         self._overlay_leaderboard: List[dict] = []
+        self._overlay_lb_error: Optional[str] = None
         self._overlay_lb_future = None
         self._overlay_lb_generation = 0
         self._overlay_lb_future_generation = 0
@@ -402,12 +404,15 @@ class BaseGame(abc.ABC):
         self._score_submit_active_payload = None
         self._last_score_payload = None
         self._score_submission_id: Optional[int] = None
+        self._score_attempt_uuid = uuid.uuid4().hex
+        self._score_attempt_revision = 0
         self.score_save_state = SAVE_IDLE
         self.score_save_error: Optional[str] = None
         self.score_save_retryable = True
         self.score_save_message = ""
         self.score_save_durable_pending = False
         self._discard_unsaved_armed = False
+        self._destructive_action_armed: Optional[str] = None
         # Restart/continue buttons share the same mouse with some games.
         # Briefly swallow a rapid second click after an overlay action so a
         # double-click cannot fire a Zuma ball or begin a 2048 swipe.
@@ -439,7 +444,7 @@ class BaseGame(abc.ABC):
                 and pygame.time.get_ticks() < self._overlay_mouse_guard_until):
             return True
         if event.type == pygame.QUIT:
-            self.running = False
+            self.request_exit()
             return True
         if event.type == getattr(pygame, "WINDOWFOCUSLOST", -1):
             # Timed games should not keep moving while the player is in
@@ -450,13 +455,7 @@ class BaseGame(abc.ABC):
             return True
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
-                if (self.score_save_state == SAVE_FAILED
-                        and not self.score_save_durable_pending
-                        and not self._discard_unsaved_armed):
-                    self._discard_unsaved_armed = True
-                    return True
-                # ESC always returns to the launcher (just exits this loop).
-                self.running = False
+                self.request_exit()
                 return True
             if event.key == pygame.K_p:
                 if self.state == "playing":
@@ -488,6 +487,7 @@ class BaseGame(abc.ABC):
         """Force one fresh leaderboard fetch for the next result overlay."""
         self._overlay_lb_key = None
         self._overlay_leaderboard = []
+        self._overlay_lb_error = None
         self._overlay_lb_future = None
         self._overlay_lb_generation += 1
 
@@ -498,21 +498,52 @@ class BaseGame(abc.ABC):
         self._score_submit_active_payload = None
         self._last_score_payload = None
         self._score_submission_id = None
+        self._score_attempt_uuid = uuid.uuid4().hex
+        self._score_attempt_revision = 0
         self.score_save_state = SAVE_IDLE
         self.score_save_error = None
         self.score_save_retryable = True
         self.score_save_message = ""
         self.score_save_durable_pending = False
         self._discard_unsaved_armed = False
+        self._destructive_action_armed = None
         self.invalidate_overlay_leaderboard()
 
+    def request_destructive_action(self, name: str,
+                                   action: Callable[[], None]) -> bool:
+        """Apply one save-aware guard to quit, reset, keys, and buttons."""
+        unsafe = (self.score_save_state == SAVE_SAVING
+                  or (self.score_save_state == SAVE_FAILED
+                      and not self.score_save_durable_pending))
+        if unsafe and self._destructive_action_armed != name:
+            self._destructive_action_armed = name
+            self._discard_unsaved_armed = True
+            return False
+        self._destructive_action_armed = None
+        self._discard_unsaved_armed = False
+        action()
+        return True
+
+    def request_exit(self) -> bool:
+        return self.request_destructive_action(
+            "exit", lambda: setattr(self, "running", False))
+
+    def request_reset(self) -> bool:
+        return self.request_destructive_action("reset", self.reset)
+
     def _submit_result_score(self, score: int, extra=None,
-                             request_id: Optional[str] = None) -> None:
+                             request_id: Optional[str] = None,
+                             revision: Optional[int] = None) -> None:
         if not self.backend or not self.game_id:
             return
+        if revision is None:
+            self._score_attempt_revision += 1
+            revision = self._score_attempt_revision
         payload = {"score": score, "extra": extra,
                    "replace": self.submit_replaces_existing,
                    "request_id": request_id or uuid.uuid4().hex,
+                   "attempt_uuid": self._score_attempt_uuid,
+                   "revision": revision,
                    "submission_id": (self._score_submission_id
                                      if self.submit_replaces_existing
                                      else None)}
@@ -536,7 +567,9 @@ class BaseGame(abc.ABC):
                     self.game_id, self.player, score, extra=extra,
                     replace=self.submit_replaces_existing,
                     submission_id=payload["submission_id"],
-                    request_id=payload["request_id"])
+                    request_id=payload["request_id"],
+                    attempt_uuid=payload["attempt_uuid"],
+                    revision=payload["revision"])
                 self._score_submit_future_generation = generation
             except Exception as exc:  # noqa: BLE001
                 self._finish_score_submission(None, payload, generation,
@@ -547,7 +580,9 @@ class BaseGame(abc.ABC):
                     self.game_id, self.player, score, extra=extra,
                     replace=self.submit_replaces_existing,
                     submission_id=payload["submission_id"],
-                    request_id=payload["request_id"])
+                    request_id=payload["request_id"],
+                    attempt_uuid=payload["attempt_uuid"],
+                    revision=payload["revision"])
             except Exception as exc:  # noqa: BLE001
                 self._finish_score_submission(None, payload, generation,
                                               str(exc))
@@ -574,6 +609,18 @@ class BaseGame(abc.ABC):
             return
         row_id, error = parse_score_response(result)
         if row_id is None:
+            durable_pending = bool(
+                isinstance(result, dict) and result.get("durable_pending"))
+            if durable_pending:
+                self.score_save_state = SAVE_PENDING
+                self.score_save_error = None
+                self.score_save_retryable = True
+                self.score_save_durable_pending = True
+                self.score_save_message = "待保存记录已安全落盘"
+                self._destructive_action_armed = None
+                self._discard_unsaved_armed = False
+                self.on_score_save_failed(payload, error)
+                return
             self.score_save_state = SAVE_FAILED
             self.score_save_error = exception_text or error or "保存失败"
             self.score_save_retryable = (
@@ -589,6 +636,7 @@ class BaseGame(abc.ABC):
         self.score_save_error = None
         self.score_save_durable_pending = False
         self._discard_unsaved_armed = False
+        self._destructive_action_armed = None
         if self.submit_replaces_existing:
             self._score_submission_id = row_id
         if isinstance(result, dict) and result.get("attempt_recorded"):
@@ -607,7 +655,8 @@ class BaseGame(abc.ABC):
         if self.score_save_state != SAVE_FAILED or not payload:
             return
         self._submit_result_score(payload["score"], payload.get("extra"),
-                                  request_id=payload["request_id"])
+                                  request_id=payload["request_id"],
+                                  revision=payload["revision"])
 
     def on_score_save_succeeded(self, result: dict, payload: dict) -> None:
         """Hook for games that maintain their own confirmed-save state."""
@@ -767,8 +816,14 @@ class BaseGame(abc.ABC):
                       size=14, color=COLORS["text_dim"], center=True)
 
         save_messages = {
-            SAVE_SAVING: ("成绩保存中…", COLORS["text_dim"]),
+            SAVE_SAVING: (("保存尚未完成 · 再次操作将放弃"
+                           if self._discard_unsaved_armed
+                           else "成绩保存中…"),
+                          (COLORS["danger"] if self._discard_unsaved_armed
+                           else COLORS["text_dim"])),
             SAVE_SAVED: (self.score_save_message or "成绩已保存", COLORS["ok"]),
+            SAVE_PENDING: (self.score_save_message or "待保存记录已安全落盘",
+                           COLORS["accent2"]),
             SAVE_FAILED: (("保存失败 · 按 S 重试"
                            if (self.score_save_retryable
                                and not self._discard_unsaved_armed)
@@ -791,6 +846,7 @@ class BaseGame(abc.ABC):
                 and lb_key != self._overlay_lb_key):
             self._overlay_lb_key = lb_key
             self._overlay_leaderboard = []
+            self._overlay_lb_error = None
             self._overlay_lb_future = None
             if self.backend and self.game_id:
                 try:
@@ -806,6 +862,7 @@ class BaseGame(abc.ABC):
                             self.game_id, limit=3)
                 except Exception:  # noqa: BLE001 - records UI must degrade
                     self._overlay_leaderboard = []
+                    self._overlay_lb_error = "本机记录暂时不可读"
         if (self._overlay_lb_future is not None
                 and self._overlay_lb_future.done()):
             generation = self._overlay_lb_future_generation
@@ -817,6 +874,7 @@ class BaseGame(abc.ABC):
                                                  else [])
             except Exception:  # noqa: BLE001 - records UI must degrade
                 self._overlay_leaderboard = []
+                self._overlay_lb_error = "本机记录暂时不可读"
             self._overlay_lb_future = None
         lb = self._overlay_leaderboard
         if self.score_save_state == SAVE_SAVING:
@@ -837,6 +895,10 @@ class BaseGame(abc.ABC):
             draw_text(self.screen, "（排行加载中…）",
                       (panel.centerx, panel.y + 154), size=13,
                       color=COLORS["text_dim"], center=True)
+        elif self._overlay_lb_error:
+            draw_text(self.screen, f"（{self._overlay_lb_error}）",
+                      (panel.centerx, panel.y + 154), size=13,
+                      color=COLORS["danger"], center=True)
         else:
             draw_text(self.screen, "（暂无排行）",
                       (panel.centerx, panel.y + 154), size=13,

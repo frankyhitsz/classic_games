@@ -29,10 +29,11 @@ from typing import List, Optional
 
 import pygame
 
-from client.common.network import BackendClient, parse_score_response
-from client.common.ui import (COLORS, SAVE_FAILED, SAVE_SAVED, SAVE_SAVING,
-                              BaseGame, Button, draw_gradient_bg, draw_text,
-                              ease_out_back, ease_out_cubic)
+from client.common.ui import (COLORS, SAVE_FAILED, SAVE_PENDING, SAVE_SAVED,
+                              SAVE_SAVING, BaseGame, Button,
+                              draw_gradient_bg, draw_text, ease_out_back,
+                              ease_out_cubic)
+from game_service.service import GameDataService, parse_score_response
 
 GRID = 4
 TILE = 90
@@ -101,7 +102,7 @@ class Game2048(BaseGame):
     game_id = "2048"
     title = "2048"
 
-    def __init__(self, backend: Optional[BackendClient] = None,
+    def __init__(self, backend: Optional[GameDataService] = None,
                  player: str = "anonymous"):
         super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player)
         self.reset()
@@ -351,13 +352,16 @@ class Game2048(BaseGame):
             # The final score may arrive while the 2048 milestone request is
             # still in flight. Keep only the newest pending value; once the
             # first response supplies an id, the queued value updates it.
+            self._score_attempt_revision += 1
             self._queued_score_submission = (
-                self.score, extra, uuid.uuid4().hex)
+                self.score, extra, uuid.uuid4().hex,
+                self._score_attempt_revision)
             return
         self._begin_score_submission(self.score, extra)
 
     def _begin_score_submission(self, score: int, extra=None,
-                                request_id: Optional[str] = None) -> None:
+                                request_id: Optional[str] = None,
+                                revision: Optional[int] = None) -> None:
         if not self.backend or not self.game_id:
             return
         self.score_save_state = SAVE_SAVING
@@ -366,8 +370,13 @@ class Game2048(BaseGame):
         self.score_save_durable_pending = False
         self._discard_unsaved_armed = False
         request_id = request_id or uuid.uuid4().hex
+        if revision is None:
+            self._score_attempt_revision += 1
+            revision = self._score_attempt_revision
         self._last_score_payload = {"score": score, "extra": extra,
-                                    "request_id": request_id}
+                                    "request_id": request_id,
+                                    "attempt_uuid": self._score_attempt_uuid,
+                                    "revision": revision}
         submit_async = getattr(
             self.backend, "submit_score_reliable_async", None)
         if not callable(submit_async):
@@ -377,7 +386,9 @@ class Game2048(BaseGame):
                 self._score_submission_future = submit_async(
                     self.game_id, self.player, score, extra=extra,
                     replace=True, submission_id=self.score_submission_id,
-                    request_id=request_id)
+                    request_id=request_id,
+                    attempt_uuid=self._score_attempt_uuid,
+                    revision=revision)
                 self._score_submission_inflight_score = score
             except Exception as exc:  # noqa: BLE001
                 self.score_save_state = SAVE_FAILED
@@ -387,7 +398,9 @@ class Game2048(BaseGame):
             result = self.backend.submit_score(
                 self.game_id, self.player, score, extra=extra, replace=True,
                 submission_id=self.score_submission_id,
-                request_id=request_id)
+                request_id=request_id,
+                attempt_uuid=self._score_attempt_uuid,
+                revision=revision)
         except Exception as exc:  # noqa: BLE001
             self.score_save_state = SAVE_FAILED
             self.score_save_error = str(exc)
@@ -397,6 +410,17 @@ class Game2048(BaseGame):
     def _record_score_submission(self, result, score: int) -> None:
         row_id, error = parse_score_response(result)
         if row_id is None:
+            durable_pending = bool(
+                isinstance(result, dict) and result.get("durable_pending"))
+            if durable_pending:
+                self.score_save_state = SAVE_PENDING
+                self.score_save_error = None
+                self.score_save_retryable = True
+                self.score_save_durable_pending = True
+                self.score_save_message = "待保存记录已安全落盘"
+                self._destructive_action_armed = None
+                self._discard_unsaved_armed = False
+                return
             self.score_save_state = SAVE_FAILED
             self.score_save_error = error
             self.score_save_retryable = (
@@ -418,6 +442,7 @@ class Game2048(BaseGame):
         self.score_save_error = None
         self.score_save_durable_pending = False
         self._discard_unsaved_armed = False
+        self._destructive_action_armed = None
         if isinstance(result, dict) and result.get("attempt_recorded"):
             self.score_save_message = (
                 "本局已记录 · 新纪录" if result.get("new_personal_best")
@@ -450,7 +475,8 @@ class Game2048(BaseGame):
         if self.score_save_state == SAVE_FAILED and payload:
             self._begin_score_submission(payload["score"],
                                          payload.get("extra"),
-                                         request_id=payload["request_id"])
+                                         request_id=payload["request_id"],
+                                         revision=payload["revision"])
 
     def _detach_queued_score_submission(self) -> None:
         """Keep a final score alive when reset detaches the game object."""
@@ -463,7 +489,9 @@ class Game2048(BaseGame):
             submit_async(self.game_id, self.player, queued[0],
                          extra=queued[1], replace=True,
                          submission_id=self.score_submission_id,
-                         request_id=queued[2])
+                         request_id=queued[2],
+                         attempt_uuid=self._score_attempt_uuid,
+                         revision=queued[3])
 
     def _continue_after_win(self) -> None:
         self._queued_directions.clear()
@@ -500,7 +528,7 @@ class Game2048(BaseGame):
             return
         # R always restarts.
         if event.key == pygame.K_r:
-            self.reset()
+            self.request_reset()
             return
         if self.state == "playing":
             if event.key in (pygame.K_LEFT, pygame.K_a):
@@ -600,22 +628,22 @@ class Game2048(BaseGame):
                 Button(pygame.Rect(0, 0, 150, 36), "继续挑战 (C)",
                        self._continue_after_win, primary=True),
                 Button(pygame.Rect(0, 0, 150, 36), "重新开始 (R)",
-                       self.reset),
+                       self.request_reset),
                 Button(pygame.Rect(0, 0, 150, 36), "返回菜单 (Esc)",
-                       lambda: setattr(self, "running", False)),
+                       self.request_exit),
             ]
             self.draw_gameover_overlay("达成 2048！", buttons=btns)
         elif self.state == "gameover":
             btns = [
                 Button(pygame.Rect(0, 0, 150, 36), "重新开始 (R)",
-                       self.reset, primary=True),
+                       self.request_reset, primary=True),
                 Button(pygame.Rect(0, 0, 150, 36), "返回菜单 (Esc)",
-                       lambda: setattr(self, "running", False)),
+                       self.request_exit),
             ]
             self.draw_gameover_overlay("游戏结束", buttons=btns)
 
 
-def run_game(backend: Optional[BackendClient] = None,
+def run_game(backend: Optional[GameDataService] = None,
              player: str = "anonymous") -> None:
     Game2048(backend=backend, player=player).run()
 

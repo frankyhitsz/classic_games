@@ -12,4 +12,9 @@ fi
 export GAMES_HOST="${GAMES_HOST:-127.0.0.1}"
 export GAMES_PORT="${GAMES_PORT:-5000}"
 
+python -c 'import flask, requests' 2>/dev/null || {
+    echo "[server] missing optional API dependencies; run: pip install -e '.[api]'" >&2
+    exit 1
+}
+
 exec python -m server.app
