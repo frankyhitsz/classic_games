@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+SERVER_START_TIMEOUT_SECONDS = 20.0
 
 
 def workflow_error(title: str, detail: str) -> None:
@@ -30,8 +31,10 @@ def free_port() -> int:
         return int(listener.getsockname()[1])
 
 
-def wait_for_server(url: str, process: subprocess.Popen) -> bool:
-    for _ in range(50):
+def wait_for_server(url: str, process: subprocess.Popen,
+                    timeout: float = SERVER_START_TIMEOUT_SECONDS) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
         if process.poll() is not None:
             return False
         try:
