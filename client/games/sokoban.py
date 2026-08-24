@@ -276,8 +276,8 @@ def level_bounds(level: List[str]) -> Tuple[int, int]:
 class Sokoban(BaseGame):
     game_id = "sokoban"
     title = "推箱子"
-    # Sokoban submits only a complete, unassisted run. Replace keeps a
-    # player's best completed run from becoming duplicate leaderboard rows.
+    # Sokoban submits only a complete, unassisted run. Higher totals produced
+    # by replaying a level update that run's attempt instead of adding one.
     submit_replaces_existing = True
 
     def __init__(self, backend: Optional[BackendClient] = None,
@@ -414,7 +414,8 @@ class Sokoban(BaseGame):
             self.score = self.total_score  # display the running total
             completed_all = (len(self.completed_levels) == len(LEVELS)
                              and not self.practice_mode)
-            result = {"level": self.level_idx,
+            result = {"level": self.level_idx + 1,
+                      "level_index": self.level_idx,
                       "level_score": level_score,
                       "counted_level_score": self.level_scores[self.level_idx],
                       "total_score": self.total_score,

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Launch the pygame launcher only (assumes server is already running,
-# but works in offline mode if not).
+# Launch the pygame hub with its in-process local score store.
 set -euo pipefail
 cd "$(dirname "$0")"
 

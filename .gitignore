@@ -16,6 +16,7 @@ venv/
 # Runtime state: player scores and server output stay local
 data/*.db
 data/*.db-*
+data/*.db.*
 data/*.sqlite*
 logs/
 

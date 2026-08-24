@@ -1,7 +1,8 @@
 # Classic Games Hub
 
 基于 pygame 的经典小游戏合集，包含俄罗斯方块、贪吃蛇、2048、推箱子和祖玛。
-项目提供统一启动器，并使用 Flask 和 SQLite 保存得分与排行榜。
+项目提供统一启动器，默认直接使用本机 SQLite 保存每次游玩记录和个人最佳；
+Flask API 作为可选适配器保留。
 
 ## 游戏列表
 
@@ -11,7 +12,7 @@
 - 推箱子：16 个关卡，支持撤销和重置
 - 祖玛：5 个关卡，每关使用不同轨道和速度
 
-后端未启动时，游戏会自动进入离线模式。
+正常游玩不需要启动后端，也不需要网络或端口。
 
 ## 环境要求
 
@@ -37,32 +38,29 @@ pip install -r requirements.txt
 
 ## 启动
 
-同时启动后端和游戏菜单：
+启动游戏菜单：
 
 ```bash
 ./run.sh
 ```
 
-如需更换端口，启动脚本会让后端、健康检查和客户端使用同一个地址：
+`run.sh` 和单独启动的游戏都会使用本机记录。首次启动会只读导入旧的
+`data/scores.db`，旧文件不会被修改。
+
+如需调试 Flask API，可分别启动服务端和使用 HTTP 的启动器：
 
 ```bash
-GAMES_PORT=5010 ./run.sh
+GAMES_PORT=5010 ./run_server.sh
 ```
 
-监听局域网地址时，可分别指定服务端监听地址和客户端连接地址：
-
 ```bash
-GAMES_HOST=0.0.0.0 GAMES_CLIENT_HOST=127.0.0.1 GAMES_PORT=5010 ./run.sh
+GAMES_USE_HTTP=1 GAMES_API_URL=http://127.0.0.1:5010 ./run_launcher.sh
 ```
 
-分别启动：
+服务端默认只监听本机。确需局域网调试时可显式指定监听地址：
 
 ```bash
-# 终端 1
-./run_server.sh
-
-# 终端 2
-./run_launcher.sh
+GAMES_HOST=0.0.0.0 GAMES_PORT=5010 ./run_server.sh
 ```
 
 单独启动某个游戏：
@@ -91,7 +89,14 @@ python -m client.games.zuma
 ./run_tests.sh
 ```
 
-测试脚本会启动一个临时后端，并使用独立数据库运行客户端和接口测试。
+测试脚本会使用临时本地数据库，同时启动一个临时 Flask 适配器检查 API；
+不会读写玩家数据或仓库里的旧成绩库。
+
+固定 seed 的玩法、渲染、保存、资源和 SQLite 并发压力检查也可以单独运行：
+
+```bash
+SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python -m tests.stress
+```
 
 ## 目录结构
 
@@ -101,8 +106,9 @@ classic_games/
 │   ├── common/        # 公共 UI 与网络客户端
 │   ├── games/         # 五款游戏
 │   └── launcher.py    # 游戏菜单
+├── game_service/      # 游戏注册表、本地仓储和桌面数据服务
 ├── server/
-│   └── app.py         # Flask API
+│   └── app.py         # 可选 Flask 适配器
 ├── tests/
 │   └── regression.py
 ├── environment.yml
@@ -110,12 +116,17 @@ classic_games/
 └── run.sh
 ```
 
-运行时会自动创建以下内容，它们不会提交到仓库：
+默认数据库位置：
 
-- `data/scores.db`
-- `logs/server.log`
+- macOS：`~/Library/Application Support/ClassicGamesHub/games.db`
+- Windows：`%LOCALAPPDATA%\ClassicGamesHub\games.db`
+- Linux：`$XDG_DATA_HOME/classic-games/games.db`，未设置时使用
+  `~/.local/share/classic-games/games.db`
 
-## 后端 API
+可用 `GAMES_DATA_DIR` 指定数据目录，或用 `GAMES_DB` 指定数据库文件。
+同目录下的 `pending_saves.json` 只在本地事务失败时保存待重试记录。
+
+## 可选 Flask API
 
 | Method | Path | 说明 |
 | --- | --- | --- |

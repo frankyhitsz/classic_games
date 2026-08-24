@@ -22,6 +22,7 @@ Controls:
 from __future__ import annotations
 
 import random
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional
@@ -180,9 +181,9 @@ class Game2048(BaseGame):
                 slots.append(_LineSlot(tile=t))
         return slots
 
-    def _move(self, direction: str) -> None:
+    def _move(self, direction: str) -> bool:
         if self.state not in ("playing",):
-            return
+            return False
         if direction not in {"left", "right", "up", "down"}:
             raise ValueError(f"unknown 2048 direction: {direction}")
         # Refuse input mid-slide so the animation can finish cleanly.
@@ -191,7 +192,7 @@ class Game2048(BaseGame):
                     and (not self._queued_directions
                          or self._queued_directions[-1] != direction)):
                 self._queued_directions.append(direction)
-            return
+            return False
 
         # Reset per-move animation state.
         for t in self.tiles:
@@ -263,12 +264,14 @@ class Game2048(BaseGame):
             # transition to game-over instead of leaving the UI stuck.
             if not self._can_move():
                 self.state = "gameover"
+                self._queued_directions.clear()
                 self.extra = {"max_tile": self._max_tile(), "won": self.won}
                 self._submit_score(extra=self.extra)
-            return
+            return False
 
         # Begin animation; spawn + state transition happen when it ends.
         self.anim_t = 0.0
+        return True
 
     # ------------------------------------------------------------------
     def update(self, dt: float) -> None:
@@ -313,18 +316,21 @@ class Game2048(BaseGame):
             if pending == "won":
                 self._won_announced = True
                 self.state = "won"
+                self._queued_directions.clear()
                 self._submit_score(extra={"won": True,
                                           "max_tile": self._max_tile()})
             elif pending == "gameover":
                 self.state = "gameover"
+                self._queued_directions.clear()
                 self.extra = {"max_tile": self._max_tile(), "won": self.won}
                 self._submit_score(extra=self.extra)
 
-            # Start the one buffered move immediately after this slide has
-            # settled and its new tile has spawned. This feels responsive but
-            # still keeps merge calculations strictly one move at a time.
-            if self._queued_directions and self.state == "playing":
-                self._move(self._queued_directions.popleft())
+            # Discard no-op commands immediately. Otherwise a blocked command
+            # can leave a later direction queued until an unrelated future
+            # move, producing a surprising delayed slide.
+            while self._queued_directions and self.state == "playing":
+                if self._move(self._queued_directions.popleft()):
+                    break
 
         # Decay pop / grow spawn timers.
         for t in self.tiles:
@@ -345,16 +351,23 @@ class Game2048(BaseGame):
             # The final score may arrive while the 2048 milestone request is
             # still in flight. Keep only the newest pending value; once the
             # first response supplies an id, the queued value updates it.
-            self._queued_score_submission = (self.score, extra)
+            self._queued_score_submission = (
+                self.score, extra, uuid.uuid4().hex)
             return
         self._begin_score_submission(self.score, extra)
 
-    def _begin_score_submission(self, score: int, extra=None) -> None:
+    def _begin_score_submission(self, score: int, extra=None,
+                                request_id: Optional[str] = None) -> None:
         if not self.backend or not self.game_id:
             return
         self.score_save_state = SAVE_SAVING
         self.score_save_error = None
-        self._last_score_payload = {"score": score, "extra": extra}
+        self.score_save_retryable = True
+        self.score_save_durable_pending = False
+        self._discard_unsaved_armed = False
+        request_id = request_id or uuid.uuid4().hex
+        self._last_score_payload = {"score": score, "extra": extra,
+                                    "request_id": request_id}
         submit_async = getattr(
             self.backend, "submit_score_reliable_async", None)
         if not callable(submit_async):
@@ -363,7 +376,8 @@ class Game2048(BaseGame):
             try:
                 self._score_submission_future = submit_async(
                     self.game_id, self.player, score, extra=extra,
-                    replace=True, submission_id=self.score_submission_id)
+                    replace=True, submission_id=self.score_submission_id,
+                    request_id=request_id)
                 self._score_submission_inflight_score = score
             except Exception as exc:  # noqa: BLE001
                 self.score_save_state = SAVE_FAILED
@@ -372,7 +386,8 @@ class Game2048(BaseGame):
         try:
             result = self.backend.submit_score(
                 self.game_id, self.player, score, extra=extra, replace=True,
-                submission_id=self.score_submission_id)
+                submission_id=self.score_submission_id,
+                request_id=request_id)
         except Exception as exc:  # noqa: BLE001
             self.score_save_state = SAVE_FAILED
             self.score_save_error = str(exc)
@@ -384,12 +399,31 @@ class Game2048(BaseGame):
         if row_id is None:
             self.score_save_state = SAVE_FAILED
             self.score_save_error = error
+            self.score_save_retryable = (
+                result is None or (isinstance(result, dict)
+                                   and bool(result.get(
+                                       "retryable",
+                                       result.get("_retryable", False)))))
+            self.score_save_durable_pending = bool(
+                isinstance(result, dict) and result.get("durable_pending"))
             return
         self.score_submission_id = row_id
         self.score_submitted = True
-        self.submitted_score = score
+        confirmed_score = (result.get("score", score)
+                           if isinstance(result, dict) else score)
+        self.submitted_score = max(
+            confirmed_score,
+            self.submitted_score if self.submitted_score is not None else 0)
         self.score_save_state = SAVE_SAVED
         self.score_save_error = None
+        self.score_save_durable_pending = False
+        self._discard_unsaved_armed = False
+        if isinstance(result, dict) and result.get("attempt_recorded"):
+            self.score_save_message = (
+                "本局已记录 · 新纪录" if result.get("new_personal_best")
+                else "本局已记录")
+        else:
+            self.score_save_message = "成绩已保存"
         self.invalidate_overlay_leaderboard()
 
     def _poll_score_submission(self) -> None:
@@ -403,7 +437,7 @@ class Game2048(BaseGame):
         self._score_submission_inflight_score = None
         try:
             result = future.result()
-        except Exception:  # noqa: BLE001 - offline play must survive
+        except Exception:  # noqa: BLE001 - optional API failure must not crash
             result = None
         self._record_score_submission(result, submitted_score)
         queued = self._queued_score_submission
@@ -415,7 +449,8 @@ class Game2048(BaseGame):
         payload = self._last_score_payload
         if self.score_save_state == SAVE_FAILED and payload:
             self._begin_score_submission(payload["score"],
-                                         payload.get("extra"))
+                                         payload.get("extra"),
+                                         request_id=payload["request_id"])
 
     def _detach_queued_score_submission(self) -> None:
         """Keep a final score alive when reset detaches the game object."""
@@ -426,9 +461,12 @@ class Game2048(BaseGame):
             self.backend, "submit_score_reliable_async", None)
         if callable(submit_async):
             submit_async(self.game_id, self.player, queued[0],
-                         extra=queued[1], replace=True)
+                         extra=queued[1], replace=True,
+                         submission_id=self.score_submission_id,
+                         request_id=queued[2])
 
     def _continue_after_win(self) -> None:
+        self._queued_directions.clear()
         self.state = "playing"
         self.overlay_buttons = []
         if not self._can_move():

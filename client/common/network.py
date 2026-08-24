@@ -1,8 +1,7 @@
-"""Thin HTTP client wrapping the Flask backend.
+"""Optional HTTP client for the Flask adapter.
 
-Used by every game client so we keep a single place for endpoint URLs,
-timeouts, and error handling. Falls back gracefully when the server is
-down — local play should still work.
+The desktop launcher uses the in-process local store by default. This client
+remains available for API testing and explicit ``GAMES_USE_HTTP=1`` runs.
 """
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import os
 import threading
 import time
 import uuid
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
 import requests
@@ -36,6 +35,8 @@ def parse_score_response(result) -> tuple[Optional[int], Optional[str]]:
 
 
 class BackendClient:
+    pending_saves_are_durable = False
+
     def __init__(self, base_url: str = DEFAULT_BASE, timeout=TIMEOUT):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -44,11 +45,13 @@ class BackendClient:
         self._thread_local = threading.local()
         self._executor: Optional[ThreadPoolExecutor] = None
         self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
         self._pending_futures: set[Future] = set()
         self._sessions: set[requests.Session] = set()
         self._failed_score_submissions: list[dict] = []
         self._confirmed_replace_scores: dict[tuple[str, str], int] = {}
         self._save_sequence = 0
+        self._retrying_request_ids: set[str] = set()
         self._closed = False
 
     def _session(self) -> requests.Session:
@@ -60,7 +63,7 @@ class BackendClient:
                 self._sessions.add(session)
         return session
 
-    def _run_async(self, method, *args, **kwargs) -> Future:
+    def _run_async(self, method, *args, _completion=None, **kwargs) -> Future:
         """Run a network operation away from pygame's render thread."""
         with self._lock:
             if self._closed:
@@ -70,21 +73,34 @@ class BackendClient:
                     max_workers=2, thread_name_prefix="games-api")
             future = self._executor.submit(method, *args, **kwargs)
             self._pending_futures.add(future)
-            future.add_done_callback(self._discard_future)
+            future.add_done_callback(
+                lambda completed: self._finish_async(
+                    completed, _completion))
             return future
 
+    def _finish_async(self, future: Future, completion) -> None:
+        try:
+            if completion is not None:
+                completion(future)
+        finally:
+            self._discard_future(future)
+
     def _discard_future(self, future: Future) -> None:
-        with self._lock:
+        with self._condition:
             self._pending_futures.discard(future)
+            self._condition.notify_all()
 
     def drain(self, timeout: Optional[float] = None) -> bool:
-        """Wait for work already handed to the shared client to finish."""
-        with self._lock:
-            pending = set(self._pending_futures)
-        if not pending:
+        """Wait until work and its completion bookkeeping have finished."""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._condition:
+            while self._pending_futures:
+                remaining = (None if deadline is None
+                             else deadline - time.monotonic())
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._condition.wait(remaining)
             return True
-        _, unfinished = wait(pending, timeout=timeout)
-        return not unfinished
 
     def close(self) -> None:
         """Close worker and HTTP resources. Safe to call more than once."""
@@ -152,16 +168,24 @@ class BackendClient:
                 headers={"Content-Type": "application/json"},
                 timeout=self.timeout,
             )
-            result = resp.json()
+            try:
+                result = resp.json()
+            except ValueError:
+                result = {"ok": False, "code": "invalid_response",
+                          "error": "保存服务返回了无效 JSON"}
             if not isinstance(result, dict):
-                return None
+                result = {"ok": False, "code": "invalid_response",
+                          "error": "保存服务返回了无效结果"}
             if resp.ok:
                 self._mark_available("write", request_started)
             elif resp.status_code >= 500:
                 self._mark_unavailable("write")
                 result["_retryable"] = True
+            else:
+                result["_retryable"] = False
+            result["_http_status"] = resp.status_code
             return result
-        except (requests.RequestException, ValueError):
+        except requests.RequestException:
             self._mark_unavailable("write")
         return None
 
@@ -190,11 +214,9 @@ class BackendClient:
                      _bypass_backoff: bool = False):
         """Submit a score.
 
-        ``replace=True`` asks the backend to delete this player's
-        previous submissions for this game before inserting. Useful
-        for games whose score is a running total (e.g. Sokoban's
-        cumulative full-run total) where intermediate milestones
-        shouldn't clutter the leaderboard.
+        ``replace=True`` identifies running-total games. The current store
+        keeps every completed attempt and uses ``submission_id`` to update a
+        total within the same run.
         """
         payload = {"game_id": game_id, "player": player, "score": score}
         if extra is not None:
@@ -223,10 +245,17 @@ class BackendClient:
             row_id, _error = parse_score_response(last_result)
             if row_id is not None:
                 return last_result
-            if (isinstance(last_result, dict)
-                    and not last_result.get("_retryable")):
+            if not self._score_failure_retryable(last_result):
                 break
         return last_result
+
+    @staticmethod
+    def _score_failure_retryable(result) -> bool:
+        if result is None:
+            return True
+        if not isinstance(result, dict):
+            return False
+        return bool(result.get("retryable", result.get("_retryable", False)))
 
     def recent(self, limit: int = 20):
         r = self._get("/api/recent", params={"limit": limit})
@@ -265,14 +294,12 @@ class BackendClient:
         with self._lock:
             self._save_sequence += 1
             save_record = {"token": self._save_sequence, "payload": payload}
-        future = self._run_async(
+        return self._run_async(
             self._submit_score_with_retries, game_id, player, score,
             extra=extra, replace=replace, submission_id=submission_id,
-            request_id=payload["request_id"])
-        future.add_done_callback(
-            lambda completed: self._capture_score_save(
+            request_id=payload["request_id"],
+            _completion=lambda completed: self._capture_score_save(
                 completed, save_record))
-        return future
 
     def _capture_score_save(self, future: Future, save_record: dict) -> None:
         payload = save_record["payload"]
@@ -283,14 +310,19 @@ class BackendClient:
         row_id, _error = parse_score_response(result)
         with self._lock:
             profile_key = (payload["game_id"], payload["player"])
+            request_id = payload.get(
+                "request_id", f"legacy-save-{save_record['token']:016d}")
+            payload["request_id"] = request_id
+            self._retrying_request_ids.discard(request_id)
             self._failed_score_submissions = [
                 item for item in self._failed_score_submissions
-                if item["token"] != save_record["token"]]
+                if item["payload"]["request_id"] != request_id]
             if row_id is None:
                 confirmed = self._confirmed_replace_scores.get(profile_key)
                 superseded = (payload["replace"] and confirmed is not None
                               and confirmed >= payload["score"])
-                if not superseded:
+                if (not superseded
+                        and self._score_failure_retryable(result)):
                     self._failed_score_submissions.append(save_record)
             elif payload["replace"]:
                 self._confirmed_replace_scores[profile_key] = max(
@@ -310,8 +342,20 @@ class BackendClient:
 
     def retry_failed_saves(self) -> int:
         with self._lock:
-            failed = list(self._failed_score_submissions)
-            self._failed_score_submissions.clear()
+            failed = [item for item in self._failed_score_submissions
+                      if item["payload"]["request_id"]
+                      not in self._retrying_request_ids]
+            for item in failed:
+                self._retrying_request_ids.add(
+                    item["payload"]["request_id"])
+        scheduled = 0
         for item in failed:
-            self.submit_score_reliable_async(**item["payload"])
-        return len(failed)
+            try:
+                self.submit_score_reliable_async(**item["payload"])
+            except Exception:  # noqa: BLE001 - retain item for next retry
+                with self._lock:
+                    self._retrying_request_ids.discard(
+                        item["payload"]["request_id"])
+            else:
+                scheduled += 1
+        return scheduled

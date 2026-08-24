@@ -8,12 +8,14 @@ the score and show the leaderboard.
 from __future__ import annotations
 
 import abc
+import uuid
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
 import pygame
 
 from .network import BackendClient, parse_score_response
+from game_service.local_backend import LocalBackendClient
 
 OVERLAY_INPUT_GUARD_MS = 180
 SAVE_IDLE = "idle"
@@ -361,11 +363,9 @@ class BaseGame(abc.ABC):
 
     game_id: str = ""
     title: str = "Game"
-    # If True, ``on_win``/``on_game_over`` submit with ``replace=True``,
-    # asking the backend to delete this player's previous submissions
-    # for this game first. Set True on games whose score is a running
-    # total (Sokoban) so intermediate milestones don't clutter the
-    # leaderboard.
+    # If True, later confirmed totals in the same run update one attempt.
+    # A new run still creates its own history row; personal best is derived
+    # from attempts instead of deleting lower completed runs.
     submit_replaces_existing: bool = False
 
     def __init__(self, width: int, height: int, fps: int = 60,
@@ -377,7 +377,7 @@ class BaseGame(abc.ABC):
         self.clock = pygame.time.Clock()
         self.fps = fps
         self._owns_backend = backend is None
-        self.backend = backend if backend is not None else BackendClient()
+        self.backend = backend if backend is not None else LocalBackendClient()
         self.player = player
         self.running = True
         self.state = "playing"  # playing | paused | gameover | won
@@ -390,8 +390,7 @@ class BaseGame(abc.ABC):
         # dispatched in ``handle_event`` when state != "playing".
         self.overlay_buttons: List[Button] = []
         # Game-over overlays are drawn every frame.  Keep their leaderboard
-        # result here so drawing 60 FPS does not also issue 60 HTTP requests
-        # per second (or repeatedly block when the backend is offline).
+        # result here so drawing 60 FPS does not also issue 60 data reads.
         self._overlay_lb_key = None
         self._overlay_leaderboard: List[dict] = []
         self._overlay_lb_future = None
@@ -402,8 +401,13 @@ class BaseGame(abc.ABC):
         self._score_submit_future_generation = 0
         self._score_submit_active_payload = None
         self._last_score_payload = None
+        self._score_submission_id: Optional[int] = None
         self.score_save_state = SAVE_IDLE
         self.score_save_error: Optional[str] = None
+        self.score_save_retryable = True
+        self.score_save_message = ""
+        self.score_save_durable_pending = False
+        self._discard_unsaved_armed = False
         # Restart/continue buttons share the same mouse with some games.
         # Briefly swallow a rapid second click after an overlay action so a
         # double-click cannot fire a Zuma ball or begin a 2048 swipe.
@@ -426,7 +430,8 @@ class BaseGame(abc.ABC):
         self._poll_score_submission()
         if (event.type == pygame.KEYDOWN and event.key == pygame.K_s
                 and self.state in ("gameover", "won")
-                and self.score_save_state == SAVE_FAILED):
+                and self.score_save_state == SAVE_FAILED
+                and self.score_save_retryable):
             self.retry_score_save()
             return True
         if (event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP)
@@ -445,6 +450,11 @@ class BaseGame(abc.ABC):
             return True
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
+                if (self.score_save_state == SAVE_FAILED
+                        and not self.score_save_durable_pending
+                        and not self._discard_unsaved_armed):
+                    self._discard_unsaved_armed = True
+                    return True
                 # ESC always returns to the launcher (just exits this loop).
                 self.running = False
                 return True
@@ -487,21 +497,35 @@ class BaseGame(abc.ABC):
         self._score_submit_future = None
         self._score_submit_active_payload = None
         self._last_score_payload = None
+        self._score_submission_id = None
         self.score_save_state = SAVE_IDLE
         self.score_save_error = None
+        self.score_save_retryable = True
+        self.score_save_message = ""
+        self.score_save_durable_pending = False
+        self._discard_unsaved_armed = False
         self.invalidate_overlay_leaderboard()
 
-    def _submit_result_score(self, score: int, extra=None) -> None:
+    def _submit_result_score(self, score: int, extra=None,
+                             request_id: Optional[str] = None) -> None:
         if not self.backend or not self.game_id:
             return
         payload = {"score": score, "extra": extra,
-                   "replace": self.submit_replaces_existing}
+                   "replace": self.submit_replaces_existing,
+                   "request_id": request_id or uuid.uuid4().hex,
+                   "submission_id": (self._score_submission_id
+                                     if self.submit_replaces_existing
+                                     else None)}
         self._last_score_payload = payload
         self._score_submit_generation += 1
         generation = self._score_submit_generation
         self._score_submit_active_payload = payload
         self.score_save_state = SAVE_SAVING
         self.score_save_error = None
+        self.score_save_retryable = True
+        self.score_save_message = ""
+        self.score_save_durable_pending = False
+        self._discard_unsaved_armed = False
         submit_async = getattr(
             self.backend, "submit_score_reliable_async", None)
         if not callable(submit_async):
@@ -510,7 +534,9 @@ class BaseGame(abc.ABC):
             try:
                 self._score_submit_future = submit_async(
                     self.game_id, self.player, score, extra=extra,
-                    replace=self.submit_replaces_existing)
+                    replace=self.submit_replaces_existing,
+                    submission_id=payload["submission_id"],
+                    request_id=payload["request_id"])
                 self._score_submit_future_generation = generation
             except Exception as exc:  # noqa: BLE001
                 self._finish_score_submission(None, payload, generation,
@@ -519,7 +545,9 @@ class BaseGame(abc.ABC):
             try:
                 result = self.backend.submit_score(
                     self.game_id, self.player, score, extra=extra,
-                    replace=self.submit_replaces_existing)
+                    replace=self.submit_replaces_existing,
+                    submission_id=payload["submission_id"],
+                    request_id=payload["request_id"])
             except Exception as exc:  # noqa: BLE001
                 self._finish_score_submission(None, payload, generation,
                                               str(exc))
@@ -548,10 +576,27 @@ class BaseGame(abc.ABC):
         if row_id is None:
             self.score_save_state = SAVE_FAILED
             self.score_save_error = exception_text or error or "保存失败"
+            self.score_save_retryable = (
+                result is None or (isinstance(result, dict)
+                                   and bool(result.get(
+                                       "retryable",
+                                       result.get("_retryable", False)))))
+            self.score_save_durable_pending = bool(
+                isinstance(result, dict) and result.get("durable_pending"))
             self.on_score_save_failed(payload, self.score_save_error)
             return
         self.score_save_state = SAVE_SAVED
         self.score_save_error = None
+        self.score_save_durable_pending = False
+        self._discard_unsaved_armed = False
+        if self.submit_replaces_existing:
+            self._score_submission_id = row_id
+        if isinstance(result, dict) and result.get("attempt_recorded"):
+            self.score_save_message = (
+                "本局已记录 · 新纪录" if result.get("new_personal_best")
+                else "本局已记录")
+        else:
+            self.score_save_message = "成绩已保存"
         self.on_score_save_succeeded(result, payload)
         # Read the leaderboard only after the server has acknowledged the
         # score, otherwise the GET can race ahead of the POST.
@@ -561,7 +606,8 @@ class BaseGame(abc.ABC):
         payload = self._last_score_payload
         if self.score_save_state != SAVE_FAILED or not payload:
             return
-        self._submit_result_score(payload["score"], payload.get("extra"))
+        self._submit_result_score(payload["score"], payload.get("extra"),
+                                  request_id=payload["request_id"])
 
     def on_score_save_succeeded(self, result: dict, payload: dict) -> None:
         """Hook for games that maintain their own confirmed-save state."""
@@ -722,8 +768,13 @@ class BaseGame(abc.ABC):
 
         save_messages = {
             SAVE_SAVING: ("成绩保存中…", COLORS["text_dim"]),
-            SAVE_SAVED: ("成绩已保存", COLORS["ok"]),
-            SAVE_FAILED: ("保存失败 · 按 S 重试", COLORS["danger"]),
+            SAVE_SAVED: (self.score_save_message or "成绩已保存", COLORS["ok"]),
+            SAVE_FAILED: (("保存失败 · 按 S 重试"
+                           if (self.score_save_retryable
+                               and not self._discard_unsaved_armed)
+                           else "未落盘 · 再按 Esc 放弃"
+                           if self._discard_unsaved_armed
+                           else "成绩数据无效 · 无法重试"), COLORS["danger"]),
         }
         save_line = save_messages.get(self.score_save_state)
         if save_line:
@@ -753,7 +804,7 @@ class BaseGame(abc.ABC):
                     else:
                         self._overlay_leaderboard = self.backend.leaderboard(
                             self.game_id, limit=3)
-                except Exception:  # noqa: BLE001 - offline play must survive
+                except Exception:  # noqa: BLE001 - records UI must degrade
                     self._overlay_leaderboard = []
         if (self._overlay_lb_future is not None
                 and self._overlay_lb_future.done()):
@@ -764,7 +815,7 @@ class BaseGame(abc.ABC):
                     self._overlay_leaderboard = (result
                                                  if isinstance(result, list)
                                                  else [])
-            except Exception:  # noqa: BLE001 - offline play must survive
+            except Exception:  # noqa: BLE001 - records UI must degrade
                 self._overlay_leaderboard = []
             self._overlay_lb_future = None
         lb = self._overlay_leaderboard

@@ -50,6 +50,12 @@ env GAMES_API_URL="${TEST_API_URL}" \
     SDL_VIDEODRIVER=dummy \
     SDL_AUDIODRIVER=dummy python -m tests.regression || TEST_STATUS=$?
 
+if [[ "${TEST_STATUS}" -eq 0 ]]; then
+    env GAMES_DB="${TEST_RUNTIME_DIR}/stress-default.db" \
+        SDL_VIDEODRIVER=dummy \
+        SDL_AUDIODRIVER=dummy python -m tests.stress || TEST_STATUS=$?
+fi
+
 DEFAULT_DB_AFTER=$(default_db_fingerprint)
 if [[ "${DEFAULT_DB_BEFORE}" != "${DEFAULT_DB_AFTER}" ]]; then
     echo "tests modified the default score database" >&2

@@ -679,13 +679,15 @@ run("launcher-recent-shows-game-name", """
             captured_recent.extend(entries)
         return orig(surf, rect, entries, title=title, **kw)
     L.draw_leaderboard = spy
-    BackendClient.health = lambda self: True
-    BackendClient.list_games = lambda self, *a, **k: []
-    BackendClient.leaderboard = lambda self, *a, **k: []
-    BackendClient.recent = lambda self, *a, **k: [
-        {'game_id':'tetris', 'player':'a', 'score':100},
-        {'game_id':'snake', 'player':'b', 'score':200},
-    ]
+    class FakeLocal(BackendClient):
+        def health(self): return True
+        def list_games(self, *a, **k): return []
+        def leaderboard(self, *a, **k): return []
+        def recent(self, *a, **k): return [
+            {'game_id':'tetris', 'player':'a', 'score':100},
+            {'game_id':'snake', 'player':'b', 'score':200},
+        ]
+    L.LocalBackendClient = FakeLocal
     def driver():
         time.sleep(0.4)
         pygame.event.post(pygame.event.Event(pygame.QUIT))
@@ -791,7 +793,7 @@ for mod_name, cls_name in [("tetris","Tetris"), ("snake","Snake"),
 
 
 # ===========================================================================
-print("\n=== 30. Sokoban accumulates a full-run TOTAL score (and replaces prev) ===")
+print("\n=== 30. Sokoban records one complete-run TOTAL score ===")
 run("sokoban-total-score", """
     import os; os.environ['SDL_VIDEODRIVER']='dummy'
     import pygame; pygame.init()
@@ -820,15 +822,15 @@ run("sokoban-total-score", """
     assert last_score == expected_total, \\
         f'final submitted score={last_score}, expected total={expected_total}'
     assert last_extra.get('completed_all') is True, last_extra
-    assert last_replace, f'completed run must replace older run: {submitted}'
-    # Verify backend really did delete previous submissions — only ONE
-    # row for player 'rt' should remain.
+    assert last_replace, f'completed run must use running-total mode: {submitted}'
+    # Personal-best output has one row per local player even though attempts
+    # retain every completed run.
     import requests
     base = os.environ.get('GAMES_API_URL', 'http://127.0.0.1:5000')
     lb = requests.get(f'{base}/api/leaderboard/sokoban',
                       params={'limit': 10}).json()
     rt_rows = [e for e in lb['leaderboard'] if e['player'] == 'rt']
-    assert len(rt_rows) == 1, f'expected 1 rt row, got {len(rt_rows)}: {rt_rows}'
+    assert len(rt_rows) == 1, f'expected 1 best row, got {len(rt_rows)}: {rt_rows}'
     assert rt_rows[0]['score'] == expected_total, rt_rows
     # Reloading level 0 resets the running total.
     g.load_level(0)
@@ -1218,6 +1220,13 @@ run("snake-restart-and-turn-buffer", """
     g.update(0.75)
     assert g.body[0] == (old_head[0] + 1, old_head[1]), \
         'a recovered frame replayed several invisible snake steps'
+    g.reset(); old_head=g.body[0]
+    g.score=640; g.level=13; g.move_speed=19
+    g.food=(old_head[0]+1, old_head[1])
+    g.update(0.103)
+    assert g.move_speed == 20
+    assert g.body[0] == (old_head[0] + 2, old_head[1]), \
+        'catch-up retained the pre-level-up interval'
     pygame.quit()
 """)
 
@@ -1734,36 +1743,45 @@ run("backend-failure-backoff", """
 # ===========================================================================
 print("\n=== 64. Score API rejects malformed and dangerous payloads ===")
 run("backend-score-validation", """
-    from server.app import app, init_db
-    init_db(); client = app.test_client()
-    cases = [
-        [],
-        {'game_id':'tetris', 'player':123, 'score':1},
-        {'game_id':'tetris', 'player':'p', 'score':-1},
-        {'game_id':'tetris', 'player':'p', 'score':True},
-        {'game_id':'tetris', 'player':'p', 'score':1, 'replace':'false'},
-    ]
-    for payload in cases:
-        response = client.post('/api/scores', json=payload)
-        assert response.status_code == 400, (payload, response.data)
-    response = client.post('/api/scores', json={
-        'game_id':'tetris', 'player':'   ', 'score':0})
-    assert response.status_code == 200
+    import tempfile
+    from pathlib import Path
+    from server.app import create_app
+    with tempfile.TemporaryDirectory() as temp_dir:
+        app=create_app({'TESTING':True,
+                        'DB_PATH':str(Path(temp_dir)/'scores.db')})
+        client = app.test_client()
+        cases = [
+            [],
+            {'game_id':'tetris', 'player':123, 'score':1},
+            {'game_id':'tetris', 'player':'p', 'score':-1},
+            {'game_id':'tetris', 'player':'p', 'score':True},
+            {'game_id':'tetris', 'player':'p', 'score':1, 'replace':'false'},
+        ]
+        for payload in cases:
+            response = client.post('/api/scores', json=payload)
+            assert response.status_code == 400, (payload, response.data)
+        response = client.post('/api/scores', json={
+            'game_id':'tetris', 'player':'   ', 'score':0})
+        assert response.status_code == 200
 """)
 
 # ===========================================================================
-print("\n=== 65. Sokoban replacement never erases a higher completed run ===")
-run("backend-preserves-higher-run", """
+print("\n=== 65. Sokoban records each run while preserving personal best ===")
+run("backend-records-run-and-preserves-best", """
     import os
     from client.common.network import BackendClient
     be = BackendClient(); player = f'best_{os.getpid()}'
     high = be.submit_score('sokoban', player, 3900, replace=True)
     low = be.submit_score('sokoban', player, 900, replace=True)
     assert high and low, (high, low)
-    assert low.get('preserved') is True and low.get('score') == 3900, low
+    assert low.get('attempt_recorded') is True, low
+    assert low.get('new_personal_best') is False, low
+    assert low.get('personal_best') == 3900, low
     rows = [r for r in be.leaderboard('sokoban', 50)
             if r.get('player') == player]
     assert len(rows) == 1 and rows[0]['score'] == 3900, rows
+    stats = be.stats('sokoban')
+    assert stats['attempts'] >= 2, stats
 """)
 
 # ===========================================================================
@@ -1785,7 +1803,7 @@ run("backend-tie-ranks", """
 # ===========================================================================
 print("\n=== 67. Launcher reconnects when backend comes online later ===")
 run("launcher-auto-reconnect", """
-    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'; os.environ['GAMES_USE_HTTP']='1'
     import threading, time, pygame
     from client.common.network import BackendClient
     import client.launcher as L
@@ -2196,13 +2214,13 @@ run("tetris-held-input-and-gravity", """
 """)
 
 # ===========================================================================
-print("\n=== 83. Flask import initializes DB and the score contract is strict ===")
-run("backend-import-init-and-strict-contract", """
+print("\n=== 83. Flask import is side-effect free and its factory contract is strict ===")
+run("backend-app-factory-and-strict-contract", """
     import os, sqlite3, subprocess, sys, tempfile
     with tempfile.TemporaryDirectory() as temp_dir:
         env = os.environ.copy(); env['GAMES_DB'] = os.path.join(temp_dir, 'fresh.db')
-        code = ("from server.app import app\\n"
-                "c = app.test_client()\\n"
+        code = ("from server.app import create_app\\n"
+                "c = create_app().test_client()\\n"
                 "r = c.post('/api/scores', "
                 "json={'game_id':'tetris','score':1})\\n"
                 "assert r.status_code == 200 and r.get_json()['ok']\\n")
@@ -2210,8 +2228,7 @@ run("backend-import-init-and-strict-contract", """
                                 capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
 
-    # Import-time initialization also migrates databases created by the
-    # previous schema instead of only handling brand-new files.
+    # Importing the module must not migrate or otherwise change an old DB.
     with tempfile.TemporaryDirectory() as temp_dir:
         old_db = os.path.join(temp_dir, 'old.db')
         with sqlite3.connect(old_db) as conn:
@@ -2219,16 +2236,15 @@ run("backend-import-init-and-strict-contract", """
                          'game_id TEXT, player TEXT, score INTEGER, '
                          'extra TEXT, created_at REAL)')
         env = os.environ.copy(); env['GAMES_DB'] = old_db
-        code = ("import sqlite3\\n"
-                "from server.app import DB_PATH\\n"
-                "c=sqlite3.connect(DB_PATH)\\n"
-                "cols={r[1] for r in c.execute('pragma table_info(scores)')}\\n"
-                "assert 'updated_at' in cols\\n")
+        before = open(old_db, 'rb').read()
+        code = "import server.app\\n"
         result = subprocess.run([sys.executable, '-c', code], env=env,
                                 capture_output=True, text=True)
         assert result.returncode == 0, result.stderr
+        assert open(old_db, 'rb').read() == before
 
-    from server.app import app
+    from server.app import create_app
+    app = create_app()
     c = app.test_client()
     invalid = [
         {'game_id':'tetris', 'score':'12'},
@@ -2541,11 +2557,11 @@ run("backend-reliable-save-and-close", """
             return ({'ok':True,'id':11} if self.available else None)
     backend=RecoveringBackend()
     backend.submit_score_reliable_async('snake','p',20).result(timeout=3)
-    import time; time.sleep(0.02)
+    assert backend.drain(timeout=3)
     assert backend.failed_save_count() == 1
     backend.available=True
     assert backend.retry_failed_saves() == 1
-    backend.drain(timeout=3); time.sleep(0.02)
+    assert backend.drain(timeout=3)
     assert backend.failed_save_count() == 0
     backend.close()
 
@@ -2556,13 +2572,55 @@ run("backend-reliable-save-and-close", """
         def __init__(self, value): self.value=value
         def result(self): return self.value
     low={'token':1, 'payload':{'game_id':'2048','player':'p','score':100,
-         'extra':None,'replace':True,'submission_id':None}}
+         'extra':None,'replace':True,'submission_id':None,
+         'request_id':'low-save-request-0001'}}
     high={'token':2, 'payload':{'game_id':'2048','player':'p','score':250,
-          'extra':None,'replace':True,'submission_id':None}}
+          'extra':None,'replace':True,'submission_id':None,
+          'request_id':'high-save-request-001'}}
     backend._capture_score_save(Done({'ok':True,'id':5}), high)
     backend._capture_score_save(Done(None), low)
     assert backend.failed_save_count() == 0
     backend.close()
+
+    # drain waits for score bookkeeping, not only the network Future.
+    import threading
+    class BlockingCapture(BackendClient):
+        def __init__(self):
+            super().__init__(); self.entered=threading.Event()
+            self.release=threading.Event()
+        def submit_score(self,*a,**k): return None
+        def _capture_score_save(self, future, record):
+            self.entered.set(); self.release.wait()
+            super()._capture_score_save(future, record)
+    backend=BlockingCapture()
+    backend.submit_score_reliable_async('snake','p',30)
+    assert backend.entered.wait(3)
+    drained=threading.Event()
+    waiter=threading.Thread(
+        target=lambda: (backend.drain(timeout=3), drained.set()))
+    waiter.start()
+    assert not drained.wait(0.05), 'drain returned before capture finished'
+    backend.release.set(); waiter.join(3)
+    assert drained.is_set() and backend.failed_save_count() == 1
+    backend.close()
+
+    # Permanent validation errors are not added to the retry queue.
+    class PermanentFailure(BackendClient):
+        def submit_score(self,*a,**k):
+            return {'ok':False, 'code':'invalid_score',
+                    '_retryable':False}
+    backend=PermanentFailure()
+    backend.submit_score_reliable_async('snake','p',30)
+    assert backend.drain(timeout=3)
+    assert backend.failed_save_count() == 0
+    backend.close()
+
+    backend=RecoveringBackend()
+    backend.submit_score_reliable_async('snake','p',40)
+    assert backend.drain(timeout=3) and backend.failed_save_count() == 1
+    backend.close()
+    assert backend.retry_failed_saves() == 0
+    assert backend.failed_save_count() == 1, 'closed retry lost the record'
 """)
 
 # ===========================================================================
@@ -2572,18 +2630,20 @@ run("backend-monotonic-update-and-json-errors", """
     from pathlib import Path
     import server.app as server
     with tempfile.TemporaryDirectory() as temp_dir:
-        server.DB_PATH=Path(temp_dir)/'scores.db'; server.init_db()
-        client=server.app.test_client()
+        db_path=Path(temp_dir)/'scores.db'
+        app=server.create_app({'TESTING':True, 'DB_PATH':str(db_path)})
+        client=app.test_client()
         first=client.post('/api/scores',json={
             'game_id':'2048','player':'p','score':100}).get_json()
         lower=client.post('/api/scores',json={
             'game_id':'2048','player':'p','score':10,
             'submission_id':first['id']}).get_json()
         assert lower['score'] == 100, lower
+        assert lower['no_op'] is True, lower
         rows=client.get('/api/leaderboard/2048').get_json()['leaderboard']
         assert rows[0]['score'] == 100, rows
         stats=client.get('/api/stats/2048').get_json()
-        assert stats['records'] == 1 and 'plays' not in stats, stats
+        assert stats['attempts'] == 1 and 'plays' not in stats, stats
 
         request={'game_id':'tetris','player':'p','score':88,
                  'request_id':'same-logical-save-0001'}
@@ -2592,11 +2652,16 @@ run("backend-monotonic-update-and-json-errors", """
         assert repeated['id'] == saved['id']
         assert repeated['duplicate_request'] is True
         stats=client.get('/api/stats/tetris').get_json()
-        assert stats['records'] == 1, stats
+        assert stats['attempts'] == 1, stats
+        conflict={**request, 'extra':{'different':True}}
+        response=client.post('/api/scores',json=conflict)
+        assert response.status_code == 409, response.get_json()
 
     with tempfile.TemporaryDirectory() as temp_dir:
-        server.DB_PATH=Path(temp_dir)
-        client=server.app.test_client()
+        good_path=Path(temp_dir)/'working.db'
+        app=server.create_app({'TESTING':True, 'DB_PATH':str(good_path)})
+        app.extensions['game_store'].db_path=Path(temp_dir)
+        client=app.test_client()
         requests=[
             client.post('/api/scores',json={'game_id':'tetris','score':1}),
             client.get('/api/leaderboard/tetris'),
@@ -2631,6 +2696,275 @@ run("sokoban-confirmed-total-requires-ack", """
     g.retry_score_save(); g.draw()
     assert g._confirmed_total == g.total_score and g._pending_total is None
     pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 96. Local scores persist without Flask and recover an outbox ===")
+run("local-store-persists-and-recovers-outbox", """
+    import os, sqlite3, subprocess, sys, tempfile
+    from pathlib import Path
+    from game_service.local_backend import LocalBackendClient
+    from game_service.store import LocalGameStore
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root=Path(temp_dir); db=root/'games.db'; outbox=root/'pending.json'
+        first=LocalBackendClient(db_path=db, outbox_path=outbox)
+        saved=first.submit_score_reliable_async(
+            'tetris','p',123,request_id='local-save-request-0001').result()
+        assert saved['ok'] and saved['attempt_recorded']
+        first.close()
+        reopened=LocalBackendClient(db_path=db, outbox_path=outbox)
+        assert reopened.stats('tetris')['attempts'] == 1
+        assert reopened.leaderboard('tetris')[0]['score'] == 123
+        reopened.close()
+
+        class FailOnceStore(LocalGameStore):
+            def __init__(self, path):
+                super().__init__(path); self.fail=True
+            def record_score(self, *args, **kwargs):
+                if self.fail:
+                    self.fail=False
+                    raise sqlite3.OperationalError('locked')
+                return super().record_score(*args, **kwargs)
+        pending_db=root/'pending.db'; pending_outbox=root/'pending-saves.json'
+        failed=LocalBackendClient(
+            store=FailOnceStore(pending_db), outbox_path=pending_outbox)
+        result=failed.submit_score(
+            'snake','p',45,request_id='outbox-save-request-001')
+        assert not result['ok'] and result['retryable']
+        assert result['durable_pending'] is True
+        assert failed.failed_save_count() == 1 and pending_outbox.exists()
+        failed.close()
+        recovered=LocalBackendClient(
+            db_path=pending_db, outbox_path=pending_outbox)
+        assert recovered.failed_save_count() == 0
+        assert recovered.stats('snake')['attempts'] == 1
+        recovered.close()
+
+        cross_db=root/'cross-process.db'
+        cross_outbox=root/'cross-process.json'
+        payload={'game_id':'zuma','player':'restart','score':55,
+                 'extra':None,'replace':False,'submission_id':None,
+                 'request_id':'cross-process-request-001'}
+        code=("from pathlib import Path\\n"
+              "from game_service.local_backend import PersistentSaveOutbox\\n"
+              f"PersistentSaveOutbox(Path({str(cross_outbox)!r})).add("
+              f"{payload!r})\\n")
+        result=subprocess.run([sys.executable,'-c',code],
+                              capture_output=True,text=True,env=os.environ.copy())
+        assert result.returncode == 0, result.stderr
+        code=("from game_service.local_backend import LocalBackendClient\\n"
+              "from pathlib import Path\\n"
+              f"c=LocalBackendClient(Path({str(cross_db)!r}), "
+              f"outbox_path=Path({str(cross_outbox)!r}))\\n"
+              "assert c.stats('zuma')['attempts']==1\\n"
+              "assert c.failed_save_count()==0\\n")
+        result=subprocess.run([sys.executable,'-c',code],
+                              capture_output=True,text=True,env=os.environ.copy())
+        assert result.returncode == 0, result.stderr
+
+        legacy=root/'legacy.db'; migrated=root/'migrated.db'
+        with sqlite3.connect(legacy) as conn:
+            conn.execute('CREATE TABLE scores (id INTEGER PRIMARY KEY, '
+                         'game_id TEXT, player TEXT, score INTEGER, '
+                         'extra TEXT, created_at REAL)')
+            conn.execute("INSERT INTO scores VALUES "
+                         "(1,'zuma','old-player',321,NULL,1.0)")
+        legacy_before=legacy.read_bytes()
+        migrated_store=LocalGameStore(migrated, legacy_db_path=legacy)
+        assert migrated_store.stats('zuma')['attempts'] == 1
+        migrated_store.initialize()
+        assert migrated_store.stats('zuma')['attempts'] == 1
+        assert legacy.read_bytes() == legacy_before
+
+        embedded=root/'embedded-legacy.db'
+        with sqlite3.connect(embedded) as conn:
+            conn.execute('CREATE TABLE scores (id INTEGER PRIMARY KEY, '
+                         'game_id TEXT, player TEXT, score INTEGER, '
+                         'extra TEXT, created_at REAL)')
+            conn.execute("INSERT INTO scores VALUES "
+                         "(1,'snake','embedded',88,NULL,2.0)")
+        embedded_store=LocalGameStore(embedded)
+        assert embedded_store.stats('snake')['attempts'] == 1
+        assert embedded_store.migration_backup
+        assert embedded_store.migration_backup.is_file()
+        embedded_store.initialize()
+        assert embedded_store.stats('snake')['attempts'] == 1
+
+        corrupt=root/'corrupt.db'; corrupt.write_bytes(b'not sqlite data')
+        repaired=LocalBackendClient(
+            db_path=corrupt, outbox_path=root/'corrupt-outbox.json')
+        assert repaired.health() and repaired.recovery_notice
+        assert list(root.glob('corrupt.db.corrupt-*'))
+        assert repaired.submit_score('tetris','p',1)['ok']
+        repaired.close()
+
+        unusable=root/'database-is-directory'; unusable.mkdir()
+        degraded=LocalBackendClient(
+            db_path=unusable, outbox_path=root/'degraded-outbox.json')
+        assert not degraded.health() and degraded.initialization_error
+        result=degraded.submit_score(
+            'tetris','p',2,request_id='degraded-save-request-01')
+        assert not result['ok'] and result['durable_pending']
+        degraded.close()
+
+        future_db=root/'future.db'
+        with sqlite3.connect(future_db) as conn:
+            conn.execute('CREATE TABLE schema_meta '
+                         '(key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+            conn.execute("INSERT INTO schema_meta VALUES ('version','999')")
+        future_before=future_db.read_bytes()
+        from game_service.store import StoreError
+        try:
+            LocalGameStore(future_db)
+        except StoreError as exc:
+            assert exc.code == 'unsupported_schema'
+        else:
+            raise AssertionError('newer schema was silently overwritten')
+        assert future_db.read_bytes() == future_before
+""")
+
+# ===========================================================================
+print("\n=== 97. Overlay retry reuses one logical save ID ===")
+run("overlay-retry-reuses-logical-save-id", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from game_service.local_backend import completed_future
+    from client.common.ui import BaseGame, SAVE_FAILED, SAVE_SAVED
+    class Backend:
+        def __init__(self): self.ids=[]
+        def submit_score_reliable_async(self,*args,**kwargs):
+            self.ids.append(kwargs['request_id'])
+            if len(self.ids) == 1:
+                return completed_future({'ok':False,'code':'busy',
+                                         'retryable':True})
+            return completed_future({'ok':True,'id':7,
+                                     'attempt_recorded':True,
+                                     'new_personal_best':True})
+        def leaderboard_async(self,*a,**k): return completed_future([])
+    class Demo(BaseGame):
+        game_id='tetris'
+        def update(self,dt): pass
+        def draw(self): pass
+    backend=Backend(); game=Demo(260,260,backend=backend)
+    game.on_game_over(99); game.draw_gameover_overlay()
+    assert game.score_save_state == SAVE_FAILED
+    escape=pygame.event.Event(pygame.KEYDOWN,
+                              {'key':pygame.K_ESCAPE,'unicode':''})
+    game.handle_event(escape)
+    assert game.running and game._discard_unsaved_armed
+    game.handle_event(escape); assert not game.running
+    game.running=True; game._discard_unsaved_armed=False
+    game.retry_score_save(); game.draw_gameover_overlay()
+    assert game.score_save_state == SAVE_SAVED
+    assert len(backend.ids) == 2 and len(set(backend.ids)) == 1, backend.ids
+    assert game.score_save_message == '本局已记录 · 新纪录'
+
+    from client.common.network import BackendClient
+    class ToggleBackend(BackendClient):
+        def __init__(self):
+            super().__init__(); self.available=False; self.request_ids=[]
+        def submit_score(self,*args,**kwargs):
+            self.request_ids.append(kwargs['request_id'])
+            return ({'ok':True,'id':8} if self.available else None)
+        def leaderboard(self,*a,**k): return []
+    backend=ToggleBackend(); game=Demo(260,260,backend=backend)
+    game.on_game_over(50); assert backend.drain(timeout=3)
+    game.draw_gameover_overlay()
+    assert game.score_save_state == SAVE_FAILED
+    assert backend.failed_save_count() == 1
+    backend.available=True; game.retry_score_save()
+    assert backend.drain(timeout=3); game.draw_gameover_overlay()
+    assert game.score_save_state == SAVE_SAVED
+    assert backend.failed_save_count() == 0
+    assert len(set(backend.request_ids)) == 1, backend.request_ids
+    backend.close()
+    pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 98. 2048 consumes no-op commands and clears state-bound input ===")
+run("2048-noop-queue-and-state-boundaries", """
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import pygame; pygame.init()
+    from client.games.game_2048 import Game2048, Tile
+    class Stub:
+        def submit_score(self,*a,**k): return {'ok':True,'id':1}
+        def leaderboard(self,*a,**k): return []
+    game=Game2048(backend=Stub()); game._spawn_tile=lambda:False
+    game.tiles=[]; game.grid=[[None]*4 for _ in range(4)]
+    tile=Tile(value=2,row=0,col=1)
+    game.tiles=[tile]; game.grid[0][1]=tile; game.anim_t=0.0
+    game._queued_directions.extend(['up','left'])
+    game._tick_animations(1.0)
+    assert tile.col == 0 and game.anim_t == 0.0
+    assert not game._queued_directions
+    game._tick_animations(1.0)
+    game._move('down'); game._tick_animations(1.0)
+    assert (tile.row,tile.col) == (3,0), 'an old left command executed late'
+
+    won=Game2048(backend=Stub()); won._spawn_tile=lambda:False
+    won.tiles=[]; won.grid=[[None]*4 for _ in range(4)]
+    tile=Tile(value=2048,row=0,col=1)
+    won.tiles=[tile]; won.grid[0][1]=tile
+    won.won=True; won.anim_t=0.0; won._queued_directions.append('left')
+    won._tick_animations(1.0)
+    assert won.state == 'won' and not won._queued_directions
+    won._continue_after_win(); assert not won._queued_directions
+    pygame.quit()
+""")
+
+# ===========================================================================
+print("\n=== 99. Local attempts have complete idempotency and stable recency ===")
+run("local-store-idempotency-attempts-and-recency", """
+    import tempfile
+    from concurrent.futures import ThreadPoolExecutor
+    from pathlib import Path
+    from game_service.store import LocalGameStore, StoreError
+    with tempfile.TemporaryDirectory() as temp_dir:
+        store=LocalGameStore(Path(temp_dir)/'games.db')
+        request_id='complete-payload-request-01'
+        first=store.record_score('2048','p',100,extra={'won':True},
+                                 request_id=request_id)
+        replay=store.record_score('2048','p',100,extra={'won':True},
+                                  request_id=request_id)
+        assert replay['id'] == first['id'] and replay['duplicate_request']
+        conflicts = [
+            {'extra':{'won':False}},
+            {'extra':{'won':True}, 'replace':True},
+            {'extra':{'won':True}, 'submission_id':first['id']},
+        ]
+        for changes in conflicts:
+            try:
+                store.record_score('2048','p',100,
+                                   request_id=request_id, **changes)
+            except StoreError as exc:
+                assert exc.status == 409
+            else:
+                raise AssertionError(
+                    f'same request ID accepted different payload: {changes}')
+
+        before=store.recent()[0]['ts']
+        lower=store.record_score(
+            '2048','p',10,submission_id=first['id'],
+            request_id='lower-noop-request-0001')
+        after=store.recent()[0]['ts']
+        assert lower['no_op'] and before == after
+
+        same='concurrent-request-id-0001'
+        def write(_):
+            return store.record_score('snake','q',77,request_id=same)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results=list(pool.map(write, range(20)))
+        assert len({item['id'] for item in results}) == 1
+        assert store.stats('snake')['attempts'] == 1
+
+        high=store.record_score('sokoban','p',900,
+            request_id='sokoban-high-run-00001')
+        low=store.record_score('sokoban','p',100,
+            request_id='sokoban-low-run-000001')
+        assert high['new_personal_best'] and not low['new_personal_best']
+        assert store.stats('sokoban')['attempts'] == 2
+        assert store.leaderboard('sokoban')[0]['score'] == 900
 """)
 
 

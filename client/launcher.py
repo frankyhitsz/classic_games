@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import atexit
 import importlib
+import os
 import sys
 import time
 from pathlib import Path
@@ -19,6 +20,8 @@ from client.common.network import BackendClient  # noqa: E402
 from client.common.ui import (  # noqa: E402
                               COLORS, draw_card, draw_playroom_backdrop,
                               draw_leaderboard, draw_text, font)
+from game_service.catalog import GAME_BY_ID, GAMES  # noqa: E402
+from game_service.local_backend import LocalBackendClient  # noqa: E402
 
 WIDTH, HEIGHT = 980, 680
 LEADERBOARD_REFRESH_SECS = 4.0
@@ -26,14 +29,7 @@ HEALTH_REFRESH_SECS = 5.0
 
 
 def import_game_module(game_id: str):
-    module_map = {
-        "tetris": "client.games.tetris",
-        "snake": "client.games.snake",
-        "2048": "client.games.game_2048",
-        "sokoban": "client.games.sokoban",
-        "zuma": "client.games.zuma",
-    }
-    return importlib.import_module(module_map[game_id])
+    return importlib.import_module(GAME_BY_ID[game_id].module)
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +177,8 @@ def main():
     pygame.display.set_caption("经典小游戏 · 启动器")
     clock = pygame.time.Clock()
 
-    backend = BackendClient()
+    use_http = os.environ.get("GAMES_USE_HTTP") == "1"
+    backend = BackendClient() if use_http else LocalBackendClient()
     atexit.register(backend.close)
     # Paint the launcher immediately from local metadata while the localhost
     # health check runs in the background. A stopped backend can otherwise
@@ -189,13 +186,7 @@ def main():
     online = False
     last_health_check = time.monotonic()
     health_future = backend.health_async()
-    games_meta = [
-        {"id": "tetris", "name": "俄罗斯方块", "description": "经典下落方块消除游戏"},
-        {"id": "snake", "name": "贪吃蛇", "description": "控制蛇吃食物变长"},
-        {"id": "2048", "name": "2048", "description": "滑动合并相同数字"},
-        {"id": "sokoban", "name": "推箱子", "description": "把箱子推到目标点"},
-        {"id": "zuma", "name": "祖玛", "description": "发射彩球匹配消除"},
-    ]
+    games_meta = [game.public_dict() for game in GAMES]
 
     # ----- Layout: 5 cards in a single row + 2 leaderboard panels below
     cols = 5
@@ -319,24 +310,24 @@ def main():
         return screen_
 
     lb_title_map = {g["id"]: g["name"] for g in games_meta}
-    accent_map = {
-        "tetris": COLORS["game_tetris"],
-        "snake": COLORS["game_snake"],
-        "2048": COLORS["game_2048"],
-        "sokoban": COLORS["game_sokoban"],
-        "zuma": COLORS["game_zuma"],
-    }
-    tag_map = {
-        "tetris": "旋转与消行",
-        "snake": "追逐与成长",
-        "2048": "滑动与合并",
-        "sokoban": "规划与推动",
-        "zuma": "瞄准与连锁",
-    }
+    accent_map = {game.id: COLORS[game.color_key] for game in GAMES}
+    tag_map = {game.id: game.tag for game in GAMES}
     # Animated hover lift: each card has a current lift value that we
     # ease toward its target (1.0 on hover, 0.0 otherwise) every frame.
     card_lift = {g["id"]: 0.0 for g in games_meta}
-    launch_error = None
+    launch_error = (getattr(backend, "recovery_notice", None)
+                    or getattr(backend, "initialization_error", None))
+    quit_with_unsaved_armed = False
+
+    def exit_confirmed() -> bool:
+        nonlocal quit_with_unsaved_armed
+        durable = getattr(backend, "pending_saves_are_durable", False)
+        if durable or backend.failed_save_count() == 0:
+            return True
+        if quit_with_unsaved_armed:
+            return True
+        quit_with_unsaved_armed = True
+        return False
 
     running = True
     mouse_pos = pygame.mouse.get_pos()
@@ -372,8 +363,10 @@ def main():
         launched_this_frame = False
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                running = False
-                break
+                if exit_confirmed():
+                    running = False
+                    break
+                continue
             elif event.type == pygame.MOUSEMOTION:
                 mouse_pos = event.pos
                 continue
@@ -381,7 +374,7 @@ def main():
                 if event.key == pygame.K_ESCAPE:
                     if editing_player:
                         editing_player = False
-                    else:
+                    elif exit_confirmed():
                         running = False
                     continue
                 elif editing_player:
@@ -395,6 +388,7 @@ def main():
                     continue
                 elif event.key == pygame.K_s and backend.failed_save_count():
                     backend.retry_failed_saves()
+                    quit_with_unsaved_armed = False
                     continue
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if player_input_rect.collidepoint(event.pos):
@@ -526,7 +520,7 @@ def main():
                       center=True)
 
         # ---- Leaderboards ----------------------------------------------
-        lb_title = f"{lb_title_map.get(current_lb_game, '?')} · Top 10"
+        lb_title = f"{lb_title_map.get(current_lb_game, '?')} · 本机最佳"
         draw_leaderboard(screen, lb_rect,
                          lb_cache.get(current_lb_game, []),
                          title=lb_title)
@@ -540,7 +534,8 @@ def main():
                          game_names=lb_title_map)
 
         draw_text(screen,
-                  f"Esc 退出 · 成绩服务: {'可用' if online else '不可用'} · "
+                  f"Esc 退出 · {'API 成绩服务' if use_http else '本机记录'}: "
+                  f"{'可用' if online else '不可用'} · "
                   f"玩家: {player.strip() or 'guest'}",
                   (WIDTH // 2, HEIGHT - 14), size=11,
                   color=COLORS["text_dim"], center=True)
@@ -550,7 +545,9 @@ def main():
         failed_saves = backend.failed_save_count()
         if failed_saves:
             draw_text(screen,
-                      f"有 {failed_saves} 条成绩尚未保存 · 按 S 重试",
+                      ("成绩未落盘 · 再次退出将放弃"
+                       if quit_with_unsaved_armed
+                       else f"有 {failed_saves} 条成绩尚未保存 · 按 S 重试"),
                       (WIDTH // 2, HEIGHT - 34), size=12,
                       color=COLORS["danger"], center=True)
 

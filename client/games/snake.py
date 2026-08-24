@@ -89,9 +89,13 @@ class Snake(BaseGame):
         # for ordinary low-frame-rate updates to produce every grid step.
         self.move_timer = min(self.move_timer, 4.0 * interval)
         steps = 0
-        while (self.state == "playing"
-               and self.move_timer >= interval
-               and steps < (1 if stalled else 4)):
+        while self.state == "playing" and steps < (1 if stalled else 4):
+            # Eating can raise move_speed inside _step(); derive the next
+            # interval from the new level instead of keeping a stale value for
+            # the rest of this catch-up frame.
+            interval = 1.0 / self.move_speed
+            if self.move_timer < interval:
+                break
             self.move_timer -= interval
             self._step()
             steps += 1
