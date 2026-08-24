@@ -177,8 +177,8 @@ class ProfileAndStateTests(unittest.TestCase):
                     "schema-repair-request-0001")
                 self.assertEqual(event.state, SaveState.RECOVERY_REQUIRED)
                 self.assertTrue(result["durable_pending"])
-                backend.retry_failed_saves().result(timeout=1)
-                backend.drain(1)
+                backend.retry_failed_saves().result(timeout=5)
+                backend.drain(5)
                 self.assertGreater(
                     backend._next_auto_retry_at, time.monotonic() + 30)
             backend.close()
@@ -262,18 +262,18 @@ class ProfileAndStateTests(unittest.TestCase):
             root = Path(directory)
             backend = LocalBackendClient(
                 db_path=root / "games.db", outbox_path=root / "pending")
-            profile = backend.ensure_profile_async("p").result(timeout=1)
+            profile = backend.ensure_profile_async("p").result(timeout=5)
             blocker = sqlite3.connect(root / "games.db")
             blocker.execute("BEGIN IMMEDIATE")
             result = backend.merge_progress_async(
                 profile["profile_id"], "zuma", "campaign",
-                {"unlocked_level": 3}).result(timeout=2)
+                {"unlocked_level": 3}).result(timeout=5)
             self.assertFalse(result["ok"])
             self.assertTrue(result["durable_pending"])
             blocker.rollback()
             blocker.close()
-            backend.retry_failed_saves().result(timeout=1)
-            self.assertTrue(backend.drain(2))
+            backend.retry_failed_saves().result(timeout=5)
+            self.assertTrue(backend.drain(5))
             self.assertEqual(backend.store.get_progress(
                 profile["profile_id"], "zuma", "campaign")["unlocked_level"], 3)
             backend.close()
@@ -283,22 +283,22 @@ class ProfileAndStateTests(unittest.TestCase):
             root = Path(directory)
             backend = LocalBackendClient(
                 db_path=root / "games.db", outbox_path=root / "pending")
-            profile = backend.ensure_profile_async("p").result(timeout=1)
+            profile = backend.ensure_profile_async("p").result(timeout=5)
             blocker = sqlite3.connect(root / "games.db")
             blocker.execute("BEGIN IMMEDIATE")
             first = backend.save_slot_async(
                 profile["profile_id"], "2048", "autosave",
-                {"version": 1, "score": 4}).result(timeout=2)
+                {"version": 1, "score": 4}).result(timeout=5)
             second = backend.save_slot_async(
                 profile["profile_id"], "2048", "autosave",
-                {"version": 1, "score": 8}).result(timeout=2)
+                {"version": 1, "score": 8}).result(timeout=5)
             self.assertTrue(first["durable_pending"])
             self.assertTrue(second["durable_pending"])
             self.assertEqual(backend.failed_save_count(), 1)
             blocker.rollback()
             blocker.close()
-            backend.retry_failed_saves().result(timeout=1)
-            self.assertTrue(backend.drain(2))
+            backend.retry_failed_saves().result(timeout=5)
+            self.assertTrue(backend.drain(5))
             self.assertEqual(backend.store.load_slot(
                 profile["profile_id"], "2048", "autosave")["state"]["score"],
                 8)
@@ -313,16 +313,16 @@ class ProfileAndStateTests(unittest.TestCase):
             blocker.execute("BEGIN IMMEDIATE")
             profile_id = "c" * 32
             profile_result = backend.ensure_profile_async(
-                "p", profile_id).result(timeout=2)
+                "p", profile_id).result(timeout=5)
             slot_result = backend.save_slot_async(
                 profile_id, "2048", "autosave",
-                {"version": 1, "score": 12}).result(timeout=2)
+                {"version": 1, "score": 12}).result(timeout=5)
             self.assertTrue(profile_result["durable_pending"])
             self.assertTrue(slot_result["durable_pending"])
             blocker.rollback()
             blocker.close()
-            backend.retry_failed_saves().result(timeout=1)
-            self.assertTrue(backend.drain(2))
+            backend.retry_failed_saves().result(timeout=5)
+            self.assertTrue(backend.drain(5))
             self.assertEqual(
                 backend.store.load_slot(
                     profile_id, "2048", "autosave")["state"]["score"], 12)

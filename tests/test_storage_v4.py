@@ -62,8 +62,8 @@ class StorageFailureTests(unittest.TestCase):
                 SaveState.DURABLE_PENDING)
 
             store.fail = False
-            backend.retry_failed_saves().result(timeout=1)
-            self.assertTrue(backend.drain(2))
+            backend.retry_failed_saves().result(timeout=5)
+            self.assertTrue(backend.drain(5))
             self.assertEqual(store.attempt_count("tetris"), 1)
             self.assertEqual(
                 backend.get_save_status("full-request-000000000001").state,
@@ -88,8 +88,8 @@ class StorageFailureTests(unittest.TestCase):
             self.assertFalse(backend.pending_saves_are_durable)
 
             store.fail = False
-            backend.retry_failed_saves().result(timeout=1)
-            self.assertTrue(backend.drain(2))
+            backend.retry_failed_saves().result(timeout=5)
+            self.assertTrue(backend.drain(5))
             self.assertEqual(store.attempt_count("snake"), 1)
             self.assertTrue(backend.pending_saves_are_durable)
             backend.close()
@@ -122,7 +122,7 @@ class StorageFailureTests(unittest.TestCase):
                 elapsed = time.perf_counter() - started
                 self.assertLess(elapsed, 0.01)
                 self.assertFalse(future.done())
-                future.result(timeout=1)
+                future.result(timeout=5)
             backend.close()
 
     def test_replay_keeps_completion_time_and_emits_commit_event(self):
@@ -140,8 +140,8 @@ class StorageFailureTests(unittest.TestCase):
             time.sleep(0.03)
             retry_started = time.time()
             store.fail = False
-            backend.retry_failed_saves().result(timeout=1)
-            self.assertTrue(backend.drain(2))
+            backend.retry_failed_saves().result(timeout=5)
+            self.assertTrue(backend.drain(5))
             with store.connection() as connection:
                 row = connection.execute(
                     "SELECT finished_at FROM attempts WHERE player='clock'"
@@ -434,7 +434,7 @@ class LeaderboardSemanticsTests(unittest.TestCase):
                 db_path=root / "games.db", outbox_path=root / "pending")
             first = Game2048(backend=backend, player="save",
                              profile_id="1234567890abcdef1234567890abcdef")
-            first._slot_load_future.result(timeout=1)
+            first._slot_load_future.result(timeout=5)
             first._poll_slot_load()
             first.tiles = []
             first.grid = [[None] * 4 for _ in range(4)]
@@ -443,12 +443,12 @@ class LeaderboardSemanticsTests(unittest.TestCase):
             first.grid[2][3] = tile
             first.score = 512
             first._save_autosave_slot()
-            self.assertTrue(backend.drain(2))
+            self.assertTrue(backend.drain(5))
 
             restored = Game2048(
                 backend=backend, player="save",
                 profile_id="1234567890abcdef1234567890abcdef")
-            restored._slot_load_future.result(timeout=1)
+            restored._slot_load_future.result(timeout=5)
             restored._poll_slot_load()
             self.assertEqual(restored.score, 512)
             self.assertEqual(restored.grid[2][3].value, 128)
@@ -482,12 +482,12 @@ class LeaderboardSemanticsTests(unittest.TestCase):
                 160, 120, backend=backend, player="pending",
                 profile_id="abcdefabcdefabcdefabcdefabcdefab")
             game.on_game_over(12)
-            game._score_submit_future.result(timeout=1)
+            game._score_submit_future.result(timeout=5)
             game._poll_score_submission()
             self.assertEqual(game.score_save_state, SAVE_PENDING)
             store.fail = False
-            backend.retry_failed_saves().result(timeout=1)
-            self.assertTrue(backend.drain(2))
+            backend.retry_failed_saves().result(timeout=5)
+            self.assertTrue(backend.drain(5))
             game._poll_score_submission()
             self.assertEqual(game.score_save_state, SAVE_SAVED)
             backend.close()

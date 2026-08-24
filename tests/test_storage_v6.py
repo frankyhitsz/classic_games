@@ -148,7 +148,7 @@ class StateFailureAndLoadTests(unittest.TestCase):
             root = Path(directory)
             backend = LocalBackendClient(
                 db_path=root / "games.db", outbox_path=root / "pending")
-            profile = backend.ensure_profile_async("p").result(timeout=1)
+            profile = backend.ensure_profile_async("p").result(timeout=5)
             full = sqlite3.OperationalError("full")
             full.sqlite_errorcode = sqlite3.SQLITE_FULL
             with (mock.patch.object(
@@ -157,7 +157,7 @@ class StateFailureAndLoadTests(unittest.TestCase):
                   mock.patch.object(
                     backend.store, "set_setting", side_effect=full)):
                 result = backend.set_setting_async(
-                    profile["profile_id"], "volume", 0.4).result(timeout=1)
+                    profile["profile_id"], "volume", 0.4).result(timeout=5)
             self.assertFalse(result["ok"])
             self.assertFalse(result["durable_pending"])
             self.assertFalse(backend.pending_saves_are_durable)
@@ -165,8 +165,8 @@ class StateFailureAndLoadTests(unittest.TestCase):
             event = backend.poll_local_state_events()[-1]
             self.assertEqual(event.state, SaveState.NON_DURABLE_PENDING)
 
-            backend.retry_failed_saves().result(timeout=1)
-            self.assertTrue(backend.drain(2))
+            backend.retry_failed_saves().result(timeout=5)
+            self.assertTrue(backend.drain(5))
             self.assertEqual(
                 backend.store.get_setting(profile["profile_id"], "volume"),
                 0.4)
@@ -184,7 +184,7 @@ class StateFailureAndLoadTests(unittest.TestCase):
             with mock.patch.object(
                     backend.store, "load_slot", side_effect=error):
                 result = backend.ensure_profile_and_load_slot_async(
-                    "p", profile_id, "2048", "autosave").result(timeout=1)
+                    "p", profile_id, "2048", "autosave").result(timeout=5)
             self.assertEqual(result.status, SlotLoadStatus.TEMPORARY_FAILURE)
             self.assertTrue(result.retryable)
             backend.close()

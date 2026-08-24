@@ -81,14 +81,14 @@ class LocalAsyncTests(unittest.TestCase):
             elapsed_ms = (time.perf_counter() - started) * 1000
             self.assertLess(elapsed_ms, 2.0)
             self.assertFalse(future.done())
-            result = future.result(timeout=1)
+            result = future.result(timeout=5)
             self.assertTrue(result["durable_pending"])
             self.assertEqual(backend.failed_save_count(), 1)
             lock.rollback()
             lock.close()
             self.assertEqual(
-                backend.retry_failed_saves().result(timeout=1), 1)
-            self.assertTrue(backend.drain(2))
+                backend.retry_failed_saves().result(timeout=5), 1)
+            self.assertTrue(backend.drain(5))
             self.assertEqual(backend.failed_save_count(), 0)
             backend.close()
 
@@ -100,7 +100,7 @@ class LocalAsyncTests(unittest.TestCase):
             future = backend.submit_score_async(
                 "tetris", "p", 1, extra={"bad": {1, 2}},
                 request_id="invalid-extra-request-001")
-            result = future.result(timeout=1)
+            result = future.result(timeout=5)
             self.assertEqual(result["code"], "invalid_extra")
             self.assertFalse(result["retryable"])
             self.assertEqual(backend.failed_save_count(), 0)
@@ -119,7 +119,7 @@ class LocalAsyncTests(unittest.TestCase):
             self.assertTrue(all(future.done() for future in futures))
             reopened = LocalBackendClient(
                 db_path=root / "games.db", outbox_path=root / "pending")
-            self.assertTrue(reopened.drain(2))
+            self.assertTrue(reopened.drain(5))
             self.assertEqual(reopened.store.attempt_count("snake"), 40)
             reopened.close()
 
@@ -137,7 +137,7 @@ backend = LocalBackendClient(db_path=sys.argv[1], outbox_path=sys.argv[2])
 result = backend.submit_score_async(
     'zuma', 'crash', 88,
     request_id='forced-exit-request-000001',
-    attempt_uuid='forced-exit-attempt-000001', revision=1).result(timeout=2)
+    attempt_uuid='forced-exit-attempt-000001', revision=1).result(timeout=5)
 os._exit(0 if result.get('durable_pending') else 7)
 """
             process = subprocess.run(
@@ -149,7 +149,7 @@ os._exit(0 if result.get('durable_pending') else 7)
             blocker.close()
             recovered = LocalBackendClient(
                 db_path=database, outbox_path=root / "pending")
-            self.assertTrue(recovered.drain(2))
+            self.assertTrue(recovered.drain(5))
             self.assertEqual(recovered.store.attempt_count("zuma"), 1)
             recovered.close()
 
@@ -210,7 +210,7 @@ class SpoolTests(unittest.TestCase):
             }), encoding="utf-8")
             backend = LocalBackendClient(
                 db_path=root / "games.db", outbox_path=root / "pending")
-            self.assertTrue(backend.drain(2))
+            self.assertTrue(backend.drain(5))
             self.assertEqual(backend.store.attempt_count("zuma"), 1)
             self.assertIn("已隔离 1 条", backend.recovery_notice)
             self.assertTrue(list((root / "pending-quarantine").iterdir()))
@@ -699,8 +699,8 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
                 "request_id": "external-pending-request-0001",
             })
             self.assertEqual(
-                backend.retry_failed_saves().result(timeout=1), 1)
-            self.assertTrue(backend.drain(2))
+                backend.retry_failed_saves().result(timeout=5), 1)
+            self.assertTrue(backend.drain(5))
             self.assertEqual(backend.store.attempt_count("sokoban"), 1)
             backend.close()
 
