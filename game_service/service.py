@@ -29,6 +29,7 @@ class SaveState(str, Enum):
     SAVING = "saving"
     COMMITTED = "committed"
     DURABLE_PENDING = "durable_pending"
+    NON_DURABLE_PENDING = "non_durable_pending"
     RECOVERY_REQUIRED = "recovery_required"
     QUARANTINED = "quarantined"
     PERMANENT_FAILURE = "permanent_failure"
@@ -46,6 +47,37 @@ class SaveEvent:
         value = asdict(self)
         value["state"] = self.state.value
         return value
+
+
+@dataclass(frozen=True)
+class LocalStateEvent:
+    key: str
+    kind: str
+    logical_revision: int
+    state: SaveState
+    result: dict
+
+    def to_dict(self) -> dict[str, Any]:
+        value = asdict(self)
+        value["state"] = self.state.value
+        return value
+
+
+class SlotLoadStatus(str, Enum):
+    LOADED = "loaded"
+    NO_SLOT = "no_slot"
+    TEMPORARY_FAILURE = "temporary_failure"
+    PROFILE_PENDING = "profile_pending"
+    CORRUPT = "corrupt"
+
+
+@dataclass(frozen=True)
+class SlotLoadResult:
+    status: SlotLoadStatus
+    slot: Optional[dict] = None
+    error_code: Optional[str] = None
+    error: Optional[str] = None
+    retryable: bool = False
 
 
 @dataclass
@@ -159,10 +191,19 @@ class GameDataService(Protocol):
             ruleset_version: Optional[str] = None): ...
 
     def save_slot_async(
-            self, profile_id: str, game_id: str, slot_id: str, state): ...
+            self, profile_id: str, game_id: str, slot_id: str, state,
+            ruleset_version: Optional[str] = None): ...
 
     def load_slot_async(
             self, profile_id: str, game_id: str, slot_id: str): ...
+
+    def ensure_profile_and_load_slot_async(
+            self, display_name: str, profile_id: str,
+            game_id: str, slot_id: str): ...
+
+    def quarantine_slot_async(
+            self, profile_id: str, game_id: str,
+            slot_id: str, reason: str): ...
 
     def submit_score_reliable_async(
             self, game_id: str, player: str, score: int, *, extra=None,
@@ -180,6 +221,10 @@ class GameDataService(Protocol):
     def poll_pending_saves(self, interval_seconds: float = 2.0) -> int: ...
 
     def poll_save_events(self) -> list[SaveEvent]: ...
+
+    def poll_local_state_events(self) -> list[LocalStateEvent]: ...
+
+    def get_local_state_status(self, key: str) -> Optional[LocalStateEvent]: ...
 
     def get_save_status(self, request_id: str) -> Optional[SaveEvent]: ...
 

@@ -389,6 +389,17 @@ class Game2048SlotTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(game.slot_load_state, "loading")
 
+    def test_slot_load_timeout_stays_gated_and_can_retry(self):
+        from client.games.game_2048 import Game2048
+        backend = self.Backend(pending=True)
+        with mock.patch(
+                "client.games.game_2048.pygame.time.get_ticks",
+                side_effect=[0, 9000]):
+            game = Game2048(backend=backend, profile_id="f" * 32)
+            game._poll_slot_load()
+        self.assertEqual(game.slot_load_state, "failed")
+        self.assertIn("超时", game.slot_load_error)
+
     def test_v2_slot_restores_attempt_and_terminal_slot_does_not_resume(self):
         from client.games.game_2048 import Game2048
         profile_id = "b" * 32
@@ -408,7 +419,8 @@ class Game2048SlotTests(unittest.TestCase):
         game._poll_slot_load()
         self.assertEqual(game._score_attempt_uuid, state["attempt_uuid"])
         self.assertEqual(game.attempt_context.revision, 3)
-        self.assertEqual(game.score_submission_id, 7)
+        self.assertIsNone(game.score_submission_id)
+        self.assertIsNone(game._score_submission_id)
 
         terminal = {**state, "game_state": "gameover"}
         terminal_game = Game2048(

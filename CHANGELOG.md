@@ -1,5 +1,16 @@
 # 更新记录
 
+## 未发布
+
+- 本机状态日志升级为 schema 2：同 key 跨进程加锁、按 logical revision 排序、CAS 删除，
+  并冻结 ruleset；旧 schema 1 日志可原子升级。
+- 日志与 SQLite 同时不可写时保留最新内存状态，退出前提示；后台补写通过
+  `LocalStateEvent` 回传最终结果。
+- 2048 自动存档升级为 schema 3，不再持久化数据库 row ID；临时读取失败、超时和语义损坏
+  保持输入门禁，并提供重试或确认新开。
+- 档案异步操作和排队启动加入 generation/profile token；guest 与 anonymous 统一为默认身份。
+- 状态表快速检查增加 PK/UNIQUE 与外键完整性；档案归一化碰撞会合并有效子状态并保留证据。
+
 ## 0.6.0
 
 - 待保存成绩升级为 schema 2，旧版显示名档案会保留原件并转换为稳定 UUID。

@@ -27,7 +27,8 @@ from typing import List, Optional, Tuple
 
 import pygame
 
-from game_service.service import GameDataService
+from game_service.catalog import GAME_BY_ID
+from game_service.service import GameDataService, SaveState
 from client.common.ui import (COLORS, BaseGame, Button, draw_gradient_bg,
                               draw_panel, draw_text)
 
@@ -191,21 +192,55 @@ class Zuma(BaseGame):
                          profile_id=profile_id)
         self.unlocked_level = 1
         self.saved_high_score = 0
+        self._progress_generation = 0
         self._progress_future = None
+        self._progress_write_future = None
+        self.progress_save_message = ""
         self.reset()
         load_progress = getattr(self.backend, "get_progress_async", None)
         if callable(load_progress):
-            self._progress_future = load_progress(
-                self.profile_id, self.game_id, "campaign", {})
+            self._progress_future = (
+                load_progress(
+                    self.profile_id, self.game_id, "campaign", {}),
+                self._progress_generation)
 
     def _poll_progress(self) -> None:
-        future = self._progress_future
-        if future is None or not future.done():
+        write = self._progress_write_future
+        if write is not None and write[0].done():
+            self._progress_write_future = None
+            try:
+                result = write[0].result()
+            except Exception:  # noqa: BLE001
+                self.progress_save_message = "进度暂时未保存"
+            else:
+                if isinstance(result, dict) and result.get("ok") is False:
+                    self.progress_save_message = (
+                        "进度已进入待写入队列" if result.get("durable_pending")
+                        else "进度暂时未保存")
+                elif isinstance(result, dict):
+                    self._apply_progress(result, write[1])
+                    self.progress_save_message = ""
+        if self.progress_save_message:
+            getter = getattr(self.backend, "get_local_state_status", None)
+            if callable(getter):
+                ruleset = GAME_BY_ID[self.game_id].ruleset_version
+                event = getter(
+                    f"progress:{self.profile_id}:{self.game_id}:"
+                    f"{ruleset}:campaign")
+                if getattr(event, "state", None) == SaveState.COMMITTED:
+                    self.progress_save_message = ""
+        pending = self._progress_future
+        if pending is None or not pending[0].done():
             return
         self._progress_future = None
         try:
-            value = future.result()
+            value = pending[0].result()
         except Exception:  # noqa: BLE001 - a new run remains playable
+            return
+        self._apply_progress(value, pending[1])
+
+    def _apply_progress(self, value, generation: int) -> None:
+        if generation != self._progress_generation:
             return
         if not isinstance(value, dict):
             return
@@ -370,14 +405,24 @@ class Zuma(BaseGame):
             save_progress = getattr(self.backend, "merge_progress_async", None)
             if callable(save_progress):
                 try:
-                    save_progress(
-                        self.profile_id, self.game_id, "campaign",
-                        {"unlocked_level": min(
+                    self._progress_generation += 1
+                    generation = self._progress_generation
+                    progress_value = {
+                        "unlocked_level": min(
                             len(ZUMA_LEVELS), self.level_idx + 2),
-                         "highest_score": self.score,
-                         "completed_all": completed_all})
+                        "highest_score": self.score,
+                        "completed_all": completed_all}
+                    self.unlocked_level = max(
+                        self.unlocked_level,
+                        progress_value["unlocked_level"])
+                    self.saved_high_score = max(
+                        self.saved_high_score,
+                        progress_value["highest_score"])
+                    self._progress_write_future = (save_progress(
+                        self.profile_id, self.game_id, "campaign",
+                        progress_value), generation)
                 except Exception:  # noqa: BLE001 - progress is non-critical
-                    pass
+                    self.progress_save_message = "进度暂时未保存"
             if completed_all:
                 self.on_win(self.score, extra=result)
             else:
@@ -813,6 +858,10 @@ class Zuma(BaseGame):
                   f"得分 {self.score} · 已解锁 {self.unlocked_level}/{len(ZUMA_LEVELS)}",
                   (left_hud.x + 13, left_hud.y + 28), size=12,
                   color=COLORS["text_dim"])
+        if self.progress_save_message:
+            draw_text(self.screen, self.progress_save_message,
+                      (WIDTH // 2, 70), size=11,
+                      color=COLORS["danger"], center=True)
         # HUD — right-aligned stats so they don't overflow the window
         # even with long combo counts.
         from client.common.ui import font as _font

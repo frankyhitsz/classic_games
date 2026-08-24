@@ -260,11 +260,13 @@ class MigrationAndRepositoryTests(unittest.TestCase):
             profile_id = profile["profile_id"]
             self.assertNotEqual(profile_id, "玩家甲")
             store.set_setting(profile_id, "volume", 0.5)
-            store.set_progress(profile_id, "sokoban", "campaign", {"level": 3})
+            store.set_progress(
+                profile_id, "sokoban", "campaign", {"unlocked_level": 3})
             store.save_slot(profile_id, "2048", "autosave", {"score": 64})
             self.assertEqual(store.get_setting(profile_id, "volume"), 0.5)
             self.assertEqual(
-                store.get_progress(profile_id, "sokoban", "campaign")["level"], 3)
+                store.get_progress(
+                    profile_id, "sokoban", "campaign")["unlocked_level"], 3)
             self.assertEqual(
                 store.load_slot(profile_id, "2048", "autosave")["state"]["score"],
                 64)
@@ -431,6 +433,8 @@ class LeaderboardSemanticsTests(unittest.TestCase):
                 db_path=root / "games.db", outbox_path=root / "pending")
             first = Game2048(backend=backend, player="save",
                              profile_id="1234567890abcdef1234567890abcdef")
+            first._slot_load_future.result(timeout=1)
+            first._poll_slot_load()
             first.tiles = []
             first.grid = [[None] * 4 for _ in range(4)]
             tile = Tile(value=128, row=2, col=3)

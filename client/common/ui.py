@@ -543,6 +543,16 @@ class BaseGame(abc.ABC):
         unsafe = (self.score_save_state == SAVE_SAVING
                   or (self.score_save_state == SAVE_FAILED
                       and not self.score_save_durable_pending))
+        if self.backend is not None:
+            failed_count = getattr(self.backend, "failed_save_count", None)
+            durable = getattr(
+                self.backend, "pending_saves_are_durable", True)
+            try:
+                unsafe = unsafe or (
+                    callable(failed_count) and failed_count() > 0
+                    and not durable)
+            except (OSError, RuntimeError):
+                unsafe = True
         now = pygame.time.get_ticks()
         confirmation_active = (
             self._destructive_action_armed == name
@@ -671,6 +681,18 @@ class BaseGame(abc.ABC):
     def _finish_score_submission(self, result, payload, generation: int,
                                  exception_text: Optional[str] = None) -> None:
         if generation != self._score_submit_generation:
+            return
+        if (isinstance(result, dict)
+                and result.get("code") == "submission_not_found"
+                and payload.get("submission_id") is not None):
+            # Integer SQLite row IDs are only hints from older local saves.
+            # The attempt UUID is the durable identity across restores and
+            # database imports, so retry once without the stale hint.
+            self._score_submission_id = None
+            self._submit_result_score(
+                payload["score"], payload.get("extra"),
+                request_id=payload["request_id"],
+                revision=payload["revision"])
             return
         row_id, error = parse_score_response(result)
         if row_id is None:

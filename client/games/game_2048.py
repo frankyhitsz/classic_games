@@ -33,7 +33,8 @@ from client.common.ui import (COLORS, SAVE_PENDING, SAVE_SAVING, BaseGame, Butto
                               draw_gradient_bg, draw_text, ease_out_back,
                               ease_out_cubic)
 from game_service.mutation import MAX_SCORE
-from game_service.service import GameDataService
+from game_service.service import (GameDataService, SaveState, SlotLoadResult,
+                                  SlotLoadStatus)
 
 GRID = 4
 TILE = 90
@@ -49,6 +50,7 @@ EMPTY_CELL_COLOR = (240, 245, 252)
 ANIM_DURATION = 0.13   # slide
 SPAWN_DURATION = 0.18  # scale-up for newly spawned tile
 MERGE_DURATION = 0.22  # pop after a merge
+SLOT_LOAD_TIMEOUT_SECONDS = 8.0
 
 
 def tile_color(value: int):
@@ -110,22 +112,56 @@ class Game2048(BaseGame):
                          profile_id=profile_id)
         self._slot_load_future = None
         self._slot_save_future = None
+        self._slot_quarantine_future = None
         self.slot_load_state = "ready"
+        self.slot_load_error: Optional[str] = None
         self.slot_save_error: Optional[str] = None
+        self._slot_save_pending = False
+        self._slot_revision = 0
+        self._new_game_confirm_deadline = 0
+        self._slot_load_started_at = 0.0
         self._initializing_board = True
         self.reset()
         self._initializing_board = False
+        self._begin_slot_load()
+
+    def _begin_slot_load(self) -> None:
         ensure_and_load = getattr(
             self.backend, "ensure_profile_and_load_slot_async", None)
         load_slot = getattr(self.backend, "load_slot_async", None)
-        if callable(ensure_and_load):
-            self._slot_load_future = ensure_and_load(
-                self.player, self.profile_id, self.game_id, "autosave")
-        elif callable(load_slot):
-            self._slot_load_future = load_slot(
-                self.profile_id, self.game_id, "autosave")
+        try:
+            if callable(ensure_and_load):
+                self._slot_load_future = ensure_and_load(
+                    self.player, self.profile_id, self.game_id, "autosave")
+            elif callable(load_slot):
+                self._slot_load_future = load_slot(
+                    self.profile_id, self.game_id, "autosave")
+            else:
+                self._slot_load_future = None
+        except Exception as exc:  # noqa: BLE001
+            self._slot_load_future = None
+            self.slot_load_state = "failed"
+            self.slot_load_error = f"自动存档读取失败：{exc}"
+            return
         if self._slot_load_future is not None:
             self.slot_load_state = "loading"
+            self.slot_load_error = None
+            self._slot_load_started_at = pygame.time.get_ticks() / 1000.0
+
+    def _retry_slot_load(self) -> None:
+        if self._slot_load_future is None:
+            self._begin_slot_load()
+
+    def _confirm_new_game_after_load_failure(self) -> None:
+        now = pygame.time.get_ticks()
+        if now > self._new_game_confirm_deadline:
+            self._new_game_confirm_deadline = now + 4000
+            self.slot_load_error = "再按一次 N 确认新开一局；原存档不会被静默覆盖"
+            return
+        self._new_game_confirm_deadline = 0
+        self.slot_load_state = "ready"
+        self.slot_load_error = None
+        self.reset()
 
     # ------------------------------------------------------------------
     def reset(self):
@@ -374,18 +410,21 @@ class Game2048(BaseGame):
                 t.merge_pop = max(0.0, t.merge_pop - dt / MERGE_DURATION)
 
     def _save_autosave_slot(self) -> None:
+        if self.slot_load_state != "ready":
+            return
         save_slot = getattr(self.backend, "save_slot_async", None)
         if not callable(save_slot):
             return
+        self._slot_revision += 1
         state = {
-            "version": 2,
+            "version": 3,
             "game_state": self.state,
             "score": self.score,
             "won": self.won,
             "won_announced": self._won_announced,
             "attempt_uuid": self._score_attempt_uuid,
-            "revision": self.attempt_context.revision,
-            "submission_id": self._score_submission_id,
+            "attempt_revision": self.attempt_context.revision,
+            "slot_revision": self._slot_revision,
             "confirmed_score": self.submitted_score,
             "grid": [[self.grid[row][col].value
                       if self.grid[row][col] is not None else 0
@@ -393,12 +432,14 @@ class Game2048(BaseGame):
         }
         try:
             self._slot_save_future = save_slot(
-                self.profile_id, self.game_id, "autosave", state)
+                self.profile_id, self.game_id, "autosave", state,
+                self.attempt_context.ruleset_version)
         except Exception:  # noqa: BLE001 - score play remains available
             self._slot_save_future = None
             self.slot_save_error = "自动存档暂时未保存"
 
     def _poll_slot_save(self) -> None:
+        self._poll_slot_save_status()
         future = self._slot_save_future
         if future is None or not future.done():
             return
@@ -409,23 +450,73 @@ class Game2048(BaseGame):
             self.slot_save_error = "自动存档暂时未保存"
         else:
             if isinstance(result, dict) and result.get("ok") is False:
-                self.slot_save_error = str(
-                    result.get("error") or "自动存档暂时未保存")
+                if result.get("durable_pending"):
+                    self._slot_save_pending = True
+                    self.slot_save_error = "自动存档已进入待写入队列"
+                else:
+                    self._slot_save_pending = False
+                    self.slot_save_error = str(
+                        result.get("error") or "自动存档暂时未保存")
             else:
+                self._slot_save_pending = False
                 self.slot_save_error = None
+        self._poll_slot_save_status()
+
+    def _poll_slot_save_status(self) -> None:
+        if not self._slot_save_pending:
+            return
+        getter = getattr(self.backend, "get_local_state_status", None)
+        if not callable(getter):
+            return
+        key = f"slot:{self.profile_id}:{self.game_id}:autosave"
+        event = getter(key)
+        state = getattr(event, "state", None)
+        if state == SaveState.COMMITTED:
+            self._slot_save_pending = False
+            self.slot_save_error = None
+        elif state in (SaveState.PERMANENT_FAILURE, SaveState.QUARANTINED):
+            self._slot_save_pending = False
+            result = getattr(event, "result", {})
+            self.slot_save_error = str(
+                result.get("error") or "自动存档无法恢复")
 
     def _poll_slot_load(self) -> None:
         future = self._slot_load_future
-        if future is None or not future.done():
+        if future is None:
+            return
+        elapsed = (pygame.time.get_ticks() / 1000.0
+                   - self._slot_load_started_at)
+        if not future.done() and elapsed >= SLOT_LOAD_TIMEOUT_SECONDS:
+            self._slot_load_future = None
+            self.slot_load_state = "failed"
+            self.slot_load_error = "自动存档读取超时，请重试或返回菜单"
+            return
+        if not future.done():
             return
         self._slot_load_future = None
         try:
             saved = future.result()
-        except Exception:  # noqa: BLE001 - an invalid save starts a new board
+        except Exception as exc:  # noqa: BLE001
             self.slot_load_state = "failed"
+            self.slot_load_error = f"自动存档读取失败：{exc}"
             return
+        if isinstance(saved, SlotLoadResult):
+            if saved.status == SlotLoadStatus.LOADED:
+                saved = saved.slot
+            elif saved.status == SlotLoadStatus.NO_SLOT:
+                self.slot_load_state = "ready"
+                self.slot_load_error = None
+                self._save_autosave_slot()
+                return
+            else:
+                self.slot_load_state = "failed"
+                self.slot_load_error = (
+                    saved.error or "自动存档暂时无法读取，请重试")
+                return
         if not isinstance(saved, dict):
             self.slot_load_state = "ready"
+            self.slot_load_error = None
+            self._save_autosave_slot()
             return
         state = saved.get("state")
         grid = state.get("grid") if isinstance(state, dict) else None
@@ -438,7 +529,7 @@ class Game2048(BaseGame):
                 and all(isinstance(row, list) for row in grid) else [])
         if (saved.get("ruleset_version")
                 != self.attempt_context.ruleset_version
-                or not isinstance(state, dict) or version not in (1, 2)
+                or not isinstance(state, dict) or version not in (1, 2, 3)
                 or type(score) is not int or not 0 <= score <= MAX_SCORE
                 or not isinstance(grid, list) or len(grid) != GRID
                 or any(not isinstance(row, list) or len(row) != GRID
@@ -452,16 +543,18 @@ class Game2048(BaseGame):
                 or game_state not in {"playing", "won", "gameover"}
                 or (game_state == "won" and not bool(state.get("won")))
                 or (bool(state.get("won")) and max(flat, default=0) < 2048)):
-            self.slot_load_state = "failed"
+            self._quarantine_bad_slot("invalid_2048_slot_semantics")
             return
         if game_state == "gameover":
             self.slot_load_state = "ready"
+            self.slot_load_error = None
             self._save_autosave_slot()
             return
-        if version == 2:
+        if version in (2, 3):
             attempt_uuid = state.get("attempt_uuid")
-            revision = state.get("revision")
-            submission_id = state.get("submission_id")
+            revision = state.get(
+                "attempt_revision", state.get("revision"))
+            slot_revision = state.get("slot_revision", 0)
             confirmed_score = state.get("confirmed_score")
             valid_attempt = (
                 isinstance(attempt_uuid, str)
@@ -470,16 +563,14 @@ class Game2048(BaseGame):
                         and (char.isalnum() or char in "-_")
                         for char in attempt_uuid))
             if (not valid_attempt or type(revision) is not int or revision < 0
-                    or (submission_id is not None
-                        and (type(submission_id) is not int
-                             or submission_id <= 0))
+                    or type(slot_revision) is not int or slot_revision < 0
                     or (confirmed_score is not None
                         and (type(confirmed_score) is not int
                              or not 0 <= confirmed_score <= score))
                     or type(state.get("won_announced")) is not bool
                     or (state.get("won_announced")
                         and not bool(state.get("won")))):
-                self.slot_load_state = "failed"
+                self._quarantine_bad_slot("invalid_2048_attempt_state")
                 return
         self.tiles = []
         self.grid = [[None] * GRID for _ in range(GRID)]
@@ -494,20 +585,35 @@ class Game2048(BaseGame):
         self.won = bool(state.get("won"))
         self.state = game_state
         self._won_announced = (
-            bool(state.get("won_announced")) if version == 2 else self.won)
-        if version == 2:
+            bool(state.get("won_announced")) if version in (2, 3) else self.won)
+        if version in (2, 3):
             self.attempt_context.attempt_uuid = attempt_uuid
             self.attempt_context.revision = revision
             self._score_attempt_uuid = attempt_uuid
             self._score_attempt_revision = revision
-            self._score_submission_id = submission_id
-            self.score_submission_id = submission_id
+            # v2 stored a process-local SQLite row ID. It is deliberately
+            # ignored; attempt_uuid is the stable identity.
+            self._score_submission_id = None
+            self.score_submission_id = None
             self.submitted_score = confirmed_score
             self.score_submitted = confirmed_score is not None
+            self._slot_revision = slot_revision
         self.anim_t = 1.0
         self.slot_load_state = "ready"
-        if version == 1:
+        self.slot_load_error = None
+        if version in (1, 2):
             self._save_autosave_slot()
+
+    def _quarantine_bad_slot(self, reason: str) -> None:
+        quarantine = getattr(self.backend, "quarantine_slot_async", None)
+        if callable(quarantine):
+            try:
+                self._slot_quarantine_future = quarantine(
+                    self.profile_id, self.game_id, "autosave", reason)
+            except Exception:  # noqa: BLE001
+                self._slot_quarantine_future = None
+        self.slot_load_state = "failed"
+        self.slot_load_error = "自动存档内容损坏，原始数据已隔离；可重试或确认新开"
 
     def _submit_score(self, extra=None) -> None:
         # Repeated calls for the same settled score are ignored.  When the
@@ -577,11 +683,17 @@ class Game2048(BaseGame):
 
     # ------------------------------------------------------------------
     def handle_event(self, event):
-        if self.slot_load_state == "loading":
+        if self.slot_load_state != "ready":
             if (event.type == pygame.QUIT
                     or (event.type == pygame.KEYDOWN
                         and event.key == pygame.K_ESCAPE)):
                 super().handle_event(event)
+            elif (self.slot_load_state == "failed"
+                  and event.type == pygame.KEYDOWN):
+                if event.key == pygame.K_t:
+                    self._retry_slot_load()
+                elif event.key == pygame.K_n:
+                    self._confirm_new_game_after_load_failure()
             self._swipe_start = None
             self._queued_directions.clear()
             return
@@ -708,6 +820,20 @@ class Game2048(BaseGame):
             self.screen.blit(veil, (0, 0))
             draw_text(self.screen, "正在恢复自动存档…",
                       (self.width // 2, self.height // 2), size=18,
+                      color=COLORS["accent"], bold=True, center=True)
+        elif self.slot_load_state == "failed":
+            veil = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+            veil.fill((245, 248, 255, 225))
+            self.screen.blit(veil, (0, 0))
+            draw_text(self.screen, "自动存档未能安全恢复",
+                      (self.width // 2, self.height // 2 - 34), size=20,
+                      color=COLORS["danger"], bold=True, center=True)
+            draw_text(self.screen,
+                      self.slot_load_error or "请重试读取",
+                      (self.width // 2, self.height // 2), size=12,
+                      color=COLORS["text"], center=True)
+            draw_text(self.screen, "T 重试 · N 新开（需二次确认）· Esc 返回",
+                      (self.width // 2, self.height // 2 + 34), size=13,
                       color=COLORS["accent"], bold=True, center=True)
         elif self.slot_save_error:
             draw_text(self.screen, self.slot_save_error,

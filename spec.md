@@ -1,59 +1,61 @@
-# 第七次审查修复规格
+# 第八次审查修复规格
 
 ## 目标
 
-核对第七次审查指出的升级、档案、进度和自动存档问题，保证上一版本留下的数据库与待保存
-成绩可以直接升级，并让默认桌面模式在数据库暂时被锁或损坏时保住最新本机状态。
+核对第八次审查提出的本机状态一致性问题，使多进程 profile、setting、progress 和 save-slot
+写入具有确定顺序、可恢复的最终状态和可见故障；2048 在不能确认自动存档读取结果时不得
+静默开始或覆盖旧槽。
 
 ## 范围
 
-- Windows 和 POSIX 使用操作系统文件锁串行化同一 request，不使用 PID 探测；
-- 待保存成绩 schema 1 原件先备份，再转换为 schema 2 和统一的 UUID 档案身份；
-- SQLite schema v5 显式转换旧 settings、progress、save_slots，增加外键、规则版本、数据版本
-  和损坏本机状态隔离表；
-- standalone 结算与旧成绩导入在同一事务中补齐 profile，排行榜采用当前显示名；
-- 启动器在档案确认前不启动游戏，支持本机档案新建、轮换和改名；
-- 推箱子与祖玛进度按 ruleset 隔离，使用单调合并，练习与闯关分键；
-- 档案、设置、进度和存档使用 keyed latest-value journal，在写库失败后自动补写；
-- 2048 在读取自动存档期间屏蔽玩法输入，存档包含 attempt/revision/提交确认状态，终局存档
-  不恢复成可继续的棋盘；
-- schema repair、系统时钟回拨和保存状态缓存淘汰有可恢复的状态语义；
-- HTTP 调试模式明确保持“成绩 API only”，不伪装成本机数据服务的等价实现。
+- state journal schema v2：每个语义 key 使用 OS 文件锁、logical revision、hash CAS、显式
+  ruleset、目录 fsync、隔离通知和有界扫描；
+- journal 与 SQLite 同时失败时保留按 key 最新的内存 operation，退出前按持久性提示；
+- Sokoban/Zuma progress 使用各自字段 schema 和单调合并，UI 以 generation 拒绝晚到 read；
+- profile startup/save/list 和 queued launch 使用 generation 与预期 profile token；默认 guest 与
+  legacy anonymous 使用同一稳定身份；
+- SQLite current-schema 检查状态表 PK/UNIQUE 与外键完整性；profile 归一化碰撞合并子状态并
+  在 `invalid_local_state` 留证；正常读取不取写锁；
+- 2048 使用 typed slot load、超时/重试/二次确认门禁、语义坏槽隔离和 slot schema v3；稳定
+  attempt UUID 替代持久化 SQLite row ID；
+- 本机状态通过 `LocalStateEvent` 报告最终结果，成绩 committed 状态可从 durable receipt 重建；
+- CI 设置并发取消、job 超时并执行第八轮故障与迁移用例。
 
-## 非目标
+## 非目标与约束
 
-- 不增加账号、云同步、公网排行、遥测或在线反作弊；
-- 不在没有新 ruleset、玩法说明和验收样例时改变计分、随机性或关卡规则；
-- 不代表仓库所有者选择代码和素材许可证；
-- 不把 headless CI 当作 Windows/macOS 安装包和真实显示设备的发布验收。
+- 不改变五款游戏现有 ruleset、计分或关卡内容；
+- 不增加账号、云同步、遥测或公网服务；
+- 不在没有权利来源确认时替仓库所有者选择 LICENSE；
+- 不按文件年龄删除跨进程锁 inode。该做法会让已经打开旧 inode 的 waiter 与新建 inode
+  同时获得“同一 key”的锁；清理必须先设计目录级代际协议；
+- GitHub required checks、签名、公证和安装器需要远端权限或真实平台验收，代码结果不能冒充
+  仓库设置或发行证明。
 
 ## 关键决策
 
-1. 锁文件是稳定 inode，锁的持有与释放由内核负责；文件内容不表示进程存活。
-2. schema 1 pending 的旧 payload hash 先按旧语义核对，身份转换后重算 schema 2 hash；原字节
-   保存在 migration-backup。
-3. schema v5 的状态表迁移与版本写入位于一个 `BEGIN IMMEDIATE` 事务；开始前用 SQLite backup
-   API 创建独立备份，坏 JSON 进入 `invalid_local_state`。
-4. 当前档案名负责展示，attempt 行保留结算时名字作为恢复后备；具体策略见
-   `docs/adr/profile-display-name.md`。
-5. 关卡进度合并对数字取最大值、布尔取或、集合列表取并集、分数字典逐项取最大值；规则版本
-   和 practice/campaign 都是存储维度。
-6. keyed state journal 每个语义键只保留最新操作。写库成功后仅在文件 hash 仍匹配时删除，避免
-   旧 worker 清掉另一进程写入的更新。
-7. 2048 schema 2 存档拒绝越界分数、非法棋盘值、矛盾 won 状态和无效 attempt 元数据；旧
-   schema 1 棋盘可读取并在下一次写入时升级。
-8. 对未来墙钟超过五分钟的合法 pending 使用当前时间入库并在回执中标记 `clock_adjusted`，
-   不把时钟校正当作永久请求错误。
+1. state operation 在提交到 worker 前取得 `(logical_revision, operation_id)`；setting/profile/slot
+   使用 last-write ordering，progress 无论到达顺序都做 schema-aware merge。
+2. put、读取重写、隔离与 remove-if-current 使用由 key 摘要确定的同一 OS 锁。锁文件使用稳定
+   inode，文件内容不表示进程存活。
+3. state envelope v1 先核对原 hash，再按当前兼容 catalog 冻结旧 operation 的 ruleset并原子
+   重写为 v2。现有规则升级必须保留旧 catalog 版本，不能让 pending 漂移。
+4. journal publish 成功后 operation 已可安全退出；publish 与数据库都失败时进入内存队列并触发
+   二次确认门禁，后台重试会先恢复 journal 再写库。
+5. profile 迁移碰撞只从有效 JSON 中选值：progress 单调合并，setting 取较新有效值，slot 优先
+   `slot_revision`；损坏和被舍弃原文均进入隔离表。
+6. 2048 slot v3 保存 attempt UUID、attempt revision、slot revision、确认分数和棋盘，不保存
+   SQLite row ID。v2 row ID 只作为废弃字段读取并丢弃。
+7. slot 临时失败、profile pending、超时和语义损坏都保持玩法门禁。只有明确 no-slot 或用户二次
+   确认新开后才能写 autosave。
 
 ## 验收标准
 
-- 第七次审查 F01–F22 均有代码结果或明确取舍；
-- schema v2 含旧 attempts/state tables 的数据库可升级、备份、重复初始化，分数和状态可读；
-- schema 1 per-request pending 能恢复旧显示名身份、重算 hash 并重放；
-- Windows 锁路径不调用 `os.kill`，坏锁内容与 metadata 前崩溃不造成永久阻塞；
-- orphan 状态写入被拒绝，损坏 JSON 被隔离并返回默认值；
-- 数据库持锁期间的进度写入返回 durable pending，解锁后可补写；
-- 2048 载入前输入无效，恢复 attempt 身份，gameover slot 不恢复为 playing；
-- 原有玩法、界面、存储、迁移和压力检查通过；Ruff、编译、whitespace、构建与默认数据库
-  指纹检查通过；
-- 完成两轮独立复查，修复每轮新发现的问题后重新验证。
+- F01–F26 逐项有代码证据、明确反驳或仍受外部条件约束的状态；
+- 旧 worker 不能删除/覆盖较新 journal；另一进程持同 key lock 时写入必须等待；
+- progress 多实例写入不回退，v1 journal 升级后 ruleset 固定；
+- journal 与数据库同时失败时退出保护生效，恢复后 setting/slot/progress 可读；
+- 临时 slot read 不等于 no-slot；2048 读取超时或损坏时输入和自动写入保持关闭；
+- 改名后的 2048 revision 继续写入同一 attempt，v2 row ID 不进入 v3 slot；
+- 畸形 v5 PK 会备份重建；guest/anonymous 子状态碰撞不静默丢失有效值；
+- 两轮独立复查完成，每轮发现的问题均修复并重新验证；
+- 功能、存储、迁移、压力、Ruff、编译、构建和默认数据库指纹检查通过。

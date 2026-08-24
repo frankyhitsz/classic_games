@@ -19,6 +19,9 @@ from .catalog import GAME_BY_ID, VALID_GAME_IDS, ScorePolicy
 from .mutation import (ATTEMPT_STATUSES, MutationError, ScoreMutation,
                        canonical_json, normalize_score_mutation)
 from .profile import ProfileIdentity, ProfileIdentityError
+from .progress import (ProgressPolicyError,
+                       merge_progress as merge_progress_values,
+                       validate_progress)
 from .service import StorageStatus
 
 SCHEMA_VERSION = 5
@@ -282,6 +285,18 @@ class LocalGameStore:
                            and row["on_delete"].upper() == "CASCADE"
                            for row in foreign_keys):
                     return False
+            expected_state_keys = {
+                "settings": ("profile_id", "key"),
+                "progress": ("profile_id", "game_id", "ruleset_version", "key"),
+                "save_slots": ("profile_id", "game_id", "slot_id"),
+            }
+            for table, expected in expected_state_keys.items():
+                if not any(unique and columns == expected
+                           for unique, columns in
+                           self._table_indexes(conn, table).values()):
+                    return False
+            if conn.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                return False
             required_indexes = {
                 "idx_attempts_request_id": (True, ("request_id",)),
                 "idx_attempts_uuid": (True, ("attempt_uuid",)),
@@ -473,8 +488,7 @@ class LocalGameStore:
                 f"ON attempts WHEN {invalid} BEGIN "
                 "SELECT RAISE(ABORT, 'attempt invariant failed'); END")
 
-    @staticmethod
-    def _migrate_profiles(conn: sqlite3.Connection) -> None:
+    def _migrate_profiles(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO profiles "
             "(profile_id, display_name, created_at, last_used) "
@@ -501,20 +515,159 @@ class LocalGameStore:
                 "UPDATE attempts SET profile_id=? WHERE profile_id=?",
                 (new_id, row["profile_id"]))
             for table in ("settings", "progress", "save_slots"):
-                columns = LocalGameStore._table_columns(conn, table)
+                columns = self._table_columns(conn, table)
                 if ("profile_id" not in columns
-                        or not LocalGameStore._local_state_table_is_current(
+                        or not self._local_state_table_is_current(
                             conn, table)):
                     continue
-                conn.execute(
-                    f"UPDATE OR IGNORE {table} SET profile_id=? "
-                    "WHERE profile_id=?", (new_id, row["profile_id"]))
-                conn.execute(
-                    f"DELETE FROM {table} WHERE profile_id=?",
-                    (row["profile_id"],))
+                self._merge_profile_child_rows(
+                    conn, table, row["profile_id"], new_id)
             conn.execute(
                 "DELETE FROM profiles WHERE profile_id=?",
                 (row["profile_id"],))
+
+    def _merge_profile_child_rows(self, conn: sqlite3.Connection, table: str,
+                                  old_id: str, new_id: str) -> None:
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE profile_id=?", (old_id,)).fetchall()
+        for row in rows:
+            data = dict(row)
+            if table == "settings":
+                key_columns = ("key",)
+                raw_column = "value_json"
+            elif table == "progress":
+                key_columns = ("game_id", "ruleset_version", "key")
+                raw_column = "value_json"
+            else:
+                key_columns = ("game_id", "slot_id")
+                raw_column = "state_json"
+            where = " AND ".join(f"{column}=?" for column in key_columns)
+            key_values = tuple(data[column] for column in key_columns)
+            existing = conn.execute(
+                f"SELECT * FROM {table} WHERE profile_id=? AND {where}",
+                (new_id, *key_values)).fetchone()
+            if existing is None:
+                conn.execute(
+                    f"UPDATE {table} SET profile_id=? WHERE profile_id=? "
+                    f"AND {where}", (new_id, old_id, *key_values))
+                continue
+
+            reason = "profile_normalization_collision"
+            if table == "progress":
+                old_value = current_value = None
+                try:
+                    old_value = json.loads(
+                        data[raw_column], parse_constant=_reject_json_constant)
+                    old_value = validate_progress(
+                        data["game_id"], data["key"], old_value)
+                except (TypeError, ValueError, json.JSONDecodeError,
+                        ProgressPolicyError):
+                    old_value = None
+                    self._quarantine_local_state(
+                        conn, kind=table, profile_id=old_id,
+                        game_id=data.get("game_id"),
+                        item_key=str(data.get("key")),
+                        raw_value=str(data[raw_column]), reason=reason)
+                try:
+                    current_value = json.loads(
+                        existing[raw_column], parse_constant=_reject_json_constant)
+                    current_value = validate_progress(
+                        data["game_id"], data["key"], current_value)
+                except (TypeError, ValueError, json.JSONDecodeError,
+                        ProgressPolicyError):
+                    current_value = None
+                    self._quarantine_local_state(
+                        conn, kind=table, profile_id=new_id,
+                        game_id=data.get("game_id"),
+                        item_key=str(data.get("key")),
+                        raw_value=str(existing[raw_column]), reason=reason)
+                if old_value is not None and current_value is not None:
+                    merged = merge_progress_values(
+                        data["game_id"], data["key"],
+                        current_value, old_value)
+                elif old_value is not None:
+                    merged = old_value
+                else:
+                    merged = current_value
+                if merged is None:
+                    conn.execute(
+                        "DELETE FROM progress WHERE profile_id=? AND game_id=? "
+                        "AND ruleset_version=? AND key=?",
+                        (new_id, data["game_id"], data["ruleset_version"],
+                         data["key"]))
+                else:
+                    conn.execute(
+                        "UPDATE progress SET value_json=?, value_version=?, "
+                        "updated_at=? WHERE profile_id=? AND game_id=? "
+                        "AND ruleset_version=? AND key=?",
+                        (self._encoded_value(merged),
+                         max(int(existing["value_version"]),
+                             int(data["value_version"])) + 1,
+                         max(float(existing["updated_at"]),
+                             float(data["updated_at"])),
+                         new_id, data["game_id"], data["ruleset_version"],
+                         data["key"]))
+            else:
+                old_valid = current_valid = True
+                try:
+                    old_decoded = json.loads(
+                        data[raw_column], parse_constant=_reject_json_constant)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    old_valid = False
+                    old_decoded = None
+                    self._quarantine_local_state(
+                        conn, kind=table, profile_id=old_id,
+                        game_id=data.get("game_id"),
+                        item_key=str(data.get("key", data.get("slot_id"))),
+                        raw_value=str(data[raw_column]), reason=reason)
+                try:
+                    current_decoded = json.loads(
+                        existing[raw_column], parse_constant=_reject_json_constant)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    current_valid = False
+                    current_decoded = None
+                    self._quarantine_local_state(
+                        conn, kind=table, profile_id=new_id,
+                        game_id=data.get("game_id"),
+                        item_key=str(data.get("key", data.get("slot_id"))),
+                        raw_value=str(existing[raw_column]), reason=reason)
+                existing_order = float(existing["updated_at"])
+                old_order = float(data["updated_at"])
+                if table == "save_slots" and old_valid and current_valid:
+                    try:
+                        existing_order = int(current_decoded.get(
+                            "slot_revision", existing_order))
+                        old_order = int(old_decoded.get(
+                            "slot_revision", old_order))
+                    except (AttributeError, TypeError, ValueError):
+                        pass
+                choose_old = old_valid and (
+                    not current_valid or old_order > existing_order)
+                if old_valid and current_valid:
+                    losing = existing if choose_old else row
+                    self._quarantine_local_state(
+                        conn, kind=table,
+                        profile_id=(new_id if choose_old else old_id),
+                        game_id=data.get("game_id"),
+                        item_key=str(data.get("key", data.get("slot_id"))),
+                        raw_value=str(losing[raw_column]), reason=reason)
+                if choose_old:
+                    assignments = [
+                        column for column in data
+                        if column not in {"profile_id", *key_columns}]
+                    conn.execute(
+                        f"UPDATE {table} SET "
+                        + ", ".join(f"{column}=?" for column in assignments)
+                        + f" WHERE profile_id=? AND {where}",
+                        (*(data[column] for column in assignments),
+                         new_id, *key_values))
+                elif not current_valid:
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE profile_id=? AND {where}",
+                        (new_id, *key_values))
+            conn.execute(
+                f"DELETE FROM {table} WHERE profile_id=? AND {where}",
+                (old_id, *key_values))
 
     @staticmethod
     def _create_local_state_tables(conn: sqlite3.Connection) -> None:
@@ -557,11 +710,21 @@ class LocalGameStore:
         }[table]
         if not required <= LocalGameStore._table_columns(conn, table):
             return False
-        return any(
+        has_foreign_key = any(
             row["table"] == "profiles" and row["from"] == "profile_id"
             and row["to"] == "profile_id"
             and row["on_delete"].upper() == "CASCADE"
             for row in conn.execute(f"PRAGMA foreign_key_list({table})"))
+        expected_key = {
+            "settings": ("profile_id", "key"),
+            "progress": ("profile_id", "game_id", "ruleset_version", "key"),
+            "save_slots": ("profile_id", "game_id", "slot_id"),
+        }[table]
+        has_unique_key = any(
+            unique and columns == expected_key
+            for unique, columns in
+            LocalGameStore._table_indexes(conn, table).values())
+        return has_foreign_key and has_unique_key
 
     @staticmethod
     def _migration_profile(conn: sqlite3.Connection, raw_profile,
@@ -863,6 +1026,24 @@ class LocalGameStore:
             conn.execute("SELECT 1 FROM attempts LIMIT 1").fetchone()
         return True
 
+    def get_save_receipt(self, request_id: str) -> Optional[dict]:
+        request_id = self._query_identifier(request_id, "request_id", 64)
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT response_json FROM save_requests WHERE request_id=? "
+                "AND (expires_at IS NULL OR expires_at>=?)",
+                (request_id, time.time())).fetchone()
+        if row is None:
+            return None
+        try:
+            response = json.loads(
+                row["response_json"], parse_constant=_reject_json_constant)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(response, dict) or response.get("ok") is not True:
+            return None
+        return response
+
     def storage_status(self, outbox_writable: bool = True,
                        recovery_notice: Optional[str] = None) -> StorageStatus:
         readable = writable = False
@@ -914,7 +1095,6 @@ class LocalGameStore:
     def _identity_matches(row: sqlite3.Row, mutation: ScoreMutation) -> bool:
         return all((
             row["game_id"] == mutation.game_id,
-            row["player"] == mutation.player,
             row["profile_id"] == mutation.profile_id,
             row["mode"] == mutation.mode,
             row["ruleset_version"] == mutation.ruleset_version,
@@ -1416,30 +1596,6 @@ class LocalGameStore:
                 "profile_not_found", "profile does not exist", 404)
 
     @staticmethod
-    def _merge_monotonic(existing, incoming):
-        if isinstance(existing, dict) and isinstance(incoming, dict):
-            return {
-                key: (LocalGameStore._merge_monotonic(existing[key], value)
-                      if key in existing else value)
-                for key, value in {**existing, **incoming}.items()
-            }
-        if (type(existing) in (int, float)
-                and type(incoming) in (int, float)):
-            return max(existing, incoming)
-        if isinstance(existing, bool) and isinstance(incoming, bool):
-            return existing or incoming
-        if isinstance(existing, list) and isinstance(incoming, list):
-            merged = list(existing)
-            for value in incoming:
-                if value not in merged:
-                    merged.append(value)
-            try:
-                return sorted(merged)
-            except TypeError:
-                return merged
-        return incoming
-
-    @staticmethod
     def _quarantine_local_state(conn: sqlite3.Connection, *, kind: str,
                                 profile_id: str, game_id: Optional[str],
                                 item_key: str, raw_value: str,
@@ -1471,28 +1627,31 @@ class LocalGameStore:
         profile_id = self._profile_uuid(profile_id)
         key = self._query_identifier(key, "setting_key", 64)
         with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT value_json FROM settings WHERE profile_id=? AND key=?",
                 (profile_id, key)).fetchone()
-            if row is None:
+        if row is None:
+            return default
+        try:
+            return json.loads(
+                row["value_json"], parse_constant=_reject_json_constant)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            with self.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute(
+                    "SELECT value_json FROM settings "
+                    "WHERE profile_id=? AND key=?",
+                    (profile_id, key)).fetchone()
+                if current is not None and current["value_json"] == row["value_json"]:
+                    self._quarantine_local_state(
+                        conn, kind="settings", profile_id=profile_id,
+                        game_id=None, item_key=key,
+                        raw_value=str(row["value_json"]), reason="invalid_json")
+                    conn.execute(
+                        "DELETE FROM settings WHERE profile_id=? AND key=?",
+                        (profile_id, key))
                 conn.commit()
-                return default
-            try:
-                value = json.loads(
-                    row["value_json"], parse_constant=_reject_json_constant)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                self._quarantine_local_state(
-                    conn, kind="settings", profile_id=profile_id,
-                    game_id=None, item_key=key,
-                    raw_value=str(row["value_json"]), reason="invalid_json")
-                conn.execute(
-                    "DELETE FROM settings WHERE profile_id=? AND key=?",
-                    (profile_id, key))
-                conn.commit()
-                return default
-            conn.commit()
-            return value
+            return default
 
     def set_progress(self, profile_id: str, game_id: str,
                      key: str, value,
@@ -1504,6 +1663,10 @@ class LocalGameStore:
         ruleset_version = self._query_identifier(
             ruleset_version or GAME_BY_ID[game_id].ruleset_version,
             "ruleset_version", 32)
+        try:
+            value = validate_progress(game_id, key, value)
+        except ProgressPolicyError as exc:
+            raise StoreError("invalid_progress", str(exc)) from exc
         encoded = self._encoded_value(value)
         with self.connection() as conn:
             self._require_profile(conn, profile_id)
@@ -1529,7 +1692,10 @@ class LocalGameStore:
         ruleset_version = self._query_identifier(
             ruleset_version or GAME_BY_ID[game_id].ruleset_version,
             "ruleset_version", 32)
-        self._encoded_value(value)
+        try:
+            value = validate_progress(game_id, key, value)
+        except ProgressPolicyError as exc:
+            raise StoreError("invalid_progress", str(exc)) from exc
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._require_profile(conn, profile_id)
@@ -1550,7 +1716,11 @@ class LocalGameStore:
                         game_id=game_id, item_key=key,
                         raw_value=str(row["value_json"]), reason="invalid_json")
                     existing = {}
-            merged = self._merge_monotonic(existing, value)
+            try:
+                merged = merge_progress_values(
+                    game_id, key, existing, value)
+            except ProgressPolicyError as exc:
+                raise StoreError("invalid_progress", str(exc)) from exc
             encoded = self._encoded_value(merged)
             conn.execute(
                 "INSERT INTO progress(profile_id,game_id,ruleset_version,key,"
@@ -1575,39 +1745,47 @@ class LocalGameStore:
             ruleset_version or GAME_BY_ID[game_id].ruleset_version,
             "ruleset_version", 32)
         with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT value_json FROM progress "
                 "WHERE profile_id=? AND game_id=? AND ruleset_version=? AND key=?",
                 (profile_id, game_id, ruleset_version, key)).fetchone()
-            if row is None:
+        if row is None:
+            return default
+        try:
+            value = json.loads(
+                row["value_json"], parse_constant=_reject_json_constant)
+            return validate_progress(game_id, key, value)
+        except (TypeError, ValueError, json.JSONDecodeError,
+                ProgressPolicyError):
+            with self.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute(
+                    "SELECT value_json FROM progress WHERE profile_id=? "
+                    "AND game_id=? AND ruleset_version=? AND key=?",
+                    (profile_id, game_id, ruleset_version, key)).fetchone()
+                if current is not None and current["value_json"] == row["value_json"]:
+                    self._quarantine_local_state(
+                        conn, kind="progress", profile_id=profile_id,
+                        game_id=game_id, item_key=key,
+                        raw_value=str(row["value_json"]), reason="invalid_progress")
+                    conn.execute(
+                        "DELETE FROM progress WHERE profile_id=? AND game_id=? "
+                        "AND ruleset_version=? AND key=?",
+                        (profile_id, game_id, ruleset_version, key))
                 conn.commit()
-                return default
-            try:
-                value = json.loads(
-                    row["value_json"], parse_constant=_reject_json_constant)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                self._quarantine_local_state(
-                    conn, kind="progress", profile_id=profile_id,
-                    game_id=game_id, item_key=key,
-                    raw_value=str(row["value_json"]), reason="invalid_json")
-                conn.execute(
-                    "DELETE FROM progress WHERE profile_id=? AND game_id=? "
-                    "AND ruleset_version=? AND key=?",
-                    (profile_id, game_id, ruleset_version, key))
-                conn.commit()
-                return default
-            conn.commit()
-            return value
+            return default
 
     def save_slot(self, profile_id: str, game_id: str,
-                  slot_id: str, state) -> None:
+                  slot_id: str, state,
+                  ruleset_version: Optional[str] = None) -> None:
         if game_id not in VALID_GAME_IDS:
             raise StoreError("unknown_game", f"unknown game_id: {game_id}", 404)
         profile_id = self._profile_uuid(profile_id)
         slot_id = self._query_identifier(slot_id, "slot_id", 64)
         encoded = self._encoded_value(state)
-        ruleset = GAME_BY_ID[game_id].ruleset_version
+        ruleset = self._query_identifier(
+            ruleset_version or GAME_BY_ID[game_id].ruleset_version,
+            "ruleset_version", 32)
         state_version = (state.get("version", 1)
                          if isinstance(state, dict) else 1)
         if type(state_version) is not int or state_version < 1:
@@ -1634,34 +1812,63 @@ class LocalGameStore:
         profile_id = self._profile_uuid(profile_id)
         slot_id = self._query_identifier(slot_id, "slot_id", 64)
         with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT state_json, state_version, ruleset_version, updated_at "
                 "FROM save_slots "
                 "WHERE profile_id=? AND game_id=? AND slot_id=?",
                 (profile_id, game_id, slot_id)).fetchone()
+        if row is None:
+            return None
+        try:
+            state = json.loads(
+                row["state_json"], parse_constant=_reject_json_constant)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            with self.connection() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                current = conn.execute(
+                    "SELECT state_json FROM save_slots WHERE profile_id=? "
+                    "AND game_id=? AND slot_id=?",
+                    (profile_id, game_id, slot_id)).fetchone()
+                if current is not None and current["state_json"] == row["state_json"]:
+                    self._quarantine_local_state(
+                        conn, kind="save_slots", profile_id=profile_id,
+                        game_id=game_id, item_key=slot_id,
+                        raw_value=str(row["state_json"]), reason="invalid_json")
+                    conn.execute(
+                        "DELETE FROM save_slots WHERE profile_id=? AND game_id=? "
+                        "AND slot_id=?", (profile_id, game_id, slot_id))
+                conn.commit()
+            return None
+        return {"state": state,
+                "state_version": row["state_version"],
+                "ruleset_version": row["ruleset_version"],
+                "updated_at": row["updated_at"]}
+
+    def quarantine_slot(self, profile_id: str, game_id: str,
+                        slot_id: str, reason: str) -> bool:
+        if game_id not in VALID_GAME_IDS:
+            raise StoreError("unknown_game", f"unknown game_id: {game_id}", 404)
+        profile_id = self._profile_uuid(profile_id)
+        slot_id = self._query_identifier(slot_id, "slot_id", 64)
+        reason = self._query_identifier(reason, "reason", 64)
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT state_json FROM save_slots WHERE profile_id=? "
+                "AND game_id=? AND slot_id=?",
+                (profile_id, game_id, slot_id)).fetchone()
             if row is None:
                 conn.commit()
-                return None
-            try:
-                state = json.loads(
-                    row["state_json"], parse_constant=_reject_json_constant)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                self._quarantine_local_state(
-                    conn, kind="save_slots", profile_id=profile_id,
-                    game_id=game_id, item_key=slot_id,
-                    raw_value=str(row["state_json"]), reason="invalid_json")
-                conn.execute(
-                    "DELETE FROM save_slots WHERE profile_id=? AND game_id=? "
-                    "AND slot_id=?", (profile_id, game_id, slot_id))
-                conn.commit()
-                return None
-            result = {"state": state,
-                      "state_version": row["state_version"],
-                      "ruleset_version": row["ruleset_version"],
-                      "updated_at": row["updated_at"]}
+                return False
+            self._quarantine_local_state(
+                conn, kind="save_slots", profile_id=profile_id,
+                game_id=game_id, item_key=slot_id,
+                raw_value=str(row["state_json"]), reason=reason)
+            conn.execute(
+                "DELETE FROM save_slots WHERE profile_id=? AND game_id=? "
+                "AND slot_id=?", (profile_id, game_id, slot_id))
             conn.commit()
-            return result
+            return True
 
     def _legacy_rows(self, legacy_conn: sqlite3.Connection,
                      source: str) -> list[tuple]:

@@ -6,6 +6,8 @@ import unicodedata
 import uuid
 from dataclasses import dataclass
 
+DEFAULT_PROFILE_NAME = "guest"
+
 
 class ProfileIdentityError(ValueError):
     pass
@@ -32,9 +34,15 @@ class ProfileIdentity:
     @classmethod
     def from_legacy_name(cls, display_name: str) -> "ProfileIdentity":
         name = cls.normalize_display_name(display_name)
+        if name.casefold() in {"guest", "anonymous"}:
+            name = DEFAULT_PROFILE_NAME
         return cls(uuid.uuid5(
             uuid.NAMESPACE_URL,
             f"classic-games-local-profile:{name}").hex)
+
+    @classmethod
+    def default(cls) -> "ProfileIdentity":
+        return cls.from_legacy_name(DEFAULT_PROFILE_NAME)
 
     @classmethod
     def validate_uuid(cls, value: str) -> "ProfileIdentity":

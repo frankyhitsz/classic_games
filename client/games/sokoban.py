@@ -16,7 +16,8 @@ from typing import List, Optional, Tuple
 
 import pygame
 
-from game_service.service import GameDataService
+from game_service.catalog import GAME_BY_ID
+from game_service.service import GameDataService, SaveState
 from client.common.ui import (COLORS, BaseGame, Button, draw_gradient_bg,
                               draw_panel, draw_text)
 
@@ -290,7 +291,11 @@ class Sokoban(BaseGame):
         self.practice_mode = False
         self.unlocked_level = 1
         self.saved_completed_levels: set[int] = set()
+        self._progress_generation = 0
         self._progress_future = None
+        self._progress_write_future = None
+        self._progress_status_key = "campaign"
+        self.progress_save_message = ""
         self._confirmed_total: Optional[int] = None
         self._pending_total: Optional[int] = None
         w, h = level_bounds(LEVELS[0])
@@ -300,17 +305,48 @@ class Sokoban(BaseGame):
         self.load_level(0)
         load_progress = getattr(self.backend, "get_progress_async", None)
         if callable(load_progress):
-            self._progress_future = load_progress(
-                self.profile_id, self.game_id, "campaign", {})
+            self._progress_future = (
+                load_progress(
+                    self.profile_id, self.game_id, "campaign", {}),
+                self._progress_generation)
 
     def _poll_progress(self) -> None:
-        future = self._progress_future
-        if future is None or not future.done():
+        write = self._progress_write_future
+        if write is not None and write[0].done():
+            self._progress_write_future = None
+            try:
+                result = write[0].result()
+            except Exception:  # noqa: BLE001
+                self.progress_save_message = "进度暂时未保存"
+            else:
+                if isinstance(result, dict) and result.get("ok") is False:
+                    self.progress_save_message = (
+                        "进度已进入待写入队列" if result.get("durable_pending")
+                        else "进度暂时未保存")
+                elif isinstance(result, dict):
+                    self._apply_progress(result, write[1])
+                    self.progress_save_message = ""
+        if self.progress_save_message:
+            getter = getattr(self.backend, "get_local_state_status", None)
+            if callable(getter):
+                ruleset = GAME_BY_ID[self.game_id].ruleset_version
+                event = getter(
+                    f"progress:{self.profile_id}:{self.game_id}:"
+                    f"{ruleset}:{self._progress_status_key}")
+                if getattr(event, "state", None) == SaveState.COMMITTED:
+                    self.progress_save_message = ""
+        pending = self._progress_future
+        if pending is None or not pending[0].done():
             return
         self._progress_future = None
         try:
-            value = future.result()
+            value = pending[0].result()
         except Exception:  # noqa: BLE001 - a new campaign remains playable
+            return
+        self._apply_progress(value, pending[1])
+
+    def _apply_progress(self, value, generation: int) -> None:
+        if generation != self._progress_generation:
             return
         if not isinstance(value, dict):
             return
@@ -463,17 +499,28 @@ class Sokoban(BaseGame):
             save_progress = getattr(self.backend, "merge_progress_async", None)
             if callable(save_progress):
                 try:
-                    save_progress(
-                        self.profile_id, self.game_id,
-                        "practice" if self.practice_mode else "campaign",
-                        {"unlocked_level": min(
+                    self._progress_generation += 1
+                    generation = self._progress_generation
+                    progress_value = {
+                        "unlocked_level": min(
                             len(LEVELS), max(self.completed_levels) + 2),
-                         "completed_levels": sorted(self.completed_levels),
-                         "level_scores": {
-                             str(key): value
-                             for key, value in self.level_scores.items()}})
+                        "completed_levels": sorted(self.completed_levels),
+                        "level_scores": {
+                            str(key): value
+                            for key, value in self.level_scores.items()}}
+                    self.unlocked_level = max(
+                        self.unlocked_level,
+                        progress_value["unlocked_level"])
+                    self.saved_completed_levels.update(
+                        progress_value["completed_levels"])
+                    progress_key = (
+                        "practice" if self.practice_mode else "campaign")
+                    self._progress_status_key = progress_key
+                    self._progress_write_future = (save_progress(
+                        self.profile_id, self.game_id,
+                        progress_key, progress_value), generation, progress_key)
                 except Exception:  # noqa: BLE001 - progress is non-critical
-                    pass
+                    self.progress_save_message = "进度暂时未保存"
             if (completed_all
                     and (self._confirmed_total is None
                          or self.total_score > self._confirmed_total)
@@ -523,6 +570,8 @@ class Sokoban(BaseGame):
                   color=COLORS["text"], bold=True)
         hint = (f"已解锁 {self.unlocked_level}/{len(LEVELS)} · "
                 "K 前往最高关 · N 练习跳关 · Esc 返回")
+        if self.progress_save_message:
+            hint = f"{self.progress_save_message} · {hint}"
         hw = _font(11).size(hint)[0]
         draw_text(self.screen, hint,
                   (header.right - hw - 12, header.y + 29), size=11,

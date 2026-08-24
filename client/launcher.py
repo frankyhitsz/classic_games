@@ -20,8 +20,11 @@ if str(ROOT) not in sys.path:
 from client.common.ui import (  # noqa: E402
                               COLORS, draw_card, draw_playroom_backdrop,
                               draw_leaderboard, draw_text, font)
+from client.profile_controller import ProfileController  # noqa: E402
 from game_service.catalog import GAME_BY_ID, GAMES  # noqa: E402
 from game_service.local_backend import LocalBackendClient  # noqa: E402
+from game_service.profile import ProfileIdentity  # noqa: E402
+from game_service.service import SaveState  # noqa: E402
 
 WIDTH, HEIGHT = 980, 680
 LEADERBOARD_REFRESH_SECS = 4.0
@@ -210,20 +213,22 @@ def main():
     # the first click now starts a real name instead of appending to the
     # literal string "guest".
     player = ""
-    profile_id = uuid.uuid4().hex
-    profile_future = None
-    profile_save_future = None
+    profile_id = ProfileIdentity.default().profile_id
+    profile_controller = ProfileController(profile_id)
     profile_ready = not callable(getattr(backend, "last_profile_async", None))
+    if profile_ready:
+        profile_controller.resolve(profile_id)
     profile_error = None
     profile_choice_locked = False
     last_profile_async = getattr(backend, "last_profile_async", None)
     if callable(last_profile_async):
-        profile_future = last_profile_async()
+        profile_controller.bind(
+            "load", last_profile_async(), match_profile=False)
     profiles_cache: List[dict] = []
-    profiles_future = None
     list_profiles_async = getattr(backend, "list_profiles_async", None)
     if callable(list_profiles_async):
-        profiles_future = list_profiles_async()
+        profile_controller.bind(
+            "list", list_profiles_async(), match_profile=False)
 
     # Bottom panels — leaderboard (left, switches on hover) + recent (right).
     panel_y = start_y + card_h + 24
@@ -273,47 +278,60 @@ def main():
             recent_future = backend.recent_async(limit=8)
 
     def poll_network() -> None:
-        nonlocal player, profile_id, profile_future, profile_save_future
+        nonlocal player, profile_id
         nonlocal profile_choice_locked, profile_ready, profile_error
-        nonlocal profiles_future, profiles_cache
+        nonlocal profiles_cache
         nonlocal online, health_future, recent_cache, recent_ts, recent_future
         nonlocal records_error
-        if profile_future is not None and profile_future.done():
+        profile_operation = profile_controller.completed("load")
+        if profile_operation is not None:
             try:
-                saved_profile = profile_future.result()
+                saved_profile = profile_operation.future.result()
             except Exception:  # noqa: BLE001
                 saved_profile = None
-                profile_error = "本机档案载入失败，暂时不能开始游戏"
-            profile_future = None
-            if isinstance(saved_profile, dict) and not profile_choice_locked:
+                if profile_controller.is_current(profile_operation):
+                    profile_error = "本机档案载入失败，暂时不能开始游戏"
+            if (profile_controller.is_current(profile_operation)
+                    and isinstance(saved_profile, dict)
+                    and not profile_choice_locked):
                 profile_id = saved_profile.get("profile_id") or profile_id
+                profile_controller.resolve(profile_id)
                 saved_name = saved_profile.get("display_name") or "guest"
                 player = "" if saved_name == "guest" else saved_name
                 profile_ready = True
                 profile_error = None
-            elif saved_profile is None and not profile_choice_locked:
+            elif (profile_controller.is_current(profile_operation)
+                  and saved_profile is None and not profile_choice_locked
+                  and profile_error is None):
+                profile_controller.resolve(profile_id)
                 ensure_profile = getattr(backend, "ensure_profile_async", None)
                 if callable(ensure_profile):
-                    profile_save_future = ensure_profile("guest", profile_id)
+                    profile_controller.bind(
+                        "save", ensure_profile("guest", profile_id))
                 elif profile_error is None:
                     profile_ready = True
-        if profile_save_future is not None and profile_save_future.done():
+        profile_operation = profile_controller.completed("save")
+        if profile_operation is not None:
             saved_profile = None
             try:
-                saved_profile = profile_save_future.result()
+                saved_profile = profile_operation.future.result()
                 if (isinstance(saved_profile, dict)
                         and saved_profile.get("ok") is False):
                     raise RuntimeError(
                         saved_profile.get("error") or "profile save failed")
-                if isinstance(saved_profile, dict):
+                if (profile_controller.is_current(profile_operation)
+                        and isinstance(saved_profile, dict)):
                     profile_id = saved_profile.get("profile_id") or profile_id
-                profile_ready = True
-                profile_error = None
+                    profile_controller.resolve(profile_id)
+                if profile_controller.is_current(profile_operation):
+                    profile_ready = True
+                    profile_error = None
             except Exception:  # noqa: BLE001
-                profile_error = "本机档案保存失败，重试后才能开始游戏"
-                profile_ready = False
-            profile_save_future = None
-            if (isinstance(saved_profile, dict)
+                if profile_controller.is_current(profile_operation):
+                    profile_error = "本机档案保存失败，重试后才能开始游戏"
+                    profile_ready = False
+            if (profile_controller.is_current(profile_operation)
+                    and isinstance(saved_profile, dict)
                     and saved_profile.get("ok") is not False):
                 profiles_cache = [
                     item for item in profiles_cache
@@ -322,13 +340,21 @@ def main():
                     "profile_id": profile_id,
                     "display_name": player.strip() or "guest",
                 })
-        if profiles_future is not None and profiles_future.done():
+        profile_operation = profile_controller.completed("list")
+        if profile_operation is not None:
             try:
-                result = profiles_future.result()
-                profiles_cache = result if isinstance(result, list) else []
+                result = profile_operation.future.result()
+                if profile_controller.is_current(profile_operation):
+                    profiles_cache = result if isinstance(result, list) else []
             except Exception:  # noqa: BLE001
                 pass
-            profiles_future = None
+        if not profile_ready:
+            get_state = getattr(backend, "get_local_state_status", None)
+            if callable(get_state):
+                state_event = get_state(f"profile:{profile_id}")
+                if getattr(state_event, "state", None) == SaveState.COMMITTED:
+                    profile_ready = True
+                    profile_error = None
         if health_future is not None and health_future.done():
             was_online = online
             try:
@@ -402,9 +428,10 @@ def main():
     quit_with_unsaved_deadline = 0.0
 
     def finish_player_edit() -> None:
-        nonlocal editing_player, player_composition, profile_save_future
+        nonlocal editing_player, player_composition
         nonlocal profile_choice_locked, profile_ready, profile_error
         profile_choice_locked = True
+        profile_controller.select(profile_id)
         editing_player = False
         player_composition = ""
         pygame.key.stop_text_input()
@@ -412,24 +439,27 @@ def main():
         if callable(ensure_profile):
             profile_ready = False
             profile_error = None
-            profile_save_future = ensure_profile(
-                player.strip() or "guest", profile_id)
+            profile_controller.bind(
+                "save", ensure_profile(
+                    player.strip() or "guest", profile_id))
 
     def retry_profile_save() -> None:
-        nonlocal profile_save_future, profile_error
-        if profile_save_future is not None:
+        nonlocal profile_error
+        if profile_controller.has_operation("save"):
             return
         ensure_profile = getattr(backend, "ensure_profile_async", None)
         if callable(ensure_profile):
             profile_error = None
-            profile_save_future = ensure_profile(
-                player.strip() or "guest", profile_id)
+            profile_controller.bind(
+                "save", ensure_profile(
+                    player.strip() or "guest", profile_id))
 
     def choose_profile(*, create_new: bool = False) -> None:
         nonlocal player, profile_id, profile_choice_locked, profile_ready
         nonlocal profile_error, editing_player, player_composition
         if create_new or not profiles_cache:
             profile_id = uuid.uuid4().hex
+            profile_controller.select(profile_id)
             player = ""
             profile_choice_locked = True
             profile_ready = True
@@ -446,6 +476,7 @@ def main():
             index = -1
         selected = profiles_cache[(index + 1) % len(profiles_cache)]
         profile_id = selected["profile_id"]
+        profile_controller.select(profile_id)
         selected_name = selected.get("display_name") or "guest"
         player = "" if selected_name == "guest" else selected_name
         profile_choice_locked = True
@@ -483,7 +514,6 @@ def main():
         last_health_check = 0.0
 
     running = True
-    pending_launch_gid = None
     mouse_pos = pygame.mouse.get_pos()
     while running:
         frame_dt = clock.tick(60) / 1000.0
@@ -494,9 +524,10 @@ def main():
         if callable(poll_pending):
             poll_pending()
         poll_network()
-        if pending_launch_gid is not None and profile_ready:
+        pending_launch_gid = profile_controller.pop_ready_launch(
+            ready=profile_ready)
+        if pending_launch_gid is not None:
             launch_game(pending_launch_gid)
-            pending_launch_gid = None
         if (health_future is None
                 and now - last_health_check >= HEALTH_REFRESH_SECS):
             health_future = backend.health_async()
@@ -585,7 +616,7 @@ def main():
                         if not profile_ready:
                             launch_error = (profile_error
                                             or "正在载入本机档案，请稍候")
-                            pending_launch_gid = gid
+                            profile_controller.queue_launch(gid)
                             retry_profile_save()
                             break
                         launch_game(gid)
