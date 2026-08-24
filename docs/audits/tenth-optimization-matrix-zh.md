@@ -54,7 +54,7 @@
 | CG10-P1-27 | 完成 | archive 覆盖 attempts/profile/progress/slot/settings 与 invalid rows。 |
 | CG10-P1-28 | 完成 | preview 统计 new/conflict/invalid；`--apply` 原子插入、现有行优先、操作前备份。 |
 | CG10-P1-29 | 接受 | 当前仍以终端错误和 recovery notice 为主；旋转结构化日志尚未实现。 |
-| CG10-P1-30 | 待推送 | 本地验证完成后推送并记录本次 head 的实际 CI 结果。 |
+| CG10-P1-30 | 完成 | `de04abc` 的 CI #24 共 7 个 job 全部成功。 |
 | CG10-P1-31 | 外部 | branch protection 需要仓库设置授权，本轮未修改。 |
 | CG10-P1-32 | 完成 | workflow 顶层权限收紧为 `contents: read`。 |
 | CG10-P1-33 | 接受 | Actions 使用明确 major 版本但未锁 commit SHA；需单独维护可信 SHA 清单。 |

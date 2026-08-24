@@ -13,7 +13,7 @@
 - [x] 增加 release profile、JUnit/JSON、CI 最小权限和发行约束；
 - [x] 完成第一轮独立复查并重新验证；
 - [x] 完成第二轮独立复查并重新验证；
-- [ ] 提交、推送并核验远端 CI。
+- [x] 提交、推送并核验远端 CI。
 
 ## 初版验证
 
@@ -52,4 +52,5 @@
 - Ruff、compileall、shell 语法、whitespace、118 行优化矩阵计数全部通过；
 - `tests.release full` 成功生成 JUnit/JSON；pip-audit 未发现已知漏洞；wheel smoke 生成
   141,569 字节 wheel；
-- 远端 CI 待推送后核验。
+- 提交 `de04abc` 已推送到 `origin/main`；GitHub Actions CI #24 的 release-gate、core-only、
+  Python 3.12/3.13、Ubuntu、macOS、Windows 共 7 个 job 全部成功。

@@ -57,3 +57,5 @@ dummy driver、完整存储测试和压力检查；没有把任务书中“审�
 - `tests.release full` 的 storage/stress/gameplay 三层均成功，并生成 JUnit/JSON；
 - pip-audit 未发现固定发行依赖的已知漏洞；wheel smoke 成功生成 141,569 字节 wheel；
 - P0/P1/P2/P3 矩阵分别为 12/48/32/26 行，共 118 行。
+- `de04abc` 推送后的 GitHub Actions CI #24 共 7 个 job 全部成功，包括独立 release-gate、
+  core-only、Python 3.12/3.13 和 Ubuntu/macOS/Windows 全量检查。
