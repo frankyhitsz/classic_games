@@ -59,7 +59,18 @@ jobs:
             python -c 'from pathlib import Path; text=Path("storage-tests.log").read_text(errors="replace"); detail="\n".join(text.splitlines()[-40:]); detail=detail.replace("%","%25").replace("\r","%0D").replace("\n","%0A"); print(f"::error title=Storage test failures::{detail}")'
           fi
           exit ${status}
-      - run: python -m coverage run --append -m tests.stress
+      - name: Run stress tests
+        shell: bash
+        run: |
+          set -o pipefail
+          set +e
+          python -m coverage run --append -m tests.stress 2>&1 | tee stress-tests.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ ${status} -ne 0 ]]; then
+            python -c 'from pathlib import Path; text=Path("stress-tests.log").read_text(errors="replace"); detail="\n".join(text.splitlines()[-30:]); detail=detail.replace("%","%25").replace("\r","%0D").replace("\n","%0A"); print(f"::error title=Stress test failures::{detail}")'
+          fi
+          exit ${status}
       - run: python -m coverage report --fail-under=60
       - run: python -m coverage xml
       - run: python -m tests.ci_regression
@@ -70,6 +81,7 @@ jobs:
           path: |
             coverage.xml
             storage-tests.log
+            stress-tests.log
             ci-regression.log
           if-no-files-found: ignore
 

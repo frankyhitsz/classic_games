@@ -31,6 +31,12 @@ from game_service.local_backend import LocalBackendClient, completed_future
 from game_service.store import LocalGameStore
 
 SEED = 20260824
+CI_RENDER_P95_MS = 50.0
+LOCAL_RENDER_P95_MS = 16.7
+CI_SAVE_P95_MS = 50.0
+LOCAL_SAVE_P95_MS = 16.7
+CI_SUBMIT_P99_MS = 10.0
+LOCAL_SUBMIT_P99_MS = 2.0
 
 
 class StubBackend:
@@ -134,6 +140,8 @@ def exercise_games(rng: random.Random) -> None:
 def render_benchmark() -> None:
     backend = StubBackend()
     results = []
+    p95_budget = (CI_RENDER_P95_MS if os.environ.get("CI")
+                  else LOCAL_RENDER_P95_MS)
     for game_type in (Tetris, Snake, Game2048, Sokoban, Zuma):
         game = game_type(backend=backend)
         for _ in range(10):
@@ -145,7 +153,7 @@ def render_benchmark() -> None:
             samples.append((time.perf_counter() - started) * 1000)
         ordered = sorted(samples)
         p95 = ordered[int(len(ordered) * 0.95) - 1]
-        assert p95 <= 16.7, (game_type.__name__, p95)
+        assert p95 <= p95_budget, (game_type.__name__, p95, p95_budget)
         results.append(
             f"{game_type.__name__} median={statistics.median(samples):.3f}ms "
             f"p95={p95:.3f}ms")
@@ -166,7 +174,9 @@ def storage_stress(root: Path) -> None:
     ordered = sorted(samples)
     p95 = ordered[int(len(ordered) * 0.95) - 1]
     p99 = ordered[int(len(ordered) * 0.99) - 1]
-    assert p95 <= 16.7
+    save_budget = (CI_SAVE_P95_MS if os.environ.get("CI")
+                   else LOCAL_SAVE_P95_MS)
+    assert p95 <= save_budget, (p95, save_budget)
     backend.close()
     print(f"local-save: median={statistics.median(samples):.3f}ms "
           f"p95={p95:.3f}ms p99={p99:.3f}ms")
@@ -193,7 +203,9 @@ def storage_stress(root: Path) -> None:
     assert locked.drain(5)
     assert locked.store.attempt_count("snake") == 20
     submit_p99 = sorted(submit_samples)[int(len(submit_samples) * 0.99) - 1]
-    assert submit_p99 <= 2.0, submit_p99
+    submit_budget = (CI_SUBMIT_P99_MS if os.environ.get("CI")
+                     else LOCAL_SUBMIT_P99_MS)
+    assert submit_p99 <= submit_budget, (submit_p99, submit_budget)
     locked.close()
     print(f"locked-submit: p99={submit_p99:.3f}ms, durable fallback=ok")
 

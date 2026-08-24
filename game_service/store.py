@@ -728,7 +728,8 @@ class LocalGameStore:
 
     @staticmethod
     def _migration_profile(conn: sqlite3.Connection, raw_profile,
-                           display_name: Optional[str] = None) -> str:
+                           display_name: Optional[str] = None,
+                           last_used: Optional[float] = None) -> str:
         raw = raw_profile if isinstance(raw_profile, str) else "guest"
         try:
             profile_id = ProfileIdentity.validate_uuid(raw).profile_id
@@ -739,12 +740,12 @@ class LocalGameStore:
                 display_name or raw or "guest")
         except ProfileIdentityError:
             name = "guest"
-        now = time.time()
+        timestamp = time.time() if last_used is None else last_used
         conn.execute(
             "INSERT INTO profiles(profile_id, display_name, created_at, last_used) "
             "VALUES (?, ?, ?, ?) ON CONFLICT(profile_id) DO UPDATE SET "
             "last_used=MAX(profiles.last_used, excluded.last_used)",
-            (profile_id, name, now, now))
+            (profile_id, name, timestamp, timestamp))
         return profile_id
 
     @staticmethod
@@ -789,11 +790,12 @@ class LocalGameStore:
             for row in rows:
                 data = {key: row[key] for key in row.keys()}
                 try:
-                    profile_id = self._migration_profile(
-                        conn, data.get("profile_id", "guest"))
                     updated_at = float(data.get("updated_at") or time.time())
                     if not math.isfinite(updated_at) or updated_at < 0:
                         raise ValueError("invalid timestamp")
+                    profile_id = self._migration_profile(
+                        conn, data.get("profile_id", "guest"),
+                        last_used=updated_at)
                     if kind == "settings":
                         key = self._query_identifier(
                             data.get("key"), "setting_key", 64)
@@ -1577,14 +1579,20 @@ class LocalGameStore:
         with self.connection() as conn:
             row = conn.execute(
                 "SELECT profile_id, display_name, last_used FROM profiles "
-                "ORDER BY last_used DESC, profile_id LIMIT 1").fetchone()
+                "ORDER BY last_used DESC, "
+                "EXISTS(SELECT 1 FROM attempts "
+                "WHERE attempts.profile_id=profiles.profile_id) DESC, "
+                "profile_id LIMIT 1").fetchone()
         return dict(row) if row is not None else None
 
     def list_profiles(self) -> list[dict]:
         with self.connection() as conn:
             rows = conn.execute(
                 "SELECT profile_id, display_name, created_at, last_used "
-                "FROM profiles ORDER BY last_used DESC, profile_id").fetchall()
+                "FROM profiles ORDER BY last_used DESC, "
+                "EXISTS(SELECT 1 FROM attempts "
+                "WHERE attempts.profile_id=profiles.profile_id) DESC, "
+                "profile_id").fetchall()
         return [dict(row) for row in rows]
 
     @staticmethod

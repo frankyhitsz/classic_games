@@ -6,6 +6,7 @@ __pycache__/
 .coverage
 ci-regression.log
 storage-tests.log
+stress-tests.log
 coverage.xml
 htmlcov/
 build/
