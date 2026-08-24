@@ -54,3 +54,6 @@
   141,569 字节 wheel；
 - 提交 `de04abc` 已推送到 `origin/main`；GitHub Actions CI #24 的 release-gate、core-only、
   Python 3.12/3.13、Ubuntu、macOS、Windows 共 7 个 job 全部成功。
+- 纯文档提交触发的 CI #25 在 macOS 暴露 stress fixture 固定 1 秒 Future 等待；同一功能提交的
+  #24 已通过，#25 runner 的保存 p99 同时从约 3 ms 抖到 29 ms。测试改为 CI 30 秒总完成期限，
+  不改变异步入队 p99、同步保存 p95 或任何产品超时。

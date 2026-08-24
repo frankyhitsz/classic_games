@@ -42,6 +42,7 @@ CI_WINDOWS_SAVE_P95_MS = 750.0
 LOCAL_SAVE_P95_MS = 16.7
 CI_SUBMIT_P99_MS = 10.0
 LOCAL_SUBMIT_P99_MS = 2.0
+ASYNC_COMPLETION_TIMEOUT_SECONDS = 30.0 if os.environ.get("CI") else 5.0
 
 
 class StubBackend:
@@ -202,13 +203,13 @@ def storage_stress(root: Path) -> None:
             "snake", f"locked-{index}", index,
             request_id=f"locked-stress-request-{index:016d}"))
         submit_samples.append((time.perf_counter() - started) * 1000)
-    first = futures[0].result(timeout=1)
+    first = futures[0].result(timeout=ASYNC_COMPLETION_TIMEOUT_SECONDS)
     assert first["durable_pending"]
     blocker.rollback()
     blocker.close()
-    assert locked.drain(5)
-    locked.retry_failed_saves().result(timeout=2)
-    assert locked.drain(5)
+    assert locked.drain(ASYNC_COMPLETION_TIMEOUT_SECONDS)
+    locked.retry_failed_saves().result(timeout=ASYNC_COMPLETION_TIMEOUT_SECONDS)
+    assert locked.drain(ASYNC_COMPLETION_TIMEOUT_SECONDS)
     assert locked.store.attempt_count("snake") == 20
     submit_p99 = sorted(submit_samples)[int(len(submit_samples) * 0.99) - 1]
     submit_budget = (CI_SUBMIT_P99_MS if os.environ.get("CI")

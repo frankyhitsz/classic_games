@@ -59,3 +59,5 @@ dummy driver、完整存储测试和压力检查；没有把任务书中“审�
 - P0/P1/P2/P3 矩阵分别为 12/48/32/26 行，共 118 行。
 - `de04abc` 推送后的 GitHub Actions CI #24 共 7 个 job 全部成功，包括独立 release-gate、
   core-only、Python 3.12/3.13 和 Ubuntu/macOS/Windows 全量检查。
+- 随后的纯文档 CI #25 在 macOS 暴露 stress fixture 固定 1 秒 Future 等待；改用 CI 30 秒总完成
+  期限等待真实状态，不放宽异步入队 p99、同步保存 p95 或产品数据库预算。
