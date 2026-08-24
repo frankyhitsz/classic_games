@@ -59,3 +59,6 @@
 - 第二次 CI 的 lint 与 Python 兼容任务通过，macOS gameplay 阶段呈现单项冷启动超时特征。
   单项子进程预算由 15 秒调至 30 秒，job 总超时不变；CI 现在始终上传 gameplay 详细日志，
   后续失败不再只剩退出码。
+- CI #6 进一步定位到 Windows storage 与 macOS gameplay。启动器速度用例原先只发一次退出，
+  在慢 runner 上会与新增的未持久 profile 退出保护混测；现固定使用无 profile 状态的 HTTP stub。
+  Windows 子进程完成预算由 2 秒调至 10 秒，storage 输出也始终进入 artifact。

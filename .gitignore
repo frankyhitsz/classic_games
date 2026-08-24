@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 ci-regression.log
+storage-tests.log
 coverage.xml
 htmlcov/
 build/

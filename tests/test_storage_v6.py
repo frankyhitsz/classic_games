@@ -56,7 +56,7 @@ class StateJournalV2Tests(unittest.TestCase):
                 self.assertTrue(marker.exists())
                 time.sleep(0.05)
                 self.assertFalse(finished.exists())
-            self.assertEqual(process.wait(timeout=2), 0)
+            self.assertEqual(process.wait(timeout=10), 0)
             self.assertTrue(finished.exists())
 
     def test_old_worker_cannot_delete_or_overwrite_new_operation(self):

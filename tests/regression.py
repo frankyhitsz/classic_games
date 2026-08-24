@@ -747,7 +747,9 @@ run("tetris-rotate-against-floor", """
 # ===========================================================================
 print("\n=== 28. Launcher redraws within 3 s after a sub-game exits ===")
 run("launcher-fast-return", """
-    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import os
+    os.environ['SDL_VIDEODRIVER']='dummy'
+    os.environ['GAMES_USE_HTTP']='1'
     import threading, time, pygame
     from client.common.network import BackendClient
     import client.launcher as L
