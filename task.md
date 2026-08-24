@@ -11,7 +11,7 @@
 - [x] 完成第一轮独立复查并重新验证；
 - [x] 完成第二轮独立复查并重新验证；
 - [x] 更新逐条审查结论并执行最终完整检查；
-- [ ] 创建提交并推送远端。
+- [x] 创建提交并推送远端。
 
 ## 实现摘要
 
@@ -73,3 +73,4 @@
   `e0ae24d4f1361b98e009c7d158f060beff01a8e6b41bed9fa3b2c4c539ec42ca`。
 
 详细判断见 `classic_games_sixth_code_review_response_zh.md`。
+实现提交 `e0393b0` 已推送到 `origin/main`。
