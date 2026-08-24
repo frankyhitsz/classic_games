@@ -443,7 +443,7 @@ for mod_name, cls_name in [("tetris","Tetris"), ("snake","Snake"),
 # ===========================================================================
 print("\n=== 15. Launcher: hovering a card switches leaderboard title ===")
 run("launcher-hover-switches-leaderboard", """
-    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'; os.environ['GAMES_USE_HTTP']='1'
     import threading, time, pygame
     from client.common.network import BackendClient
     import client.launcher as L
@@ -481,7 +481,7 @@ run("launcher-hover-switches-leaderboard", """
 # ===========================================================================
 print("\n=== 16. Launcher: two clicks in the same frame launch only ONE game ===")
 run("launcher-no-double-launch", """
-    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'; os.environ['GAMES_USE_HTTP']='1'
     import threading, time, pygame
     from client.common.network import BackendClient
     import client.launcher as L
@@ -513,7 +513,7 @@ run("launcher-no-double-launch", """
 # ===========================================================================
 print("\n=== 17. Launcher: returning from a sub-game doesn't crash ===")
 run("launcher-return-no-crash", """
-    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'; os.environ['GAMES_USE_HTTP']='1'
     import threading, time, pygame
     from client.common.network import BackendClient
     import client.launcher as L
@@ -675,7 +675,7 @@ run("recent-shows-game-id", """
 # ===========================================================================
 print("\n=== 25. Launcher formats recent rows with the game name visible ===")
 run("launcher-recent-shows-game-name", """
-    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'; os.environ['GAMES_USE_HTTP']='1'
     import threading, time, pygame
     from client.common.network import BackendClient
     import client.launcher as L
@@ -962,7 +962,7 @@ run("2048-score-no-overflow", """
 # ===========================================================================
 print("\n=== 36. Launcher player input truncates long names ===")
 run("launcher-input-truncates", """
-    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'; os.environ['GAMES_USE_HTTP']='1'
     import threading, time, pygame
     from client.common.network import BackendClient
     import client.launcher as L
@@ -1332,7 +1332,7 @@ run("zuma-entrance-queue-spacing", """
 # ===========================================================================
 print("\n=== 48. Launcher guest label is a placeholder, not typed text ===")
 run("launcher-guest-placeholder", """
-    import os; os.environ['SDL_VIDEODRIVER']='dummy'
+    import os; os.environ['SDL_VIDEODRIVER']='dummy'; os.environ['GAMES_USE_HTTP']='1'
     import threading, time, pygame
     from client.common.network import BackendClient
     import client.launcher as L

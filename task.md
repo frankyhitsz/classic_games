@@ -90,3 +90,6 @@
   “探测空闲端口—关闭—子进程重绑”的竞态；健康检查、真实 HTTP 请求和关闭回收仍完整执行。
 - CI #15 全部通过：Ubuntu、macOS、Windows 的 storage、stress、gameplay，Python 3.12/3.13
   兼容任务及 core-only 安装任务均成功。
+- 纯文档提交触发的 CI #16 在 Ubuntu 偶发卡住 `launcher-guest-placeholder`，查明六个启动器 UI
+  用例虽然 monkeypatch 了 `BackendClient`，却没有启用 HTTP 测试模式，实际走了本机档案初始化
+  和退出保护。六项现显式使用其 stub 后端，避免把输入/悬停/点击测试与持久化生命周期混测。
