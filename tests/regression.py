@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent.parent
 ENV = {**os.environ, "SDL_VIDEODRIVER": "dummy", "SDL_AUDIODRIVER": "dummy",
        "PYTHONPATH": str(ROOT)}
 PASS, FAIL = 0, 0
+SUBPROCESS_TIMEOUT_SECONDS = 30
 
 
 def run(name: str, body: str) -> None:
@@ -26,10 +27,12 @@ def run(name: str, body: str) -> None:
     try:
         proc = subprocess.run(
             [sys.executable, "-c", full], env=ENV, capture_output=True,
-            text=True, cwd=str(ROOT), timeout=15)
+            text=True, cwd=str(ROOT), timeout=SUBPROCESS_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         FAIL += 1
-        print(f"  FAIL: {name} (timed out after 15s)")
+        print(
+            f"  FAIL: {name} "
+            f"(timed out after {SUBPROCESS_TIMEOUT_SECONDS}s)")
         return
     if proc.returncode == 0:
         PASS += 1

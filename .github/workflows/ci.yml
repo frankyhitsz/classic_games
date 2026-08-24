@@ -56,7 +56,9 @@ jobs:
         if: always()
         with:
           name: coverage-${{ matrix.os }}-py${{ matrix.python-version }}
-          path: coverage.xml
+          path: |
+            coverage.xml
+            ci-regression.log
           if-no-files-found: ignore
 
   python-compatibility:

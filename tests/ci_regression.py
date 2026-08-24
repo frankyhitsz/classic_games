@@ -65,7 +65,14 @@ def main() -> int:
                 })
                 result = subprocess.run(
                     [sys.executable, "-m", "tests.regression"],
-                    cwd=ROOT, env=test_env)
+                    cwd=ROOT, env=test_env, capture_output=True, text=True,
+                    check=False)
+                output = result.stdout
+                if result.stderr:
+                    output += "\n[stderr]\n" + result.stderr
+                (ROOT / "ci-regression.log").write_text(
+                    output, encoding="utf-8")
+                print(output, end="" if output.endswith("\n") else "\n")
                 return result.returncode
             finally:
                 server.terminate()

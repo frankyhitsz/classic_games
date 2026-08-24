@@ -4,6 +4,7 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 .coverage
+ci-regression.log
 coverage.xml
 htmlcov/
 build/

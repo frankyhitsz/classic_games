@@ -56,3 +56,6 @@
 - 首次推送触发的 CI 暴露 Ruff 0.16 扩大隐式规则集造成的工具漂移；现显式固定项目既有
   correctness 规则，并用 Ruff 0.12 与 0.16.4 双版本检查。GitHub Actions 升至 Node 24 的
   v7 action，移除 runner 的 Node 20 弃用路径。
+- 第二次 CI 的 lint 与 Python 兼容任务通过，macOS gameplay 阶段呈现单项冷启动超时特征。
+  单项子进程预算由 15 秒调至 30 秒，job 总超时不变；CI 现在始终上传 gameplay 详细日志，
+  后续失败不再只剩退出码。
