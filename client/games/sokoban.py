@@ -288,6 +288,9 @@ class Sokoban(BaseGame):
         self.level_scores: dict[int, int] = {}
         self.completed_levels: set[int] = set()
         self.practice_mode = False
+        self.unlocked_level = 1
+        self.saved_completed_levels: set[int] = set()
+        self._progress_future = None
         self._confirmed_total: Optional[int] = None
         self._pending_total: Optional[int] = None
         w, h = level_bounds(LEVELS[0])
@@ -295,6 +298,30 @@ class Sokoban(BaseGame):
                          fps=60, backend=backend, player=player,
                          profile_id=profile_id)
         self.load_level(0)
+        load_progress = getattr(self.backend, "get_progress_async", None)
+        if callable(load_progress):
+            self._progress_future = load_progress(
+                self.profile_id, self.game_id, "campaign", {})
+
+    def _poll_progress(self) -> None:
+        future = self._progress_future
+        if future is None or not future.done():
+            return
+        self._progress_future = None
+        try:
+            value = future.result()
+        except Exception:  # noqa: BLE001 - a new campaign remains playable
+            return
+        if not isinstance(value, dict):
+            return
+        unlocked = value.get("unlocked_level", 1)
+        completed = value.get("completed_levels", [])
+        if type(unlocked) is int:
+            self.unlocked_level = min(len(LEVELS), max(1, unlocked))
+        if (isinstance(completed, list)
+                and all(type(item) is int and 0 <= item < len(LEVELS)
+                        for item in completed)):
+            self.saved_completed_levels = set(completed)
 
     def load_level(self, idx: int):
         self.level_idx = idx
@@ -333,7 +360,7 @@ class Sokoban(BaseGame):
         self.offset_y = 66
 
     def update(self, dt: float):
-        pass
+        self._poll_progress()
 
     def handle_event(self, event):
         # Let BaseGame handle QUIT, ESC (return to launcher), P (pause),
@@ -359,6 +386,10 @@ class Sokoban(BaseGame):
             self.load_level(next_idx)
             if next_idx != 0:
                 self.practice_mode = True
+            return
+        if event.key == pygame.K_k and self.unlocked_level > 1:
+            self.load_level(self.unlocked_level - 1)
+            self.practice_mode = True
             return
         if event.key in (pygame.K_u, pygame.K_BACKSPACE):
             if self.state == "playing":
@@ -429,11 +460,12 @@ class Sokoban(BaseGame):
                       "completed_levels": len(self.completed_levels),
                       "practice": self.practice_mode,
                       "completed_all": completed_all}
-            save_progress = getattr(self.backend, "set_progress_async", None)
+            save_progress = getattr(self.backend, "merge_progress_async", None)
             if callable(save_progress):
                 try:
                     save_progress(
-                        self.profile_id, self.game_id, "campaign",
+                        self.profile_id, self.game_id,
+                        "practice" if self.practice_mode else "campaign",
                         {"unlocked_level": min(
                             len(LEVELS), max(self.completed_levels) + 2),
                          "completed_levels": sorted(self.completed_levels),
@@ -470,6 +502,7 @@ class Sokoban(BaseGame):
         self.load_level(next_idx)
 
     def draw(self):
+        self._poll_progress()
         draw_gradient_bg(self.screen, top=(252, 253, 255),
                          bottom=(221, 232, 255))
         header = pygame.Rect(12, 8, self.width - 24, 48)
@@ -488,7 +521,8 @@ class Sokoban(BaseGame):
         draw_text(self.screen, stats_line,
                   (header.right - sw - 12, header.y + 9), size=15,
                   color=COLORS["text"], bold=True)
-        hint = "U/退格 撤销 · R 重置 · N 跳关(练习) · Esc 返回菜单"
+        hint = (f"已解锁 {self.unlocked_level}/{len(LEVELS)} · "
+                "K 前往最高关 · N 练习跳关 · Esc 返回")
         hw = _font(11).size(hint)[0]
         draw_text(self.screen, hint,
                   (header.right - hw - 12, header.y + 29), size=11,

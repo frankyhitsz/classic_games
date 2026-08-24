@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any, Optional, Protocol
 
 from .catalog import GAME_BY_ID
+from .profile import ProfileIdentity
 
 
 class StorageErrorKind(str, Enum):
@@ -64,9 +65,7 @@ class AttemptContext:
                  profile_id: Optional[str] = None, mode: str = "classic",
                  status: str = "completed") -> "AttemptContext":
         if profile_id is None:
-            profile_id = uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"classic-games-local-profile:{player}").hex
+            profile_id = ProfileIdentity.from_legacy_name(player).profile_id
         return cls(
             game_id=game_id,
             profile_id=profile_id,
@@ -136,6 +135,34 @@ class GameDataService(Protocol):
     def leaderboard_async(self, game_id: str, limit: int = 10): ...
 
     def recent_async(self, limit: int = 20): ...
+
+    def last_profile_async(self): ...
+
+    def list_profiles_async(self): ...
+
+    def ensure_profile_async(
+            self, display_name: str,
+            profile_id: Optional[str] = None): ...
+
+    def set_setting_async(self, profile_id: str, key: str, value): ...
+
+    def set_progress_async(
+            self, profile_id: str, game_id: str, key: str, value,
+            ruleset_version: Optional[str] = None): ...
+
+    def merge_progress_async(
+            self, profile_id: str, game_id: str, key: str, value,
+            ruleset_version: Optional[str] = None): ...
+
+    def get_progress_async(
+            self, profile_id: str, game_id: str, key: str, default=None,
+            ruleset_version: Optional[str] = None): ...
+
+    def save_slot_async(
+            self, profile_id: str, game_id: str, slot_id: str, state): ...
+
+    def load_slot_async(
+            self, profile_id: str, game_id: str, slot_id: str): ...
 
     def submit_score_reliable_async(
             self, game_id: str, player: str, score: int, *, extra=None,

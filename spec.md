@@ -1,62 +1,59 @@
-# 第六次审查修复规格
+# 第七次审查修复规格
 
 ## 目标
 
-逐项核对第六次审查任务书，先关闭本地成绩丢失和坏旧数据阻断启动的风险，再完善
-保存状态回写、迁移约束、本机档案和工程门禁。默认桌面路径继续保持离线、本机优先；
-Flask 只作为显式开启的调试适配器。
+核对第七次审查指出的升级、档案、进度和自动存档问题，保证上一版本留下的数据库与待保存
+成绩可以直接升级，并让默认桌面模式在数据库暂时被锁或损坏时保住最新本机状态。
 
 ## 范围
 
-- SQLite 错误优先按 error code 分类；磁盘满、只读、I/O、锁、结构和损坏库均不得被
-  当作请求语义错误而删除最后一份 mutation；
-- 旧 `pending_saves.json` 和逐 request spool 使用严格 JSON、大小、深度、节点数和
-  有限数限制；单个坏文件、隔离失败或无法生成预览不阻断其他记录和游戏启动；
-- 每个 request 保存 `durable_pending`、`committed`、`recovery_required`、
-  `quarantined` 或 `permanent_failure` 状态，游戏界面可在后台重试后更新结果；
-- 手动重试、首次 pending 扫描、quarantine 计数和启动器的数据库初始化不在 pygame
-  线程执行；重试和重开使用退避；
-- 待保存重放沿用最初结算时间，外部旧库导入与 schema 快路径解耦，同内容换路径不重复；
-- schema v4 检查行级不变量，并用触发器约束后续直接写入；无效行在备份后隔离；
-- 本机档案使用 UUID，显示名、最后使用档案、设置、进度和存档槽有实际读写入口；
-- 启动器使用 `TEXTINPUT/TEXTEDITING`，推箱子和祖玛保存进度，2048 自动保存和恢复；
-- 2048 使用 BaseGame 的统一保存状态机，只保留同 attempt 新 revision 的排队策略；
-- optional Flask 对查询参数和 JSON 错误保持一致，HTTP 重试按 attempt 维度清理；
-- 增加三平台 CI、coverage 产物、版本记录和社区维护文档。
+- Windows 和 POSIX 使用操作系统文件锁串行化同一 request，不使用 PID 探测；
+- 待保存成绩 schema 1 原件先备份，再转换为 schema 2 和统一的 UUID 档案身份；
+- SQLite schema v5 显式转换旧 settings、progress、save_slots，增加外键、规则版本、数据版本
+  和损坏本机状态隔离表；
+- standalone 结算与旧成绩导入在同一事务中补齐 profile，排行榜采用当前显示名；
+- 启动器在档案确认前不启动游戏，支持本机档案新建、轮换和改名；
+- 推箱子与祖玛进度按 ruleset 隔离，使用单调合并，练习与闯关分键；
+- 档案、设置、进度和存档使用 keyed latest-value journal，在写库失败后自动补写；
+- 2048 在读取自动存档期间屏蔽玩法输入，存档包含 attempt/revision/提交确认状态，终局存档
+  不恢复成可继续的棋盘；
+- schema repair、系统时钟回拨和保存状态缓存淘汰有可恢复的状态语义；
+- HTTP 调试模式明确保持“成绩 API only”，不伪装成本机数据服务的等价实现。
 
 ## 非目标
 
-- 不增加账号、云端存储、公网排行榜、匹配、反作弊、强制联网或遥测；
-- 不在没有独立规则版本和验收用例时改变五款游戏的核心计分与随机规则；
-- 不由代码提交替仓库所有者选择 LICENSE；
-- 不声称本机注入测试等同于 Windows、Linux 和 macOS 的真实桌面打包验收；CI 提供的是
-  headless smoke，而不是安装器证明。
+- 不增加账号、云同步、公网排行、遥测或在线反作弊；
+- 不在没有新 ruleset、玩法说明和验收样例时改变计分、随机性或关卡规则；
+- 不代表仓库所有者选择代码和素材许可证；
+- 不把 headless CI 当作 Windows/macOS 安装包和真实显示设备的发布验收。
 
 ## 关键决策
 
-1. 只有 mutation 本身永久非法时才可清除 pending；所有存储基础设施错误默认保留。
-2. `StorageErrorKind` 与 `SaveState` 使用枚举，catalog 的 score policy 也使用枚举并在
-   import 时验证。
-3. pending envelope 的 `created_at` 是结算事实时间，重放写入 attempt 的 finished/achieved
-   时间时继续使用该值。
-4. external legacy 内容 hash 负责跨路径去重，路径状态 marker 负责同一路径快速启动；失败
-   marker 有重试时间，不能触发反复 schema backup。
-5. schema v4 在迁移事务内修复旧 transport/profile 身份、隔离坏行、创建约束触发器和
-   `expires_at` 索引；回执每批最多删除 500 条。
-6. 显示名不再承担身份语义。旧显示名 profile 映射为确定性 UUID，新档案生成随机 UUID。
-7. 启动器允许记录服务在后台初始化；同步 LocalGameStore API仍保留给脚本、测试和 Flask。
-8. 2048 自动存档只接受当前 ruleset、版本 1、4×4 且值为 0 或不小于 2 的二次幂棋盘。
+1. 锁文件是稳定 inode，锁的持有与释放由内核负责；文件内容不表示进程存活。
+2. schema 1 pending 的旧 payload hash 先按旧语义核对，身份转换后重算 schema 2 hash；原字节
+   保存在 migration-backup。
+3. schema v5 的状态表迁移与版本写入位于一个 `BEGIN IMMEDIATE` 事务；开始前用 SQLite backup
+   API 创建独立备份，坏 JSON 进入 `invalid_local_state`。
+4. 当前档案名负责展示，attempt 行保留结算时名字作为恢复后备；具体策略见
+   `docs/adr/profile-display-name.md`。
+5. 关卡进度合并对数字取最大值、布尔取或、集合列表取并集、分数字典逐项取最大值；规则版本
+   和 practice/campaign 都是存储维度。
+6. keyed state journal 每个语义键只保留最新操作。写库成功后仅在文件 hash 仍匹配时删除，避免
+   旧 worker 清掉另一进程写入的更新。
+7. 2048 schema 2 存档拒绝越界分数、非法棋盘值、矛盾 won 状态和无效 attempt 元数据；旧
+   schema 1 棋盘可读取并在下一次写入时升级。
+8. 对未来墙钟超过五分钟的合法 pending 使用当前时间入库并在回执中标记 `clock_adjusted`，
+   不把时钟校正当作永久请求错误。
 
 ## 验收标准
 
-- F01–F22 均有代码、测试或具体不采纳理由；
-- FULL 与 outbox ENOSPC 同时发生时 mutation 仍留在内存并可在释放空间后提交；
-- NaN、Infinity、深嵌套、超大和逐文件 OSError 不逃出 outbox 构造/扫描；
-- pending 最终 commit/quarantine 可观察，BaseGame 和 2048 都能回写界面；
-- 手动 retry 调用和异步 submit 调用不阻塞 pygame 线程；
-- 旧库换路径不重复，重放不改变完成时间，当前坏行在备份后进入 `invalid_attempts`；
-- 零分推箱子完整通关仍提交，并列第一显示相同奖牌，最近记录不显示竞技奖牌；
-- 档案、设置、进度和 2048 存档完成真实数据库往返，昵称与 IME 有界面路径；
-- 全部功能、存储、固定输入、渲染、资源和 SQLite 并发检查通过；
-- Ruff、编译、wheel、shell、whitespace 和数据库指纹检查通过；
-- 提交只包含本轮相关改动以及用户已放入工作区的审查文档替换。
+- 第七次审查 F01–F22 均有代码结果或明确取舍；
+- schema v2 含旧 attempts/state tables 的数据库可升级、备份、重复初始化，分数和状态可读；
+- schema 1 per-request pending 能恢复旧显示名身份、重算 hash 并重放；
+- Windows 锁路径不调用 `os.kill`，坏锁内容与 metadata 前崩溃不造成永久阻塞；
+- orphan 状态写入被拒绝，损坏 JSON 被隔离并返回默认值；
+- 数据库持锁期间的进度写入返回 durable pending，解锁后可补写；
+- 2048 载入前输入无效，恢复 attempt 身份，gameover slot 不恢复为 playing；
+- 原有玩法、界面、存储、迁移和压力检查通过；Ruff、编译、whitespace、构建与默认数据库
+  指纹检查通过；
+- 完成两轮独立复查，修复每轮新发现的问题后重新验证。

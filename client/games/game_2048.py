@@ -32,6 +32,7 @@ import pygame
 from client.common.ui import (COLORS, SAVE_PENDING, SAVE_SAVING, BaseGame, Button,
                               draw_gradient_bg, draw_text, ease_out_back,
                               ease_out_cubic)
+from game_service.mutation import MAX_SCORE
 from game_service.service import GameDataService
 
 GRID = 4
@@ -109,18 +110,28 @@ class Game2048(BaseGame):
                          profile_id=profile_id)
         self._slot_load_future = None
         self._slot_save_future = None
+        self.slot_load_state = "ready"
+        self.slot_save_error: Optional[str] = None
         self._initializing_board = True
         self.reset()
         self._initializing_board = False
+        ensure_and_load = getattr(
+            self.backend, "ensure_profile_and_load_slot_async", None)
         load_slot = getattr(self.backend, "load_slot_async", None)
-        if callable(load_slot):
+        if callable(ensure_and_load):
+            self._slot_load_future = ensure_and_load(
+                self.player, self.profile_id, self.game_id, "autosave")
+        elif callable(load_slot):
             self._slot_load_future = load_slot(
                 self.profile_id, self.game_id, "autosave")
+        if self._slot_load_future is not None:
+            self.slot_load_state = "loading"
 
     # ------------------------------------------------------------------
     def reset(self):
         if not getattr(self, "_initializing_board", False):
             self._slot_load_future = None
+            self.slot_load_state = "ready"
         self._detach_queued_score_submission()
         self.begin_score_session()
         self.tiles: List[Tile] = []
@@ -280,6 +291,7 @@ class Game2048(BaseGame):
                 self.state = "gameover"
                 self._queued_directions.clear()
                 self.extra = {"max_tile": self._max_tile(), "won": self.won}
+                self._save_autosave_slot()
                 self._submit_score(extra=self.extra)
             return False
 
@@ -291,10 +303,12 @@ class Game2048(BaseGame):
     def update(self, dt: float) -> None:
         # Animations keep progressing in any state — see ``update_overlay``.
         self._poll_slot_load()
+        self._poll_slot_save()
         self._tick_animations(dt)
 
     def update_overlay(self, dt: float) -> None:
         self._poll_slot_load()
+        self._poll_slot_save()
         # A real pause must freeze the in-flight move. Previously the slide
         # finalized behind the pause overlay while tile spawning was skipped
         # because state != "playing", effectively granting a free move.
@@ -342,6 +356,9 @@ class Game2048(BaseGame):
                 self.extra = {"max_tile": self._max_tile(), "won": self.won}
                 self._submit_score(extra=self.extra)
 
+            if pending is not None:
+                self._save_autosave_slot()
+
             # Discard no-op commands immediately. Otherwise a blocked command
             # can leave a later direction queued until an unrelated future
             # move, producing a surprising delayed slide.
@@ -361,9 +378,15 @@ class Game2048(BaseGame):
         if not callable(save_slot):
             return
         state = {
-            "version": 1,
+            "version": 2,
+            "game_state": self.state,
             "score": self.score,
             "won": self.won,
+            "won_announced": self._won_announced,
+            "attempt_uuid": self._score_attempt_uuid,
+            "revision": self.attempt_context.revision,
+            "submission_id": self._score_submission_id,
+            "confirmed_score": self.submitted_score,
             "grid": [[self.grid[row][col].value
                       if self.grid[row][col] is not None else 0
                       for col in range(GRID)] for row in range(GRID)],
@@ -373,6 +396,23 @@ class Game2048(BaseGame):
                 self.profile_id, self.game_id, "autosave", state)
         except Exception:  # noqa: BLE001 - score play remains available
             self._slot_save_future = None
+            self.slot_save_error = "自动存档暂时未保存"
+
+    def _poll_slot_save(self) -> None:
+        future = self._slot_save_future
+        if future is None or not future.done():
+            return
+        self._slot_save_future = None
+        try:
+            result = future.result()
+        except Exception:  # noqa: BLE001 - keep the board playable
+            self.slot_save_error = "自动存档暂时未保存"
+        else:
+            if isinstance(result, dict) and result.get("ok") is False:
+                self.slot_save_error = str(
+                    result.get("error") or "自动存档暂时未保存")
+            else:
+                self.slot_save_error = None
 
     def _poll_slot_load(self) -> None:
         future = self._slot_load_future
@@ -382,25 +422,65 @@ class Game2048(BaseGame):
         try:
             saved = future.result()
         except Exception:  # noqa: BLE001 - an invalid save starts a new board
+            self.slot_load_state = "failed"
             return
         if not isinstance(saved, dict):
+            self.slot_load_state = "ready"
             return
         state = saved.get("state")
         grid = state.get("grid") if isinstance(state, dict) else None
         score = state.get("score") if isinstance(state, dict) else None
+        version = state.get("version") if isinstance(state, dict) else None
+        game_state = (state.get("game_state", "playing")
+                      if isinstance(state, dict) else None)
+        flat = ([value for row in grid for value in row]
+                if isinstance(grid, list)
+                and all(isinstance(row, list) for row in grid) else [])
         if (saved.get("ruleset_version")
                 != self.attempt_context.ruleset_version
-                or not isinstance(state, dict) or state.get("version") != 1
-                or type(score) is not int or score < 0
+                or not isinstance(state, dict) or version not in (1, 2)
+                or type(score) is not int or not 0 <= score <= MAX_SCORE
                 or not isinstance(grid, list) or len(grid) != GRID
                 or any(not isinstance(row, list) or len(row) != GRID
                        for row in grid)
                 or any(type(value) is not int or value < 0
                        or value == 1
+                       or value > (1 << 30)
                        or (value and value & (value - 1))
                        for row in grid for value in row)
-                or not any(value for row in grid for value in row)):
+                or not any(flat)
+                or game_state not in {"playing", "won", "gameover"}
+                or (game_state == "won" and not bool(state.get("won")))
+                or (bool(state.get("won")) and max(flat, default=0) < 2048)):
+            self.slot_load_state = "failed"
             return
+        if game_state == "gameover":
+            self.slot_load_state = "ready"
+            self._save_autosave_slot()
+            return
+        if version == 2:
+            attempt_uuid = state.get("attempt_uuid")
+            revision = state.get("revision")
+            submission_id = state.get("submission_id")
+            confirmed_score = state.get("confirmed_score")
+            valid_attempt = (
+                isinstance(attempt_uuid, str)
+                and 16 <= len(attempt_uuid) <= 64
+                and all(char.isascii()
+                        and (char.isalnum() or char in "-_")
+                        for char in attempt_uuid))
+            if (not valid_attempt or type(revision) is not int or revision < 0
+                    or (submission_id is not None
+                        and (type(submission_id) is not int
+                             or submission_id <= 0))
+                    or (confirmed_score is not None
+                        and (type(confirmed_score) is not int
+                             or not 0 <= confirmed_score <= score))
+                    or type(state.get("won_announced")) is not bool
+                    or (state.get("won_announced")
+                        and not bool(state.get("won")))):
+                self.slot_load_state = "failed"
+                return
         self.tiles = []
         self.grid = [[None] * GRID for _ in range(GRID)]
         for row in range(GRID):
@@ -412,8 +492,22 @@ class Game2048(BaseGame):
                     self.grid[row][col] = tile
         self.score = score
         self.won = bool(state.get("won"))
-        self._won_announced = self.won
+        self.state = game_state
+        self._won_announced = (
+            bool(state.get("won_announced")) if version == 2 else self.won)
+        if version == 2:
+            self.attempt_context.attempt_uuid = attempt_uuid
+            self.attempt_context.revision = revision
+            self._score_attempt_uuid = attempt_uuid
+            self._score_attempt_revision = revision
+            self._score_submission_id = submission_id
+            self.score_submission_id = submission_id
+            self.submitted_score = confirmed_score
+            self.score_submitted = confirmed_score is not None
         self.anim_t = 1.0
+        self.slot_load_state = "ready"
+        if version == 1:
+            self._save_autosave_slot()
 
     def _submit_score(self, extra=None) -> None:
         # Repeated calls for the same settled score are ignored.  When the
@@ -445,6 +539,7 @@ class Game2048(BaseGame):
             confirmed_score,
             self.submitted_score if self.submitted_score is not None else 0)
         self.submitted_extra = payload.get("extra")
+        self._save_autosave_slot()
         queued = self._queued_score_submission
         self._queued_score_submission = None
         if (queued is not None
@@ -478,9 +573,18 @@ class Game2048(BaseGame):
             self.state = "gameover"
             self.extra = {"max_tile": self._max_tile(), "won": True}
             self._submit_score(extra=self.extra)
+        self._save_autosave_slot()
 
     # ------------------------------------------------------------------
     def handle_event(self, event):
+        if self.slot_load_state == "loading":
+            if (event.type == pygame.QUIT
+                    or (event.type == pygame.KEYDOWN
+                        and event.key == pygame.K_ESCAPE)):
+                super().handle_event(event)
+            self._swipe_start = None
+            self._queued_directions.clear()
+            return
         if (event.type == getattr(pygame, "WINDOWFOCUSLOST", -1)
                 or (event.type == pygame.KEYDOWN
                     and event.key == pygame.K_p)):
@@ -597,6 +701,18 @@ class Game2048(BaseGame):
                   "方向键/WASD 滑动 · R 重开 · P 暂停 · Esc 返回菜单",
                   (self.width // 2, self.height - 18),
                   size=12, color=COLORS["text_dim"], center=True)
+
+        if self.slot_load_state == "loading":
+            veil = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+            veil.fill((245, 248, 255, 190))
+            self.screen.blit(veil, (0, 0))
+            draw_text(self.screen, "正在恢复自动存档…",
+                      (self.width // 2, self.height // 2), size=18,
+                      color=COLORS["accent"], bold=True, center=True)
+        elif self.slot_save_error:
+            draw_text(self.screen, self.slot_save_error,
+                      (self.width // 2, self.height - 38), size=12,
+                      color=COLORS["danger"], center=True)
 
         if self.state == "paused":
             self.draw_paused_overlay()

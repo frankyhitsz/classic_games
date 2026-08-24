@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .catalog import GAME_BY_ID, VALID_GAME_IDS
+from .profile import ProfileIdentity, ProfileIdentityError
 
 MAX_EXTRA_BYTES = 8 * 1024
 MAX_SCORE = 2_147_483_647
@@ -67,16 +68,10 @@ def _transport_id(value: Optional[str], field: str) -> tuple[str, bool]:
 
 
 def _profile_id(value: Optional[str], player: str) -> str:
-    if value is None:
-        return uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"classic-games-local-profile:{player}").hex
-    value = _identifier(value, "profile_id", maximum=64)
-    if (len(value) != 32
-            or any(char not in "0123456789abcdef" for char in value.lower())):
-        raise MutationError(
-            "invalid_profile_id", "profile_id must be a 32-character UUID")
-    return value.lower()
+    try:
+        return ProfileIdentity.resolve(value, player).profile_id
+    except ProfileIdentityError as exc:
+        raise MutationError("invalid_profile_id", str(exc)) from exc
 
 
 @dataclass(frozen=True)

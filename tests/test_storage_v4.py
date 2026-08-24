@@ -319,7 +319,7 @@ class MigrationAndRepositoryTests(unittest.TestCase):
         self.assertIsNone(value)
         self.assertTrue(lost)
 
-    def test_request_lock_recovers_when_owner_process_is_gone(self):
+    def test_malformed_request_lock_is_reusable(self):
         with tempfile.TemporaryDirectory() as directory:
             outbox = PersistentSaveOutbox(Path(directory) / "pending")
             outbox.path.mkdir()
@@ -328,7 +328,10 @@ class MigrationAndRepositoryTests(unittest.TestCase):
                             encoding="ascii")
             with outbox._request_lock("orphan-request-0000000001"):
                 self.assertTrue(lock.exists())
-            self.assertFalse(lock.exists())
+            # Lock files are stable inodes; the operating-system lock, not
+            # stale PID text, defines ownership. Reacquiring proves release.
+            with outbox._request_lock("orphan-request-0000000001"):
+                self.assertTrue(lock.exists())
 
 
 class FlaskBoundaryTests(unittest.TestCase):

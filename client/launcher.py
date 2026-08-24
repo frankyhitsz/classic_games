@@ -213,10 +213,17 @@ def main():
     profile_id = uuid.uuid4().hex
     profile_future = None
     profile_save_future = None
+    profile_ready = not callable(getattr(backend, "last_profile_async", None))
+    profile_error = None
     profile_choice_locked = False
     last_profile_async = getattr(backend, "last_profile_async", None)
     if callable(last_profile_async):
         profile_future = last_profile_async()
+    profiles_cache: List[dict] = []
+    profiles_future = None
+    list_profiles_async = getattr(backend, "list_profiles_async", None)
+    if callable(list_profiles_async):
+        profiles_future = list_profiles_async()
 
     # Bottom panels — leaderboard (left, switches on hover) + recent (right).
     panel_y = start_y + card_h + 24
@@ -228,6 +235,7 @@ def main():
     editing_player = False
     player_composition = ""
     player_input_rect = pygame.Rect(WIDTH - 220, 28, 180, 30)
+    profile_switch_rect = pygame.Rect(WIDTH - 348, 28, 62, 30)
 
     # Per-game leaderboard cache. ``current_lb_game`` is the game whose
     # leaderboard is currently displayed (changes when the user hovers a
@@ -266,7 +274,8 @@ def main():
 
     def poll_network() -> None:
         nonlocal player, profile_id, profile_future, profile_save_future
-        nonlocal profile_choice_locked
+        nonlocal profile_choice_locked, profile_ready, profile_error
+        nonlocal profiles_future, profiles_cache
         nonlocal online, health_future, recent_cache, recent_ts, recent_future
         nonlocal records_error
         if profile_future is not None and profile_future.done():
@@ -274,23 +283,52 @@ def main():
                 saved_profile = profile_future.result()
             except Exception:  # noqa: BLE001
                 saved_profile = None
+                profile_error = "本机档案载入失败，暂时不能开始游戏"
             profile_future = None
             if isinstance(saved_profile, dict) and not profile_choice_locked:
                 profile_id = saved_profile.get("profile_id") or profile_id
                 saved_name = saved_profile.get("display_name") or "guest"
                 player = "" if saved_name == "guest" else saved_name
+                profile_ready = True
+                profile_error = None
             elif saved_profile is None and not profile_choice_locked:
                 ensure_profile = getattr(backend, "ensure_profile_async", None)
                 if callable(ensure_profile):
                     profile_save_future = ensure_profile("guest", profile_id)
+                elif profile_error is None:
+                    profile_ready = True
         if profile_save_future is not None and profile_save_future.done():
+            saved_profile = None
             try:
                 saved_profile = profile_save_future.result()
+                if (isinstance(saved_profile, dict)
+                        and saved_profile.get("ok") is False):
+                    raise RuntimeError(
+                        saved_profile.get("error") or "profile save failed")
                 if isinstance(saved_profile, dict):
                     profile_id = saved_profile.get("profile_id") or profile_id
+                profile_ready = True
+                profile_error = None
+            except Exception:  # noqa: BLE001
+                profile_error = "本机档案保存失败，重试后才能开始游戏"
+                profile_ready = False
+            profile_save_future = None
+            if (isinstance(saved_profile, dict)
+                    and saved_profile.get("ok") is not False):
+                profiles_cache = [
+                    item for item in profiles_cache
+                    if item.get("profile_id") != profile_id]
+                profiles_cache.insert(0, {
+                    "profile_id": profile_id,
+                    "display_name": player.strip() or "guest",
+                })
+        if profiles_future is not None and profiles_future.done():
+            try:
+                result = profiles_future.result()
+                profiles_cache = result if isinstance(result, list) else []
             except Exception:  # noqa: BLE001
                 pass
-            profile_save_future = None
+            profiles_future = None
         if health_future is not None and health_future.done():
             was_online = online
             try:
@@ -365,15 +403,55 @@ def main():
 
     def finish_player_edit() -> None:
         nonlocal editing_player, player_composition, profile_save_future
-        nonlocal profile_choice_locked
+        nonlocal profile_choice_locked, profile_ready, profile_error
         profile_choice_locked = True
         editing_player = False
         player_composition = ""
         pygame.key.stop_text_input()
         ensure_profile = getattr(backend, "ensure_profile_async", None)
         if callable(ensure_profile):
+            profile_ready = False
+            profile_error = None
             profile_save_future = ensure_profile(
                 player.strip() or "guest", profile_id)
+
+    def retry_profile_save() -> None:
+        nonlocal profile_save_future, profile_error
+        if profile_save_future is not None:
+            return
+        ensure_profile = getattr(backend, "ensure_profile_async", None)
+        if callable(ensure_profile):
+            profile_error = None
+            profile_save_future = ensure_profile(
+                player.strip() or "guest", profile_id)
+
+    def choose_profile(*, create_new: bool = False) -> None:
+        nonlocal player, profile_id, profile_choice_locked, profile_ready
+        nonlocal profile_error, editing_player, player_composition
+        if create_new or not profiles_cache:
+            profile_id = uuid.uuid4().hex
+            player = ""
+            profile_choice_locked = True
+            profile_ready = True
+            profile_error = None
+            editing_player = True
+            player_composition = ""
+            pygame.key.start_text_input()
+            pygame.key.set_text_input_rect(player_input_rect)
+            return
+        ids = [item.get("profile_id") for item in profiles_cache]
+        try:
+            index = ids.index(profile_id)
+        except ValueError:
+            index = -1
+        selected = profiles_cache[(index + 1) % len(profiles_cache)]
+        profile_id = selected["profile_id"]
+        selected_name = selected.get("display_name") or "guest"
+        player = "" if selected_name == "guest" else selected_name
+        profile_choice_locked = True
+        profile_ready = False
+        profile_error = None
+        retry_profile_save()
 
     def exit_confirmed() -> bool:
         nonlocal quit_with_unsaved_armed, quit_with_unsaved_deadline
@@ -387,7 +465,25 @@ def main():
         quit_with_unsaved_deadline = now_ + 3.0
         return False
 
+    def launch_game(gid: str) -> None:
+        nonlocal screen, launch_error, recent_ts, last_health_check
+        try:
+            launch_error = None
+            mod = import_game_module(gid)
+            mod.run_game(backend=backend,
+                         player=player.strip() or "guest",
+                         profile_id=profile_id)
+        except Exception as exc:  # noqa: BLE001
+            name = lb_title_map.get(gid, gid)
+            launch_error = f"{name}启动失败，请查看终端日志"
+            print(f"[launcher] failed to launch {gid}: {exc}")
+        screen = reset_after_subgame()
+        lb_cache_ts[gid] = 0.0
+        recent_ts = 0.0
+        last_health_check = 0.0
+
     running = True
+    pending_launch_gid = None
     mouse_pos = pygame.mouse.get_pos()
     while running:
         frame_dt = clock.tick(60) / 1000.0
@@ -398,6 +494,9 @@ def main():
         if callable(poll_pending):
             poll_pending()
         poll_network()
+        if pending_launch_gid is not None and profile_ready:
+            launch_game(pending_launch_gid)
+            pending_launch_gid = None
         if (health_future is None
                 and now - last_health_check >= HEALTH_REFRESH_SECS):
             health_future = backend.health_async()
@@ -462,7 +561,14 @@ def main():
                 player_composition = event.text[:32]
                 continue
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if profile_switch_rect.collidepoint(event.pos):
+                    choose_profile(create_new=bool(
+                        pygame.key.get_mods() & pygame.KMOD_SHIFT))
+                    continue
                 if player_input_rect.collidepoint(event.pos):
+                    if not profile_ready:
+                        launch_error = (profile_error
+                                        or "正在载入本机档案，请稍候")
                     editing_player = True
                     profile_choice_locked = True
                     player_composition = ""
@@ -476,20 +582,13 @@ def main():
                     visible_rect = card["rect"].move(
                         0, -int(card_lift[gid] * 6))
                     if visible_rect.collidepoint(event.pos):
-                        try:
-                            launch_error = None
-                            mod = import_game_module(gid)
-                            mod.run_game(backend=backend,
-                                         player=player.strip() or "guest",
-                                         profile_id=profile_id)
-                        except Exception as e:  # noqa: BLE001
-                            launch_error = (
-                                f"{card['meta']['name']}启动失败，请查看终端日志")
-                            print(f"[launcher] failed to launch {gid}: {e}")
-                        screen = reset_after_subgame()
-                        lb_cache_ts[gid] = 0.0
-                        recent_ts = 0.0
-                        last_health_check = 0.0
+                        if not profile_ready:
+                            launch_error = (profile_error
+                                            or "正在载入本机档案，请稍候")
+                            pending_launch_gid = gid
+                            retry_profile_save()
+                            break
+                        launch_game(gid)
                         launched_this_frame = True
                         break
                 if launched_this_frame:
@@ -519,12 +618,22 @@ def main():
         # fit the input field so 16 CJK chars + cursor can't overflow.
         draw_text(screen, "玩家信息", (WIDTH - 282, 20), size=11,
                   color=COLORS["accent"], bold=True)
+        pygame.draw.rect(screen, COLORS["panel"], profile_switch_rect,
+                         border_radius=6)
+        pygame.draw.rect(screen, COLORS["border"], profile_switch_rect, 1,
+                         border_radius=6)
+        draw_text(screen, "切换档案", profile_switch_rect.center, size=10,
+                  color=COLORS["accent"], bold=True, center=True)
+        draw_text(screen, "Shift+点击新建", (profile_switch_rect.centerx, 69),
+                  size=8, color=COLORS["text_dim"], center=True)
         draw_text(screen, "名字", (WIDTH - 270, 43), size=13,
                   color=COLORS["text_dim"])
         pygame.draw.rect(screen, COLORS["panel"], player_input_rect,
                          border_radius=6)
         pygame.draw.rect(screen,
-                         COLORS["accent"] if editing_player else COLORS["border"],
+                         (COLORS["accent"] if editing_player
+                          else COLORS["border"] if profile_ready
+                          else COLORS["danger"]),
                          player_input_rect, 1, border_radius=6)
         shown = player or "guest"
         if editing_player and player_composition:
@@ -544,6 +653,11 @@ def main():
         draw_text(screen, shown,
                   (player_input_rect.x + 8, player_input_rect.y + 7),
                   size=14, color=COLORS["text"])
+        if not profile_ready:
+            draw_text(screen, "载入中" if profile_error is None else "待重试",
+                      (player_input_rect.centerx, player_input_rect.bottom + 9),
+                      size=9, color=(COLORS["text_dim"] if profile_error is None
+                                     else COLORS["danger"]), center=True)
 
         # ---- Cards / bright toy-box stickers ---------------------------
         for card_index, card in enumerate(cards):
@@ -589,8 +703,9 @@ def main():
                           size=10, color=COLORS["text_dim"], center=True)
             # Plays count if available
             # Status hint at bottom
-            status = "已选中 · 点击开始" if is_selected else (
-                "松手即可启动" if lift > 0.05 else "点击开始")
+            status = ("档案准备中" if not profile_ready else
+                      "已选中 · 点击开始" if is_selected else
+                      "松手即可启动" if lift > 0.05 else "点击开始")
             draw_text(screen, status,
                       (lifted_rect.centerx, lifted_rect.y + 199),
                       size=10,

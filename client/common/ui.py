@@ -400,6 +400,10 @@ class BaseGame(abc.ABC):
         self.attempt_context = AttemptContext.for_game(
             self.game_id, player, profile_id=profile_id)
         self.profile_id = self.attempt_context.profile_id
+        ensure_profile = getattr(self.backend, "ensure_profile_async", None)
+        self._profile_ensure_future = (
+            ensure_profile(self.player, self.profile_id)
+            if callable(ensure_profile) else None)
         self.running = True
         self.state = "playing"  # playing | paused | gameover | won
         self.score = 0

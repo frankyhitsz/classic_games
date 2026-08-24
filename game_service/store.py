@@ -18,9 +18,10 @@ from typing import Iterator, Optional
 from .catalog import GAME_BY_ID, VALID_GAME_IDS, ScorePolicy
 from .mutation import (ATTEMPT_STATUSES, MutationError, ScoreMutation,
                        canonical_json, normalize_score_mutation)
+from .profile import ProfileIdentity, ProfileIdentityError
 from .service import StorageStatus
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 # The render thread never waits on this budget. A quarter second gives the
 # optional Flask adapter and direct maintenance callers room to serialize
 # ordinary bursts while still falling back far sooner than the old 5 s wait.
@@ -173,26 +174,16 @@ class LocalGameStore:
                     "profile_id TEXT PRIMARY KEY, display_name TEXT NOT NULL, "
                     "created_at REAL NOT NULL, last_used REAL NOT NULL)")
                 conn.execute(
-                    "CREATE TABLE IF NOT EXISTS settings ("
-                    "profile_id TEXT NOT NULL, key TEXT NOT NULL, "
-                    "value_json TEXT NOT NULL, updated_at REAL NOT NULL, "
-                    "PRIMARY KEY(profile_id, key))")
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS progress ("
-                    "profile_id TEXT NOT NULL, game_id TEXT NOT NULL, "
-                    "key TEXT NOT NULL, value_json TEXT NOT NULL, "
-                    "updated_at REAL NOT NULL, "
-                    "PRIMARY KEY(profile_id, game_id, key))")
-                conn.execute(
-                    "CREATE TABLE IF NOT EXISTS save_slots ("
-                    "profile_id TEXT NOT NULL, game_id TEXT NOT NULL, "
-                    "slot_id TEXT NOT NULL, state_json TEXT NOT NULL, "
-                    "ruleset_version TEXT NOT NULL, updated_at REAL NOT NULL, "
-                    "PRIMARY KEY(profile_id, game_id, slot_id))")
+                    "CREATE TABLE IF NOT EXISTS invalid_local_state ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                    "kind TEXT NOT NULL, profile_id TEXT, game_id TEXT, "
+                    "item_key TEXT, raw_value TEXT NOT NULL, "
+                    "reason TEXT NOT NULL, quarantined_at REAL NOT NULL)")
                 self._ensure_v2_columns(conn)
                 self._migrate_attempt_rows(conn)
                 self._migrate_rulesets_v3(conn)
                 self._migrate_profiles(conn)
+                self._migrate_local_state_tables(conn, existing_version)
                 self._repair_invalid_attempt_rows(conn)
                 self._ensure_attempt_invariant_triggers(conn)
                 conn.execute(
@@ -256,12 +247,17 @@ class LocalGameStore:
             "id", "original_id", "reason", "row_json", "quarantined_at",
         }
         required_profiles = {"profile_id", "display_name", "created_at", "last_used"}
-        required_settings = {"profile_id", "key", "value_json", "updated_at"}
+        required_settings = {
+            "profile_id", "key", "value_json", "value_version", "updated_at"}
         required_progress = {
-            "profile_id", "game_id", "key", "value_json", "updated_at"}
+            "profile_id", "game_id", "ruleset_version", "key",
+            "value_json", "value_version", "updated_at"}
         required_slots = {
             "profile_id", "game_id", "slot_id", "state_json",
-            "ruleset_version", "updated_at"}
+            "state_version", "ruleset_version", "updated_at"}
+        required_invalid_local = {
+            "id", "kind", "profile_id", "game_id", "item_key",
+            "raw_value", "reason", "quarantined_at"}
         with self.connection() as conn:
             if not required_attempts <= self._table_columns(conn, "attempts"):
                 return False
@@ -269,10 +265,22 @@ class LocalGameStore:
                 return False
             if not required_invalid <= self._table_columns(conn, "invalid_attempts"):
                 return False
+            if not required_invalid_local <= self._table_columns(
+                    conn, "invalid_local_state"):
+                return False
             for table, columns in (
                 ("profiles", required_profiles), ("settings", required_settings),
                 ("progress", required_progress), ("save_slots", required_slots)):
                 if not columns <= self._table_columns(conn, table):
+                    return False
+            for table in ("settings", "progress", "save_slots"):
+                foreign_keys = conn.execute(
+                    f"PRAGMA foreign_key_list({table})").fetchall()
+                if not any(row["table"] == "profiles"
+                           and row["from"] == "profile_id"
+                           and row["to"] == "profile_id"
+                           and row["on_delete"].upper() == "CASCADE"
+                           for row in foreign_keys):
                     return False
             required_indexes = {
                 "idx_attempts_request_id": (True, ("request_id",)),
@@ -479,9 +487,8 @@ class LocalGameStore:
             "SELECT profile_id, display_name, created_at, last_used "
             f"FROM profiles WHERE NOT ({uuid_shape})").fetchall()
         for row in legacy:
-            new_id = uuid.uuid5(
-                uuid.NAMESPACE_URL,
-                f"classic-games-local-profile:{row['profile_id']}").hex
+            new_id = ProfileIdentity.from_legacy_name(
+                row["profile_id"]).profile_id
             conn.execute(
                 "INSERT INTO profiles(profile_id,display_name,created_at,last_used) "
                 "VALUES(?,?,?,?) ON CONFLICT(profile_id) DO UPDATE SET "
@@ -494,6 +501,11 @@ class LocalGameStore:
                 "UPDATE attempts SET profile_id=? WHERE profile_id=?",
                 (new_id, row["profile_id"]))
             for table in ("settings", "progress", "save_slots"):
+                columns = LocalGameStore._table_columns(conn, table)
+                if ("profile_id" not in columns
+                        or not LocalGameStore._local_state_table_is_current(
+                            conn, table)):
+                    continue
                 conn.execute(
                     f"UPDATE OR IGNORE {table} SET profile_id=? "
                     "WHERE profile_id=?", (new_id, row["profile_id"]))
@@ -503,6 +515,201 @@ class LocalGameStore:
             conn.execute(
                 "DELETE FROM profiles WHERE profile_id=?",
                 (row["profile_id"],))
+
+    @staticmethod
+    def _create_local_state_tables(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS settings ("
+            "profile_id TEXT NOT NULL, key TEXT NOT NULL, "
+            "value_json TEXT NOT NULL, value_version INTEGER NOT NULL DEFAULT 1, "
+            "updated_at REAL NOT NULL, PRIMARY KEY(profile_id, key), "
+            "FOREIGN KEY(profile_id) REFERENCES profiles(profile_id) "
+            "ON DELETE CASCADE)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS progress ("
+            "profile_id TEXT NOT NULL, game_id TEXT NOT NULL, "
+            "ruleset_version TEXT NOT NULL, key TEXT NOT NULL, "
+            "value_json TEXT NOT NULL, value_version INTEGER NOT NULL DEFAULT 1, "
+            "updated_at REAL NOT NULL, "
+            "PRIMARY KEY(profile_id, game_id, ruleset_version, key), "
+            "FOREIGN KEY(profile_id) REFERENCES profiles(profile_id) "
+            "ON DELETE CASCADE)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS save_slots ("
+            "profile_id TEXT NOT NULL, game_id TEXT NOT NULL, "
+            "slot_id TEXT NOT NULL, state_json TEXT NOT NULL, "
+            "state_version INTEGER NOT NULL DEFAULT 1, "
+            "ruleset_version TEXT NOT NULL, updated_at REAL NOT NULL, "
+            "PRIMARY KEY(profile_id, game_id, slot_id), "
+            "FOREIGN KEY(profile_id) REFERENCES profiles(profile_id) "
+            "ON DELETE CASCADE)")
+
+    @staticmethod
+    def _local_state_table_is_current(conn: sqlite3.Connection,
+                                      table: str) -> bool:
+        required = {
+            "settings": {"profile_id", "key", "value_json",
+                         "value_version", "updated_at"},
+            "progress": {"profile_id", "game_id", "ruleset_version", "key",
+                         "value_json", "value_version", "updated_at"},
+            "save_slots": {"profile_id", "game_id", "slot_id", "state_json",
+                           "state_version", "ruleset_version", "updated_at"},
+        }[table]
+        if not required <= LocalGameStore._table_columns(conn, table):
+            return False
+        return any(
+            row["table"] == "profiles" and row["from"] == "profile_id"
+            and row["to"] == "profile_id"
+            and row["on_delete"].upper() == "CASCADE"
+            for row in conn.execute(f"PRAGMA foreign_key_list({table})"))
+
+    @staticmethod
+    def _migration_profile(conn: sqlite3.Connection, raw_profile,
+                           display_name: Optional[str] = None) -> str:
+        raw = raw_profile if isinstance(raw_profile, str) else "guest"
+        try:
+            profile_id = ProfileIdentity.validate_uuid(raw).profile_id
+        except ProfileIdentityError:
+            profile_id = ProfileIdentity.from_legacy_name(raw or "guest").profile_id
+        try:
+            name = ProfileIdentity.normalize_display_name(
+                display_name or raw or "guest")
+        except ProfileIdentityError:
+            name = "guest"
+        now = time.time()
+        conn.execute(
+            "INSERT INTO profiles(profile_id, display_name, created_at, last_used) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(profile_id) DO UPDATE SET "
+            "last_used=MAX(profiles.last_used, excluded.last_used)",
+            (profile_id, name, now, now))
+        return profile_id
+
+    @staticmethod
+    def _archive_local_state_row(conn: sqlite3.Connection, kind: str,
+                                 row: sqlite3.Row, reason: str) -> None:
+        data = {key: row[key] for key in row.keys()}
+        raw = data.get("value_json", data.get("progress_json",
+                  data.get("state_json", json.dumps(
+                      data, ensure_ascii=False, sort_keys=True, default=repr))))
+        conn.execute(
+            "INSERT INTO invalid_local_state "
+            "(kind, profile_id, game_id, item_key, raw_value, reason, "
+            "quarantined_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (kind, data.get("profile_id"), data.get("game_id"),
+             data.get("key", data.get("slot_id", data.get("slot"))),
+             str(raw), reason, time.time()))
+
+    def _migrate_local_state_tables(self, conn: sqlite3.Connection,
+                                    source_version: int) -> None:
+        legacy_tables: dict[str, Optional[str]] = {}
+        for table in ("settings", "progress", "save_slots"):
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                (table,)).fetchone()
+            if exists is None:
+                legacy_tables[table] = None
+                continue
+            if self._local_state_table_is_current(conn, table):
+                legacy_tables[table] = None
+                continue
+            suffix = f"legacy_{table}_v{source_version}_{time.time_ns()}"
+            conn.execute(f"ALTER TABLE {table} RENAME TO {suffix}")
+            legacy_tables[table] = suffix
+
+        self._create_local_state_tables(conn)
+        migrated = 0
+        quarantined = 0
+        for kind, legacy_table in legacy_tables.items():
+            if legacy_table is None:
+                continue
+            rows = conn.execute(f"SELECT * FROM {legacy_table}").fetchall()
+            for row in rows:
+                data = {key: row[key] for key in row.keys()}
+                try:
+                    profile_id = self._migration_profile(
+                        conn, data.get("profile_id", "guest"))
+                    updated_at = float(data.get("updated_at") or time.time())
+                    if not math.isfinite(updated_at) or updated_at < 0:
+                        raise ValueError("invalid timestamp")
+                    if kind == "settings":
+                        key = self._query_identifier(
+                            data.get("key"), "setting_key", 64)
+                        raw = data.get("value_json")
+                        json.loads(raw, parse_constant=_reject_json_constant)
+                        version = data.get("value_version", 1)
+                        if type(version) is not int or version < 1:
+                            raise ValueError("invalid value version")
+                        conn.execute(
+                            "INSERT INTO settings "
+                            "(profile_id,key,value_json,value_version,updated_at) "
+                            "VALUES(?,?,?,?,?) ON CONFLICT(profile_id,key) "
+                            "DO UPDATE SET value_json=excluded.value_json, "
+                            "value_version=excluded.value_version, "
+                            "updated_at=excluded.updated_at "
+                            "WHERE excluded.updated_at >= settings.updated_at",
+                            (profile_id, key, raw, version, updated_at))
+                    elif kind == "progress":
+                        game_id = data.get("game_id")
+                        if game_id not in VALID_GAME_IDS:
+                            raise ValueError("unknown game")
+                        key = data.get("key", "campaign")
+                        key = self._query_identifier(key, "progress_key", 64)
+                        raw = data.get("value_json", data.get("progress_json"))
+                        json.loads(raw, parse_constant=_reject_json_constant)
+                        ruleset = data.get("ruleset_version") or \
+                            GAME_BY_ID[game_id].ruleset_version
+                        version = data.get("value_version", 1)
+                        if type(version) is not int or version < 1:
+                            raise ValueError("invalid value version")
+                        conn.execute(
+                            "INSERT INTO progress (profile_id,game_id,"
+                            "ruleset_version,key,value_json,value_version,updated_at) "
+                            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_id,game_id,"
+                            "ruleset_version,key) DO UPDATE SET "
+                            "value_json=excluded.value_json, "
+                            "value_version=excluded.value_version, "
+                            "updated_at=excluded.updated_at "
+                            "WHERE excluded.updated_at >= progress.updated_at",
+                            (profile_id, game_id, ruleset, key, raw, version,
+                             updated_at))
+                    else:
+                        game_id = data.get("game_id")
+                        if game_id not in VALID_GAME_IDS:
+                            raise ValueError("unknown game")
+                        slot_id = data.get("slot_id", data.get("slot"))
+                        slot_id = self._query_identifier(slot_id, "slot_id", 64)
+                        raw = data.get("state_json")
+                        state = json.loads(raw, parse_constant=_reject_json_constant)
+                        ruleset = data.get("ruleset_version") or \
+                            GAME_BY_ID[game_id].ruleset_version
+                        version = data.get(
+                            "state_version",
+                            state.get("version", 1) if isinstance(state, dict) else 1)
+                        if type(version) is not int or version < 1:
+                            raise ValueError("invalid state version")
+                        conn.execute(
+                            "INSERT INTO save_slots (profile_id,game_id,slot_id,"
+                            "state_json,state_version,ruleset_version,updated_at) "
+                            "VALUES(?,?,?,?,?,?,?) ON CONFLICT(profile_id,game_id,"
+                            "slot_id) DO UPDATE SET state_json=excluded.state_json, "
+                            "state_version=excluded.state_version, "
+                            "ruleset_version=excluded.ruleset_version, "
+                            "updated_at=excluded.updated_at "
+                            "WHERE excluded.updated_at >= save_slots.updated_at",
+                            (profile_id, game_id, slot_id, raw, version, ruleset,
+                             updated_at))
+                    migrated += 1
+                except (StoreError, TypeError, ValueError,
+                        json.JSONDecodeError):
+                    self._archive_local_state_row(
+                        conn, kind, row, "invalid_legacy_local_state")
+                    quarantined += 1
+        if migrated:
+            self._migration_messages.append(
+                f"已升级 {migrated} 条本机设置、进度或存档")
+        if quarantined:
+            self._migration_messages.append(
+                f"已隔离 {quarantined} 条损坏的本机状态")
 
     def _ensure_v2_columns(self, conn: sqlite3.Connection) -> None:
         attempt_columns = self._table_columns(conn, "attempts")
@@ -741,20 +948,27 @@ class LocalGameStore:
         ).fetchone()[0])
 
     @staticmethod
-    def _validate_occurred_at(value: Optional[float], now: float) -> float:
+    def _validate_occurred_at(value: Optional[float],
+                              now: float) -> tuple[float, bool]:
         if value is None:
-            return now
+            return now, False
         if (type(value) not in (int, float) or not math.isfinite(float(value))
-                or value < 946684800 or value > now + 300):
+                or value < 946684800):
             raise StoreError(
                 "invalid_occurred_at",
                 "local completion time is outside the accepted range")
-        return float(value)
+        # A clock correction must not turn an otherwise valid durable pending
+        # request into a permanent request error. Preserve ordering by using
+        # the current local time and disclose the adjustment in the receipt.
+        if value > now + 300:
+            return now, True
+        return float(value), False
 
     def record_mutation(self, mutation: ScoreMutation,
                         occurred_at: Optional[float] = None) -> dict:
         now = time.time()
-        occurred_at = self._validate_occurred_at(occurred_at, now)
+        occurred_at, clock_adjusted = self._validate_occurred_at(
+            occurred_at, now)
         payload_hash = mutation.payload_hash
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -779,10 +993,22 @@ class LocalGameStore:
                         "DELETE FROM save_requests WHERE request_id=?",
                         (mutation.request_id,))
                 else:
+                    conn.execute(
+                        "INSERT INTO profiles(profile_id, display_name, "
+                        "created_at, last_used) VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(profile_id) DO UPDATE SET "
+                        "last_used=MAX(profiles.last_used, excluded.last_used)",
+                        (mutation.profile_id, mutation.player, now, now))
                     response["duplicate_request"] = True
                     conn.commit()
                     return response
 
+            conn.execute(
+                "INSERT INTO profiles(profile_id, display_name, created_at, "
+                "last_used) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(profile_id) DO UPDATE SET "
+                "last_used=MAX(profiles.last_used, excluded.last_used)",
+                (mutation.profile_id, mutation.player, now, now))
             best_before = self._personal_best(conn, mutation)
             attempt = conn.execute(
                 "SELECT * FROM attempts WHERE attempt_uuid=?",
@@ -955,6 +1181,7 @@ class LocalGameStore:
                 "preserved": False,
                 "replaced": 0,
                 "duplicate_request": False,
+                "clock_adjusted": clock_adjusted,
             }
             expires_at = now + RECEIPT_RETENTION_DAYS * 86400
             conn.execute(
@@ -1021,9 +1248,11 @@ class LocalGameStore:
                 "ROW_NUMBER() OVER (PARTITION BY profile_id "
                 "ORDER BY score DESC, score_achieved_at ASC, id ASC) AS pick "
                 f"FROM attempts WHERE {where}) "
-                "SELECT profile_id, player, score, score_achieved_at AS ts "
-                "FROM best_attempts WHERE pick=1 "
-                "ORDER BY score DESC, ts ASC, profile_id ASC LIMIT ?",
+                "SELECT b.profile_id, COALESCE(p.display_name, b.player) AS player, "
+                "b.score, b.score_achieved_at AS ts "
+                "FROM best_attempts b LEFT JOIN profiles p "
+                "ON p.profile_id=b.profile_id WHERE pick=1 "
+                "ORDER BY b.score DESC, ts ASC, b.profile_id ASC LIMIT ?",
                 (*params, limit),
             ).fetchall()
         result = []
@@ -1080,10 +1309,16 @@ class LocalGameStore:
             params.append(profile_id)
         with self.connection() as conn:
             rows = conn.execute(
-                "SELECT attempt_uuid, game_id, player, score, finished_at "
-                f"FROM attempts WHERE {' AND '.join(clauses)} "
-                "ORDER BY finished_at DESC, id DESC LIMIT ?",
-                (*params, limit),
+                "SELECT a.attempt_uuid, a.game_id, "
+                "COALESCE(p.display_name, a.player) AS player, "
+                "a.score, a.finished_at FROM ("
+                "SELECT id, attempt_uuid, profile_id, game_id, player, score, "
+                "finished_at FROM attempts WHERE "
+                + " AND ".join(clauses) + " "
+                "ORDER BY finished_at DESC, id DESC LIMIT ?) a "
+                "LEFT JOIN profiles p ON p.profile_id=a.profile_id "
+                "ORDER BY a.finished_at DESC, a.id DESC LIMIT ?",
+                (*params, limit, limit),
             ).fetchall()
         return [{"attempt_uuid": row["attempt_uuid"],
                  "game_id": row["game_id"], "player": row["player"],
@@ -1133,16 +1368,17 @@ class LocalGameStore:
 
     @staticmethod
     def _profile_uuid(value: str) -> str:
-        value = LocalGameStore._query_identifier(value, "profile_id", 64)
-        if (len(value) != 32
-                or any(char not in "0123456789abcdef" for char in value.lower())):
-            raise StoreError(
-                "invalid_profile_id", "profile_id must be a 32-character UUID")
-        return value.lower()
+        try:
+            return ProfileIdentity.validate_uuid(value).profile_id
+        except ProfileIdentityError as exc:
+            raise StoreError("invalid_profile_id", str(exc)) from exc
 
     def ensure_profile(self, display_name: str,
                        profile_id: Optional[str] = None) -> dict:
-        display_name = self._query_identifier(display_name, "display_name", 32)
+        try:
+            display_name = ProfileIdentity.normalize_display_name(display_name)
+        except ProfileIdentityError as exc:
+            raise StoreError("invalid_display_name", str(exc)) from exc
         profile_id = (uuid.uuid4().hex if profile_id is None else
                       self._profile_uuid(profile_id))
         now = time.time()
@@ -1171,15 +1407,63 @@ class LocalGameStore:
                 "FROM profiles ORDER BY last_used DESC, profile_id").fetchall()
         return [dict(row) for row in rows]
 
+    @staticmethod
+    def _require_profile(conn: sqlite3.Connection, profile_id: str) -> None:
+        if conn.execute(
+                "SELECT 1 FROM profiles WHERE profile_id=?", (profile_id,)
+        ).fetchone() is None:
+            raise StoreError(
+                "profile_not_found", "profile does not exist", 404)
+
+    @staticmethod
+    def _merge_monotonic(existing, incoming):
+        if isinstance(existing, dict) and isinstance(incoming, dict):
+            return {
+                key: (LocalGameStore._merge_monotonic(existing[key], value)
+                      if key in existing else value)
+                for key, value in {**existing, **incoming}.items()
+            }
+        if (type(existing) in (int, float)
+                and type(incoming) in (int, float)):
+            return max(existing, incoming)
+        if isinstance(existing, bool) and isinstance(incoming, bool):
+            return existing or incoming
+        if isinstance(existing, list) and isinstance(incoming, list):
+            merged = list(existing)
+            for value in incoming:
+                if value not in merged:
+                    merged.append(value)
+            try:
+                return sorted(merged)
+            except TypeError:
+                return merged
+        return incoming
+
+    @staticmethod
+    def _quarantine_local_state(conn: sqlite3.Connection, *, kind: str,
+                                profile_id: str, game_id: Optional[str],
+                                item_key: str, raw_value: str,
+                                reason: str) -> None:
+        conn.execute(
+            "INSERT INTO invalid_local_state "
+            "(kind, profile_id, game_id, item_key, raw_value, reason, "
+            "quarantined_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (kind, profile_id, game_id, item_key, raw_value, reason,
+             time.time()))
+
     def set_setting(self, profile_id: str, key: str, value) -> None:
         profile_id = self._profile_uuid(profile_id)
         key = self._query_identifier(key, "setting_key", 64)
         encoded = self._encoded_value(value)
         with self.connection() as conn:
+            self._require_profile(conn, profile_id)
             conn.execute(
-                "INSERT INTO settings(profile_id, key, value_json, updated_at) "
-                "VALUES (?, ?, ?, ?) ON CONFLICT(profile_id, key) DO UPDATE SET "
-                "value_json=excluded.value_json, updated_at=excluded.updated_at",
+                "INSERT INTO settings(profile_id, key, value_json, value_version, "
+                "updated_at) VALUES (?, ?, ?, 1, ?) "
+                "ON CONFLICT(profile_id, key) DO UPDATE SET "
+                "value_json=excluded.value_json, "
+                "value_version=settings.value_version+1, "
+                "updated_at=excluded.updated_at",
                 (profile_id, key, encoded, time.time()))
             conn.commit()
 
@@ -1187,39 +1471,134 @@ class LocalGameStore:
         profile_id = self._profile_uuid(profile_id)
         key = self._query_identifier(key, "setting_key", 64)
         with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT value_json FROM settings WHERE profile_id=? AND key=?",
                 (profile_id, key)).fetchone()
-        return default if row is None else json.loads(row["value_json"])
+            if row is None:
+                conn.commit()
+                return default
+            try:
+                value = json.loads(
+                    row["value_json"], parse_constant=_reject_json_constant)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self._quarantine_local_state(
+                    conn, kind="settings", profile_id=profile_id,
+                    game_id=None, item_key=key,
+                    raw_value=str(row["value_json"]), reason="invalid_json")
+                conn.execute(
+                    "DELETE FROM settings WHERE profile_id=? AND key=?",
+                    (profile_id, key))
+                conn.commit()
+                return default
+            conn.commit()
+            return value
 
     def set_progress(self, profile_id: str, game_id: str,
-                     key: str, value) -> None:
+                     key: str, value,
+                     ruleset_version: Optional[str] = None) -> None:
         if game_id not in VALID_GAME_IDS:
             raise StoreError("unknown_game", f"unknown game_id: {game_id}", 404)
         profile_id = self._profile_uuid(profile_id)
         key = self._query_identifier(key, "progress_key", 64)
+        ruleset_version = self._query_identifier(
+            ruleset_version or GAME_BY_ID[game_id].ruleset_version,
+            "ruleset_version", 32)
         encoded = self._encoded_value(value)
         with self.connection() as conn:
+            self._require_profile(conn, profile_id)
             conn.execute(
-                "INSERT INTO progress(profile_id, game_id, key, value_json, updated_at) "
-                "VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(profile_id, game_id, key) DO UPDATE SET "
-                "value_json=excluded.value_json, updated_at=excluded.updated_at",
-                (profile_id, game_id, key, encoded, time.time()))
+                "INSERT INTO progress(profile_id, game_id, ruleset_version, key, "
+                "value_json, value_version, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 1, ?) "
+                "ON CONFLICT(profile_id, game_id, ruleset_version, key) "
+                "DO UPDATE SET value_json=excluded.value_json, "
+                "value_version=progress.value_version+1, "
+                "updated_at=excluded.updated_at",
+                (profile_id, game_id, ruleset_version, key, encoded,
+                 time.time()))
             conn.commit()
 
-    def get_progress(self, profile_id: str, game_id: str,
-                     key: str, default=None):
+    def merge_progress(self, profile_id: str, game_id: str,
+                       key: str, value,
+                       ruleset_version: Optional[str] = None):
         if game_id not in VALID_GAME_IDS:
             raise StoreError("unknown_game", f"unknown game_id: {game_id}", 404)
         profile_id = self._profile_uuid(profile_id)
         key = self._query_identifier(key, "progress_key", 64)
+        ruleset_version = self._query_identifier(
+            ruleset_version or GAME_BY_ID[game_id].ruleset_version,
+            "ruleset_version", 32)
+        self._encoded_value(value)
         with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._require_profile(conn, profile_id)
+            row = conn.execute(
+                "SELECT value_json, value_version FROM progress WHERE "
+                "profile_id=? AND game_id=? AND ruleset_version=? AND key=?",
+                (profile_id, game_id, ruleset_version, key)).fetchone()
+            existing = {}
+            version = 1
+            if row is not None:
+                version = int(row["value_version"]) + 1
+                try:
+                    existing = json.loads(
+                        row["value_json"], parse_constant=_reject_json_constant)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    self._quarantine_local_state(
+                        conn, kind="progress", profile_id=profile_id,
+                        game_id=game_id, item_key=key,
+                        raw_value=str(row["value_json"]), reason="invalid_json")
+                    existing = {}
+            merged = self._merge_monotonic(existing, value)
+            encoded = self._encoded_value(merged)
+            conn.execute(
+                "INSERT INTO progress(profile_id,game_id,ruleset_version,key,"
+                "value_json,value_version,updated_at) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(profile_id,game_id,ruleset_version,key) DO UPDATE "
+                "SET value_json=excluded.value_json, "
+                "value_version=excluded.value_version, "
+                "updated_at=excluded.updated_at",
+                (profile_id, game_id, ruleset_version, key, encoded, version,
+                 time.time()))
+            conn.commit()
+        return merged
+
+    def get_progress(self, profile_id: str, game_id: str,
+                     key: str, default=None,
+                     ruleset_version: Optional[str] = None):
+        if game_id not in VALID_GAME_IDS:
+            raise StoreError("unknown_game", f"unknown game_id: {game_id}", 404)
+        profile_id = self._profile_uuid(profile_id)
+        key = self._query_identifier(key, "progress_key", 64)
+        ruleset_version = self._query_identifier(
+            ruleset_version or GAME_BY_ID[game_id].ruleset_version,
+            "ruleset_version", 32)
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT value_json FROM progress "
-                "WHERE profile_id=? AND game_id=? AND key=?",
-                (profile_id, game_id, key)).fetchone()
-        return default if row is None else json.loads(row["value_json"])
+                "WHERE profile_id=? AND game_id=? AND ruleset_version=? AND key=?",
+                (profile_id, game_id, ruleset_version, key)).fetchone()
+            if row is None:
+                conn.commit()
+                return default
+            try:
+                value = json.loads(
+                    row["value_json"], parse_constant=_reject_json_constant)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self._quarantine_local_state(
+                    conn, kind="progress", profile_id=profile_id,
+                    game_id=game_id, item_key=key,
+                    raw_value=str(row["value_json"]), reason="invalid_json")
+                conn.execute(
+                    "DELETE FROM progress WHERE profile_id=? AND game_id=? "
+                    "AND ruleset_version=? AND key=?",
+                    (profile_id, game_id, ruleset_version, key))
+                conn.commit()
+                return default
+            conn.commit()
+            return value
 
     def save_slot(self, profile_id: str, game_id: str,
                   slot_id: str, state) -> None:
@@ -1229,15 +1608,23 @@ class LocalGameStore:
         slot_id = self._query_identifier(slot_id, "slot_id", 64)
         encoded = self._encoded_value(state)
         ruleset = GAME_BY_ID[game_id].ruleset_version
+        state_version = (state.get("version", 1)
+                         if isinstance(state, dict) else 1)
+        if type(state_version) is not int or state_version < 1:
+            raise StoreError("invalid_state_version", "invalid save state version")
         with self.connection() as conn:
+            self._require_profile(conn, profile_id)
             conn.execute(
                 "INSERT INTO save_slots(profile_id, game_id, slot_id, state_json, "
-                "ruleset_version, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "state_version, ruleset_version, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(profile_id, game_id, slot_id) DO UPDATE SET "
                 "state_json=excluded.state_json, "
+                "state_version=excluded.state_version, "
                 "ruleset_version=excluded.ruleset_version, "
                 "updated_at=excluded.updated_at",
-                (profile_id, game_id, slot_id, encoded, ruleset, time.time()))
+                (profile_id, game_id, slot_id, encoded, state_version,
+                 ruleset, time.time()))
             conn.commit()
 
     def load_slot(self, profile_id: str, game_id: str,
@@ -1247,15 +1634,34 @@ class LocalGameStore:
         profile_id = self._profile_uuid(profile_id)
         slot_id = self._query_identifier(slot_id, "slot_id", 64)
         with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT state_json, ruleset_version, updated_at FROM save_slots "
+                "SELECT state_json, state_version, ruleset_version, updated_at "
+                "FROM save_slots "
                 "WHERE profile_id=? AND game_id=? AND slot_id=?",
                 (profile_id, game_id, slot_id)).fetchone()
-        if row is None:
-            return None
-        return {"state": json.loads(row["state_json"]),
-                "ruleset_version": row["ruleset_version"],
-                "updated_at": row["updated_at"]}
+            if row is None:
+                conn.commit()
+                return None
+            try:
+                state = json.loads(
+                    row["state_json"], parse_constant=_reject_json_constant)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                self._quarantine_local_state(
+                    conn, kind="save_slots", profile_id=profile_id,
+                    game_id=game_id, item_key=slot_id,
+                    raw_value=str(row["state_json"]), reason="invalid_json")
+                conn.execute(
+                    "DELETE FROM save_slots WHERE profile_id=? AND game_id=? "
+                    "AND slot_id=?", (profile_id, game_id, slot_id))
+                conn.commit()
+                return None
+            result = {"state": state,
+                      "state_version": row["state_version"],
+                      "ruleset_version": row["ruleset_version"],
+                      "updated_at": row["updated_at"]}
+            conn.commit()
+            return result
 
     def _legacy_rows(self, legacy_conn: sqlite3.Connection,
                      source: str) -> list[tuple]:
@@ -1419,6 +1825,12 @@ class LocalGameStore:
     def _insert_legacy_rows(conn: sqlite3.Connection, rows, source: str) -> int:
         imported = 0
         for mutation, created_at, updated_at, _row_id, row_fingerprint in rows:
+            conn.execute(
+                "INSERT INTO profiles(profile_id, display_name, created_at, "
+                "last_used) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(profile_id) DO UPDATE SET "
+                "last_used=MAX(profiles.last_used, excluded.last_used)",
+                (mutation.profile_id, mutation.player, created_at, updated_at))
             source_key = f"legacy-row:{row_fingerprint}"
             existing = conn.execute(
                 "SELECT id FROM attempts WHERE source_key=? "

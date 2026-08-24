@@ -189,7 +189,32 @@ class Zuma(BaseGame):
                  profile_id: Optional[str] = None):
         super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player,
                          profile_id=profile_id)
+        self.unlocked_level = 1
+        self.saved_high_score = 0
+        self._progress_future = None
         self.reset()
+        load_progress = getattr(self.backend, "get_progress_async", None)
+        if callable(load_progress):
+            self._progress_future = load_progress(
+                self.profile_id, self.game_id, "campaign", {})
+
+    def _poll_progress(self) -> None:
+        future = self._progress_future
+        if future is None or not future.done():
+            return
+        self._progress_future = None
+        try:
+            value = future.result()
+        except Exception:  # noqa: BLE001 - a new run remains playable
+            return
+        if not isinstance(value, dict):
+            return
+        unlocked = value.get("unlocked_level", 1)
+        high_score = value.get("highest_score", 0)
+        if type(unlocked) is int:
+            self.unlocked_level = min(len(ZUMA_LEVELS), max(1, unlocked))
+        if type(high_score) is int:
+            self.saved_high_score = max(0, high_score)
 
     # ------------------------------------------------------------------
     def reset(self):
@@ -255,6 +280,7 @@ class Zuma(BaseGame):
 
     # ------------------------------------------------------------------
     def update(self, dt: float):
+        self._poll_progress()
         if self.state != "playing":
             return
         self.visual_time += dt
@@ -341,7 +367,7 @@ class Zuma(BaseGame):
                       "level_bonus": self.level_bonus,
                       "won": True,
                       "completed_all": completed_all}
-            save_progress = getattr(self.backend, "set_progress_async", None)
+            save_progress = getattr(self.backend, "merge_progress_async", None)
             if callable(save_progress):
                 try:
                     save_progress(
@@ -669,6 +695,7 @@ class Zuma(BaseGame):
 
     # ------------------------------------------------------------------
     def draw(self):
+        self._poll_progress()
         # A bright marble table replaces the old moonlit, dark-green scene.
         # Every level keeps its own accent, so the five tracks still feel
         # distinct without tinting the whole game one color.
@@ -782,7 +809,8 @@ class Zuma(BaseGame):
                   f"第 {self.level_idx + 1}/{len(ZUMA_LEVELS)} 关 · {self.track_name}",
                   (left_hud.x + 13, left_hud.y + 7),
                   size=16, color=self.track_accent, bold=True)
-        draw_text(self.screen, f"得分 {self.score}",
+        draw_text(self.screen,
+                  f"得分 {self.score} · 已解锁 {self.unlocked_level}/{len(ZUMA_LEVELS)}",
                   (left_hud.x + 13, left_hud.y + 28), size=12,
                   color=COLORS["text_dim"])
         # HUD — right-aligned stats so they don't overflow the window

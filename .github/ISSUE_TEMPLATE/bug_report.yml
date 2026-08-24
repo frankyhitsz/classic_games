@@ -1,0 +1,43 @@
+name: Bug report
+description: Report a reproducible game, storage, or launcher problem
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. Start…\n2. Open…\n3. Press…"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: dropdown
+    id: system
+    attributes:
+      label: Operating system
+      options: [Windows, macOS, Linux, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Terminal output or recovery notice
+      description: Remove private paths or names before posting.
+      render: shell
+  - type: textarea
+    id: data
+    attributes:
+      label: Relevant local-data state
+      description: Note whether pending, pending-state, backup, or quarantine files exist. Do not upload personal data without checking it.
