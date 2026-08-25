@@ -429,8 +429,12 @@ class StateAndGameTests(unittest.TestCase):
                 self.assertTrue(entered.wait(5))
                 released = {**base, "owner_status": "released",
                             "slot_revision": 2}
-                result = backend.publish_slot_intent(
-                    PROFILE_ID, "2048", "autosave", released)
+                with patch(
+                        "game_service.local_backend.maintenance_lock",
+                        side_effect=AssertionError(
+                            "slot intent must use the application lease")):
+                    result = backend.publish_slot_intent(
+                        PROFILE_ID, "2048", "autosave", released)
                 self.assertTrue(result["durable_pending"])
                 resume.set()
                 self.assertTrue(backend.drain(5))

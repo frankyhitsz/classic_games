@@ -2502,24 +2502,25 @@ class LocalBackendClient:
         operation = self._new_state_operation(
             key, "save_slot",
             (profile_id, game_id, slot_id, state, ruleset_version))
-        with maintenance_lock(
-                self._selected_db_path, exclusive=False,
-                timeout=APPLICATION_MAINTENANCE_TIMEOUT_SECONDS):
-            LocalGameStore.validate_state_operation(operation)
-            with self._state_publish_lock:
-                existing = self.state_outbox.read_key(key)
-                observed = operation["logical_revision"]
-                if existing is not None:
-                    observed = max(observed, existing["logical_revision"])
-                revision = self.state_outbox.next_revision(observed)
-                operation = PersistentStateOutbox.with_revision(
-                    operation, revision)
-                receipt = self.state_outbox.put(
-                    key, operation["method"], tuple(operation["args"]),
-                    logical_revision=operation["logical_revision"],
-                    operation_id=operation["operation_id"],
-                    components=operation.get("components"),
-                    updated_at=operation["updated_at"])
+        LocalGameStore.validate_state_operation(operation)
+        # The backend's lifetime ApplicationSession already excludes data
+        # maintenance.  Do not nest a maintenance-file lease here: Windows
+        # has no shared msvcrt byte-range lock, so an older worker write in
+        # this process would otherwise block this final crash-safe intent.
+        with self._state_publish_lock:
+            existing = self.state_outbox.read_key(key)
+            observed = operation["logical_revision"]
+            if existing is not None:
+                observed = max(observed, existing["logical_revision"])
+            revision = self.state_outbox.next_revision(observed)
+            operation = PersistentStateOutbox.with_revision(
+                operation, revision)
+            receipt = self.state_outbox.put(
+                key, operation["method"], tuple(operation["args"]),
+                logical_revision=operation["logical_revision"],
+                operation_id=operation["operation_id"],
+                components=operation.get("components"),
+                updated_at=operation["updated_at"])
         with self._lock:
             self._last_state_revision = max(self._last_state_revision, revision)
             self._pending_state_count = self.state_outbox.count()
