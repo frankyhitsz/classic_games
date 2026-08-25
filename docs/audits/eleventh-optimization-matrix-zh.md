@@ -68,7 +68,7 @@
 | CG11-P1-33 | 部分 | 已覆盖未宣布 win、未确认 score、stale CAS、release/claim；未做每条语句 crash 注入。 |
 | CG11-P1-34 | 完成 | 每阶段 timeout；超时 exit 124 进入 JUnit/JSON。 |
 | CG11-P1-35 | 完成 | wheel 在隔离 venv 安装依赖，检查模块和 `classic-games-data`。 |
-| CG11-P1-36 | 完成待远端证据 | workflow 每次 push 运行；最终记录当前 run URL/编号。 |
+| CG11-P1-36 | 完成 | CI #28 的 release-gate、core-only、Python 兼容和三平台共 7 个 job 全部成功。 |
 | CG11-P1-37 | 需授权 | branch protection 是仓库设置；本次 push 授权不包含修改 required checks。 |
 | CG11-P1-38 | 完成 | 三个 Actions 均固定 v7 当前 commit SHA。 |
 | CG11-P1-39 | 完成 | constraints 固定 direct 和 transitive dependency closure。 |
@@ -153,5 +153,5 @@
 | CG11-P3-26 | 保留 | 截图/GIF 需确认商标和发布素材，本轮不加入生成资产。 |
 | CG11-P3-27 | 保留 | 新游戏必须同时定义 catalog/ruleset/data/input/test，本轮不扩游戏数。 |
 
-汇总：完成 62 项、待补远端证据 1 项、部分完成 35 项、保留 29 项、需额外授权 2 项。汇总按
-交付性质统计，不把“保留”包装为缺陷修复；最终以代码和测试证据为准。
+汇总：完成 63 项、部分完成 35 项、保留 29 项、需额外授权 2 项。汇总按交付性质统计，不把
+“保留”包装为缺陷修复；最终以代码和测试证据为准。

@@ -12,7 +12,7 @@
 - [x] 完成 release timeout、隔离 venv wheel smoke、SBOM、Actions SHA 和完整依赖约束；
 - [x] 完成第一轮独立复查并重新验证；
 - [x] 完成第二轮独立复查与完整验证；
-- [ ] 提交、推送并核验远端 CI。
+- [x] 提交、推送并核验远端 CI。
 
 ## 初版验证
 
@@ -58,7 +58,7 @@
   p99 2.426 ms，持锁异步提交 p99 0.040 ms；
 - 独立 release venv 完整通过 8 个阶段：Ruff、dependency audit、CycloneDX SBOM、compile、
   wheel smoke、storage、stress、gameplay；pip-audit 未发现已知漏洞；
-- wheel smoke 生成 153,384 字节 wheel，在无 system-site-packages 的新 venv 按约束安装 pygame，
+- wheel smoke 生成 153,855 字节 wheel，在无 system-site-packages 的新 venv 按约束安装 pygame，
   成功导入 launcher/data/store 并运行 `classic-games-data --help`；
 - `git diff --check`、compileall、Actions SHA 检查、archive v1/v2/重复导入演练和维护锁跨进程演练
   均通过。
@@ -68,3 +68,6 @@
 - CI #27 的跨平台矩阵已启动，但 release-gate 在统一 release 命令中退出 1；公开 job 页面没有展开
   内部 stage 日志。本机同一隔离 release profile 八阶段均通过；复核 GitHub clean runner 差异后，
   wheel build 改回 PEP 517 默认 build isolation，不再依赖 runner 主环境恰好预装足够新的 setuptools。
+- 修正提交 `10d4c56` 已推送到 `origin/main`。GitHub Actions
+  [CI #28](https://github.com/frankyhitsz/classic_games/actions/runs/32800809233) 完整成功：release-gate、
+  core-only、Python 3.12/3.13、Ubuntu、macOS、Windows 共 7 个 job 全部通过。
