@@ -10,7 +10,7 @@
 - [x] 写入逐条答复、优化矩阵、规格、协议、README 和 CHANGELOG；
 - [x] 第一轮复查：storage、玩法状态机和旧回归语义；
 - [x] 第二轮复查：stress、package/release、资源与跨平台边界；
-- [ ] 提交、推送并核验最终远端 CI。
+- [x] 提交、推送并核验最终远端 CI。
 
 ## 已完成的验证
 
@@ -24,6 +24,10 @@
   发布清单、storage、stress 与 107 项 gameplay 均无失败；资源检查前后文件描述符均为 19。
 - 第二轮差异复查发现 README 漏列 `test_storage_v12.py`，且新增用例统计仍为 26；已同步目录和实际的
   27 项统计，并重新执行文档差异检查。
+- 首次远端 `core-only` 发现新增的 `server.init_db()` 用例未遵守 Flask 是可选依赖的测试契约；修正为
+  API 依赖缺失时跳过，并分别验证了有 Flask 执行和无 Flask 跳过两条路径。
+- 修复提交 `d11c242` 的 GitHub CI 7 个结果全部成功：release gate、core-only、Python 3.12/3.13，
+  以及 Linux、macOS、Windows 全量矩阵；Windows junction 专用用例随 storage suite 通过。
 
 ## 核心不变量
 
