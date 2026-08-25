@@ -57,7 +57,7 @@ def _file_digest(path: Path) -> tuple[int, str]:
     try:
         metadata = os.lstat(path)
         if (not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_nlink != 1):
+                or metadata.st_nlink > 1):
             raise OSError("not a regular transaction file")
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
@@ -67,7 +67,7 @@ def _file_digest(path: Path) -> tuple[int, str]:
         size = 0
         try:
             opened = os.fstat(descriptor)
-            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink > 1
                     or (metadata.st_dev, metadata.st_ino)
                     != (opened.st_dev, opened.st_ino)):
                 raise OSError("transaction file changed while opening")
@@ -331,7 +331,7 @@ class ImportTransaction:
             journal_path = root / "journal.json"
             metadata = os.lstat(journal_path)
             if (not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_nlink != 1
+                    or metadata.st_nlink > 1
                     or metadata.st_size > MAX_TRANSACTION_FILE_BYTES):
                 raise OSError("unsafe import journal")
             flags = os.O_RDONLY

@@ -257,7 +257,7 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
     """Read a regular, single-link file without a symlink swap window."""
     try:
         before = os.lstat(path)
-        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink > 1
                 or before.st_size > limit):
             raise OSError("unsafe or oversized file")
         flags = os.O_RDONLY
@@ -266,7 +266,7 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
         descriptor = os.open(path, flags)
         try:
             after = os.fstat(descriptor)
-            if (not stat.S_ISREG(after.st_mode) or after.st_nlink != 1
+            if (not stat.S_ISREG(after.st_mode) or after.st_nlink > 1
                     or after.st_size > limit
                     or (before.st_dev, before.st_ino)
                     != (after.st_dev, after.st_ino)):
@@ -341,7 +341,7 @@ def inspect_data(database: Path) -> dict:
                         child = Path(current) / name
                         child_metadata = os.lstat(child)
                         if (stat.S_ISREG(child_metadata.st_mode)
-                                and child_metadata.st_nlink == 1):
+                                and child_metadata.st_nlink <= 1):
                             size += child_metadata.st_size
                     if size is None:
                         break
@@ -448,7 +448,7 @@ def export_transaction_data(database: Path, transaction_name: str,
             for entry in candidates:
                 metadata = entry.stat(follow_symlinks=False)
                 if (not stat.S_ISREG(metadata.st_mode)
-                        or metadata.st_nlink != 1):
+                        or metadata.st_nlink > 1):
                     files.append({"path": entry.name,
                                   "omitted": "unsafe_file_type"})
                     continue
@@ -566,7 +566,7 @@ def cleanup_recovery_data(database: Path, *, older_than_days: int,
                     candidates.append(item)
                     continue
                 paths = []
-                if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink == 1:
+                if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink <= 1:
                     paths.append((root, root.name))
                 elif stat.S_ISDIR(metadata.st_mode):
                     unsafe = False
@@ -585,7 +585,7 @@ def cleanup_recovery_data(database: Path, *, older_than_days: int,
                             child = Path(current) / name
                             child_metadata = os.lstat(child)
                             if (not stat.S_ISREG(child_metadata.st_mode)
-                                    or child_metadata.st_nlink != 1):
+                                    or child_metadata.st_nlink > 1):
                                 unsafe = True
                                 continue
                             relative = (PurePosixPath(root.name)
@@ -727,7 +727,7 @@ def _export_recovery(database: Path) -> tuple[list[dict], dict]:
             try:
                 metadata = os.lstat(path)
                 if (not stat.S_ISREG(metadata.st_mode)
-                        or metadata.st_nlink != 1):
+                        or metadata.st_nlink > 1):
                     raise ValueError("unsafe file type")
                 size = metadata.st_size
             except ValueError:

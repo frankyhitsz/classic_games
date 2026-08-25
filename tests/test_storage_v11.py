@@ -315,6 +315,7 @@ class ArchiveBoundaryTests(unittest.TestCase):
             LocalGameStore(database)
             backup = root / "games.db.backup-old"
             backup.write_bytes(b"recovery-copy")
+            os.utime(backup, (1, 1))
             plan = cleanup_recovery_data(database, older_than_days=0)
             candidate = next(item for item in plan["candidates"]
                              if item["path"] == backup.name)

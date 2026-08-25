@@ -94,7 +94,7 @@ def _validate_json_shape(value) -> None:
 def _read_regular_nofollow(path: Path, limit: int) -> bytes:
     try:
         before = os.lstat(path)
-        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink > 1
                 or before.st_size > limit):
             raise OSError("unsafe pending file")
         flags = os.O_RDONLY
@@ -105,7 +105,7 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
             after = os.fstat(descriptor)
             if ((before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
                     or not stat.S_ISREG(after.st_mode)
-                    or after.st_nlink != 1 or after.st_size > limit):
+                    or after.st_nlink > 1 or after.st_size > limit):
                 raise OSError("pending file changed while opening")
             with os.fdopen(descriptor, "rb", closefd=False) as handle:
                 raw = handle.read(limit + 1)
@@ -771,7 +771,7 @@ class PersistentSaveOutbox:
             try:
                 metadata = os.lstat(path)
                 if (not stat.S_ISREG(metadata.st_mode)
-                        or metadata.st_nlink != 1):
+                        or metadata.st_nlink > 1):
                     raise StoreError("unsafe_spool_file", "unsafe file type")
                 size = metadata.st_size
                 if size > MAX_SPOOL_FILE_BYTES:
@@ -1432,7 +1432,7 @@ class PersistentStateOutbox:
             try:
                 metadata = os.lstat(path)
                 if (not stat.S_ISREG(metadata.st_mode)
-                        or metadata.st_nlink != 1):
+                        or metadata.st_nlink > 1):
                     raise StoreError("unsafe_state_file", "unsafe file type")
                 size = metadata.st_size
                 if size > MAX_SPOOL_FILE_BYTES:
