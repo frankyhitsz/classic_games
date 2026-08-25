@@ -28,10 +28,23 @@ def _preparing_pattern(database: Path) -> str:
 
 
 def has_import_transaction_roots(database: Path) -> bool:
-    """Report any published or incomplete preparation root without changing it."""
+    """Report roots that still require recovery, without changing them."""
     database = database.expanduser().resolve(strict=False)
-    return any(database.parent.glob(_transaction_pattern(database))) or any(
-        database.parent.glob(_preparing_pattern(database)))
+    if any(database.parent.glob(_preparing_pattern(database))):
+        return True
+    for root in database.parent.glob(_transaction_pattern(database)):
+        try:
+            metadata = os.lstat(root)
+            if (not stat.S_ISDIR(metadata.st_mode)
+                    or getattr(metadata, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+                return True
+            transaction = ImportTransaction.open(database, root)
+        except (OSError, StoreError):
+            return True
+        if transaction.journal.get("phase") not in {"COMPLETED", "ROLLED_BACK"}:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -291,6 +304,10 @@ class ImportTransaction:
         records = []
         transaction_bytes = 0
         published = False
+        raw_sidecars_present = any(
+            Path(f"{database}{suffix}").exists()
+            or Path(f"{database}{suffix}").is_symlink()
+            for suffix in ("-wal", "-shm", "-journal"))
         try:
             rollback_path = preparing_root / "database-before.sqlite"
             try:
@@ -312,6 +329,11 @@ class ImportTransaction:
                     pass
                 if not allow_raw_database_fallback:
                     raise
+                if raw_sidecars_present:
+                    raise StoreError(
+                        "import_raw_sidecars_require_manual_recovery",
+                        "raw database rollback is unsafe while SQLite "
+                        "sidecars exist; preserve them for manual recovery")
                 raw_database, _size, _digest = _read_file_snapshot(
                     database, MAX_TRANSACTION_TOTAL_BYTES)
                 _write_file(rollback_path, raw_database)
@@ -680,7 +702,10 @@ def recover_import_transactions(database: Path, *,
     database = database.resolve(strict=False)
     recovered = []
     for root in sorted(database.parent.glob(_preparing_pattern(database))):
-        if root.is_symlink() or not root.is_dir():
+        metadata = os.lstat(root)
+        if (not stat.S_ISDIR(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
             raise StoreError(
                 "import_recovery_required",
                 f"unsafe import preparation root: {root.name}")
@@ -688,12 +713,13 @@ def recover_import_transactions(database: Path, *,
         _fsync_directory(database.parent)
     unfinished: list[ImportTransaction] = []
     for root in sorted(database.parent.glob(_transaction_pattern(database))):
-        if root.is_symlink():
+        metadata = os.lstat(root)
+        if (not stat.S_ISDIR(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
             raise StoreError(
                 "import_recovery_required",
-                f"import transaction root is a symbolic link: {root.name}")
-        if not root.is_dir():
-            continue
+                f"unsafe import transaction root: {root.name}")
         journal_path = root / "journal.json"
         try:
             os.lstat(journal_path)

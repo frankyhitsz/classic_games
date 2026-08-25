@@ -57,6 +57,8 @@ class LocalStateEvent:
     logical_revision: int
     state: SaveState
     result: dict
+    operation_id: str = ""
+    payload_hash: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         value = asdict(self)

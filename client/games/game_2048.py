@@ -112,9 +112,10 @@ class Game2048(BaseGame):
 
     def __init__(self, backend: Optional[GameDataService] = None,
                  player: str = "anonymous",
-                 profile_id: Optional[str] = None):
+                 profile_id: Optional[str] = None, *, rng=None):
         super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player,
                          profile_id=profile_id)
+        self.rng = random if rng is None else rng
         self._slot_load_future = None
         self._slot_save_future = None
         self._slot_quarantine_future = None
@@ -219,8 +220,8 @@ class Game2048(BaseGame):
                    if self.grid[i][j] is None]
         if not empties:
             return False
-        i, j = random.choice(empties)
-        v = 2 if random.random() < 0.9 else 4
+        i, j = self.rng.choice(empties)
+        v = 2 if self.rng.random() < 0.9 else 4
         t = Tile(value=v, row=i, col=j)
         t.spawn_progress = 0.0
         self.tiles.append(t)
@@ -1212,10 +1213,16 @@ class Game2048(BaseGame):
         publish_intent = getattr(self.backend, "publish_slot_intent", None)
         if callable(publish_intent):
             try:
-                publish_intent(
+                receipt = publish_intent(
                     self.profile_id, self.game_id, "autosave",
                     self._build_autosave_state("released"),
                     self.attempt_context.ruleset_version)
+                if (isinstance(receipt, dict)
+                        and receipt.get("published") is False
+                        and receipt.get("winner_operation_id")
+                        != receipt.get("requested_operation_id")):
+                    self.slot_save_error = "较新的存档意图已保留，本窗口未覆盖它"
+                    return
                 self._slot_save_pending = True
                 return
             except Exception:  # noqa: BLE001 - fall back to async pipeline

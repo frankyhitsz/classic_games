@@ -22,6 +22,7 @@ from client.common.ui import (COLORS, BaseGame, Button, draw_gradient_bg,
                               draw_panel, draw_text)
 
 CELL = 40
+CAMPAIGN_SESSION_SLOT = "practice-return"
 
 # Curated levels. Each is a list of strings of equal length. Levels 5-16
 # were produced from solved layouts using legal reverse pulls, then every
@@ -299,9 +300,12 @@ class Sokoban(BaseGame):
         self._progress_future = None
         self._practice_progress_future = None
         self._progress_write_futures = {"campaign": None, "practice": None}
+        self._progress_write_queued = {"campaign": None, "practice": None}
         self._progress_save_messages = {"campaign": "", "practice": ""}
         self.progress_save_message = ""
         self._campaign_snapshot = None
+        self._campaign_session_load_future = None
+        self._campaign_session_save_future = None
         self._confirmed_total: Optional[int] = None
         self._pending_total: Optional[int] = None
         w, h = level_bounds(LEVELS[0])
@@ -321,8 +325,16 @@ class Sokoban(BaseGame):
                 load_progress(
                     self.profile_id, self.game_id, "practice", {}),
                 self._progress_generation["practice"])
+        load_slot = getattr(self.backend, "load_slot_async", None)
+        if callable(load_slot):
+            try:
+                self._campaign_session_load_future = load_slot(
+                    self.profile_id, self.game_id, CAMPAIGN_SESSION_SLOT)
+            except Exception:  # noqa: BLE001 - campaign still starts normally
+                self._campaign_session_load_future = None
 
     def _poll_progress(self) -> None:
+        self._poll_campaign_session()
         for progress_key, write in list(self._progress_write_futures.items()):
             if write is None or not write[0].done():
                 continue
@@ -330,7 +342,8 @@ class Sokoban(BaseGame):
             try:
                 result = write[0].result()
             except Exception:  # noqa: BLE001
-                self._progress_save_messages[progress_key] = "进度暂时未保存"
+                if write[1] == self._progress_generation[progress_key]:
+                    self._progress_save_messages[progress_key] = "进度暂时未保存"
             else:
                 if isinstance(result, dict) and result.get("ok") is False:
                     self._progress_save_messages[progress_key] = (
@@ -339,6 +352,10 @@ class Sokoban(BaseGame):
                 elif isinstance(result, dict):
                     self._apply_progress(result, write[1], write[2])
                     self._progress_save_messages[progress_key] = ""
+            queued = self._progress_write_queued[progress_key]
+            self._progress_write_queued[progress_key] = None
+            if queued is not None:
+                self._start_progress_write(*queued)
         for progress_key, message in self._progress_save_messages.items():
             if not message:
                 continue
@@ -365,6 +382,176 @@ class Sokoban(BaseGame):
             except Exception:  # noqa: BLE001 - play remains available
                 continue
             self._apply_progress(value, pending[1], progress_key)
+
+    def _campaign_session_value(self, *, active: bool) -> dict:
+        snapshot = self._campaign_snapshot
+        if not active or snapshot is None:
+            return {"version": 1, "active": False}
+        return {
+            "version": 1, "active": True,
+            "level_idx": snapshot["level_idx"],
+            "boxes": [list(point) for point in sorted(snapshot["boxes"])],
+            "player_pos": list(snapshot["player_pos"]),
+            "moves": snapshot["moves"], "pushes": snapshot["pushes"],
+            "history": [
+                [list(position), [list(point) for point in sorted(boxes)],
+                 moves, pushes]
+                for position, boxes, moves, pushes in snapshot["history"]
+            ],
+            "score": snapshot["score"], "state": snapshot["state"],
+            "total_score": self.total_score,
+            "level_scores": {str(key): value
+                             for key, value in self.level_scores.items()},
+            "completed_levels": sorted(self.completed_levels),
+            "attempt_uuid": self.attempt_context.attempt_uuid,
+            "attempt_revision": self.attempt_context.revision,
+        }
+
+    def _persist_campaign_session(self, *, active: bool) -> bool:
+        value = self._campaign_session_value(active=active)
+        publish = getattr(self.backend, "publish_slot_intent", None)
+        if callable(publish):
+            try:
+                receipt = publish(
+                    self.profile_id, self.game_id,
+                    CAMPAIGN_SESSION_SLOT, value,
+                    self.attempt_context.ruleset_version)
+                if (isinstance(receipt, dict)
+                        and receipt.get("published") is False
+                        and receipt.get("winner_operation_id")
+                        != receipt.get("requested_operation_id")):
+                    self._progress_save_messages["campaign"] = (
+                        "较新的闯关现场已保留")
+                    return False
+                return True
+            except Exception:  # noqa: BLE001 - fall through to async save
+                pass
+        save = getattr(self.backend, "save_slot_async", None)
+        if callable(save):
+            try:
+                self._campaign_session_save_future = save(
+                    self.profile_id, self.game_id,
+                    CAMPAIGN_SESSION_SLOT, value,
+                    self.attempt_context.ruleset_version)
+                return True
+            except Exception:  # noqa: BLE001 - gameplay remains available
+                self._progress_save_messages["campaign"] = "闯关现场暂时未保存"
+        return not callable(publish) and not callable(save)
+
+    def _restore_campaign_session(self, value) -> bool:
+        if (not isinstance(value, dict) or value.get("version") != 1
+                or value.get("active") is not True
+                or type(value.get("level_idx")) is not int
+                or not 0 <= value["level_idx"] < len(LEVELS)
+                or type(value.get("moves")) is not int
+                or type(value.get("pushes")) is not int
+                or not 0 <= value["pushes"] <= value["moves"]
+                or type(value.get("score")) is not int
+                or value["score"] < 0
+                or type(value.get("total_score")) is not int
+                or value["total_score"] < 0
+                or not isinstance(value.get("attempt_uuid"), str)
+                or not 16 <= len(value["attempt_uuid"]) <= 64
+                or type(value.get("attempt_revision")) is not int
+                or value["attempt_revision"] < 0
+                or value.get("state") != "playing"):
+            return False
+        try:
+            walls, targets, _initial_boxes, _initial_player, floors = (
+                parse_level(LEVELS[value["level_idx"]]))
+            boxes = {tuple(point) for point in value["boxes"]}
+            player_pos = tuple(value["player_pos"])
+            history = [
+                (tuple(item[0]), {tuple(point) for point in item[1]},
+                 item[2], item[3]) for item in value.get("history", [])
+            ]
+        except (IndexError, KeyError, TypeError, ValueError):
+            return False
+        if (len(boxes) != len(targets) or not boxes <= floors
+                or player_pos not in floors or player_pos in boxes
+                or len(history) > 10_000
+                or any(position not in floors or position in saved_boxes
+                       or len(saved_boxes) != len(targets)
+                       or not saved_boxes <= floors
+                       or type(moves) is not int or type(pushes) is not int
+                       or not 0 <= pushes <= moves
+                       for position, saved_boxes, moves, pushes in history)):
+            return False
+        level_scores = value.get("level_scores", {})
+        completed = value.get("completed_levels", [])
+        if (not isinstance(level_scores, dict)
+                or not isinstance(completed, list)
+                or any(not isinstance(key, str) or not key.isdigit()
+                       or len(key) > 2
+                       or not 0 <= int(key) < len(LEVELS)
+                       or type(score) is not int or score < 0
+                       for key, score in level_scores.items())
+                or any(type(index) is not int
+                       or not 0 <= index < len(LEVELS) for index in completed)):
+            return False
+        self.level_idx = value["level_idx"]
+        self.walls, self.targets, self.floors = walls, targets, floors
+        self.boxes, self.player_pos, self.history = boxes, player_pos, history
+        self.moves, self.pushes = value["moves"], value["pushes"]
+        self.score = value["score"]
+        self.state = "playing"
+        self.total_score = value["total_score"]
+        self.level_scores = {int(key): score
+                             for key, score in level_scores.items()}
+        self.completed_levels = set(completed)
+        self.attempt_context.attempt_uuid = value["attempt_uuid"]
+        self.attempt_context.revision = value["attempt_revision"]
+        self.practice_mode = False
+        self._campaign_snapshot = None
+        self.overlay_buttons = []
+        w, h = level_bounds(LEVELS[self.level_idx])
+        self.width, self.height = max(500, w * CELL + 40), max(380, h * CELL + 132)
+        self.screen = pygame.display.set_mode((self.width, self.height))
+        self.offset_x = (self.width - w * CELL) // 2
+        self.offset_y = 66
+        self.progress_save_message = "已恢复练习前的闯关现场"
+        return True
+
+    def _poll_campaign_session(self) -> None:
+        future = self._campaign_session_load_future
+        if future is None or not future.done():
+            return
+        self._campaign_session_load_future = None
+        try:
+            saved = future.result()
+        except Exception:  # noqa: BLE001 - a fresh campaign remains playable
+            return
+        if isinstance(saved, dict) and isinstance(saved.get("state"), dict):
+            saved = saved["state"]
+        if self._restore_campaign_session(saved):
+            self._persist_campaign_session(active=False)
+
+    def _start_progress_write(self, progress_key: str, progress_value: dict,
+                              generation: int) -> None:
+        save_progress = getattr(self.backend, "merge_progress_async", None)
+        if not callable(save_progress):
+            return
+        try:
+            future = save_progress(
+                self.profile_id, self.game_id, progress_key, progress_value)
+        except Exception:  # noqa: BLE001 - progress is non-critical
+            self._progress_save_messages[progress_key] = "进度暂时未保存"
+            return
+        self._progress_write_futures[progress_key] = (
+            future, generation, progress_key)
+
+    def _queue_progress_write(self, progress_key: str,
+                              progress_value: dict) -> None:
+        self._progress_generation[progress_key] += 1
+        generation = self._progress_generation[progress_key]
+        current = self._progress_write_futures[progress_key]
+        if current is not None:
+            # Keep the newest unsent snapshot. The backend's merge journal
+            # retains already-submitted monotonic components.
+            self._progress_write_queued[progress_key] = (
+                progress_key, progress_value, generation)
+            return
+        self._start_progress_write(progress_key, progress_value, generation)
 
     def _apply_progress(self, value, generation: int,
                         progress_key: str = "campaign") -> None:
@@ -442,9 +629,9 @@ class Sokoban(BaseGame):
         self.offset_x = (self.width - w * CELL) // 2
         self.offset_y = 66
 
-    def _capture_campaign_session(self) -> None:
+    def _capture_campaign_session(self) -> bool:
         if self.practice_mode or self._campaign_snapshot is not None:
-            return
+            return self._campaign_snapshot is not None
         self._campaign_snapshot = {
             "level_idx": self.level_idx,
             "walls": set(self.walls), "targets": set(self.targets),
@@ -455,6 +642,10 @@ class Sokoban(BaseGame):
                         for position, boxes, moves, pushes in self.history],
             "score": self.score, "state": self.state,
         }
+        if not self._persist_campaign_session(active=True):
+            self._campaign_snapshot = None
+            return False
+        return True
 
     def _return_to_campaign(self) -> bool:
         snapshot = self._campaign_snapshot
@@ -472,6 +663,7 @@ class Sokoban(BaseGame):
         self.offset_x = (self.width - w * CELL) // 2
         self.offset_y = 66
         self.progress_save_message = "已返回原闯关进度"
+        self._persist_campaign_session(active=False)
         return True
 
     def update(self, dt: float):
@@ -497,7 +689,8 @@ class Sokoban(BaseGame):
             return False
         self._practice_select_target = None
         self._practice_select_deadline = 0
-        self._capture_campaign_session()
+        if not self._capture_campaign_session():
+            return False
         self.load_level(index, practice=True, new_campaign=False)
         return True
 
@@ -505,6 +698,9 @@ class Sokoban(BaseGame):
         # Let BaseGame handle QUIT, ESC (return to launcher), P (pause),
         # and overlay-button clicks first.
         if super().handle_event(event):
+            return
+        self._poll_campaign_session()
+        if self._campaign_session_load_future is not None:
             return
         if event.type != pygame.KEYDOWN:
             return
@@ -662,14 +858,7 @@ class Sokoban(BaseGame):
                       "completed_all": completed_all}
             save_progress = getattr(self.backend, "merge_progress_async", None)
             if callable(save_progress):
-                try:
-                    self._progress_generation[progress_key] += 1
-                    generation = self._progress_generation[progress_key]
-                    self._progress_write_futures[progress_key] = (save_progress(
-                        self.profile_id, self.game_id,
-                        progress_key, progress_value), generation, progress_key)
-                except Exception:  # noqa: BLE001 - progress is non-critical
-                    self.progress_save_message = "进度暂时未保存"
+                self._queue_progress_write(progress_key, progress_value)
             if (completed_all
                     and (self._confirmed_total is None
                          or self.total_score > self._confirmed_total)

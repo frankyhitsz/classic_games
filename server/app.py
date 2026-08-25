@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import ipaddress
 import sqlite3
 import time
 import weakref
@@ -256,6 +257,14 @@ def create_app(config: dict | None = None) -> Flask:
 
 def main() -> None:
     host = os.environ.get("GAMES_HOST", "127.0.0.1")
+    try:
+        loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host.casefold() == "localhost"
+    if not loopback and os.environ.get("GAMES_UNSAFE_EXPOSE") != "1":
+        raise SystemExit(
+            "拒绝在非回环地址启动未认证的调试 API；如已采取网络隔离，"
+            "请显式设置 GAMES_UNSAFE_EXPOSE=1")
     port = int(os.environ.get("GAMES_PORT", "5000"))
     app = create_app()
     print(f"[server] http://{host}:{port}  (db={app.config['DB_PATH']})")

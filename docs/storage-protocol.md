@@ -26,16 +26,25 @@ journal、阶段文件或数据库镜像的 hash 不匹配时停止启动，保�
 还会确认目标仍与 prepare 时相同。事务目标仅允许 active score/state journal、旧版 pending/migrated
 evidence 的删除，以及 `imported-recovery/<archive-id>/` evidence。
 
+score canonical 只在 request lock 内用 `os.replace` 发布，发布、重试计数、扫描、删除和隔离不使用硬链接，
+因此 canonical 的链接数始终为 1。发布完成后用 replay 同款 bounded/no-follow reader 再读一次，才返回
+durable receipt。state `set_progress` 使用完整 order 的 LWW；只有 `merge_progress` 增量参与 component merge，
+旧 set 与新 merge 相遇时把 set winner 作为一个有 hash 的 baseline component。
+
 transaction v1 没有内容摘要，普通启动默认停止；CLI 必须先导出 evidence，再提交 evidence 文件及其
 SHA-256 才允许 legacy rollback。发现多份未完成 transaction 时没有可信 lineage，恢复器停止而不是按
 目录名猜顺序。灾难 replace 遇到非 SQLite 目标时使用带 hash 的 transaction v3 raw rollback image；
-正常 import 不升级格式。
+正常 import 不升级格式。raw fallback 发现 WAL、SHM 或 rollback journal 时停止并要求人工恢复，不能把
+只有主文件的回滚虚报为完整恢复。terminal transaction root 即使清理失败也不再算 active；普通文件、
+symlink 和 Windows reparse/junction root 仍明确阻止启动。
 
 state journal 在替换旧 winner 前写 reject v3 `prepared` marker。SQLite 永久拒绝 incoming 时先把 marker
 改为 `rejected`，再隔离 incoming 并恢复 previous。启动时完整 `.tmp` 会提升为 final；只有 hash 或结构
 无效的临时文件才隔离。canonical 缺失或损坏时先恢复 marker 中的 previous，不把 `current=None` 当作提交
 证明。普通 score/state/clock temp 经过 grace window 后按 request/key lock 提升或合并；新 temp 保留并
-阻止 complete export，避免与仍在写入的进程竞争。
+阻止 complete export，避免与仍在写入的进程竞争。恢复会在取得锁后复查 inode、size 和 mtime；锁超时
+原样保留，canonical 损坏则必须先成功隔离才允许提升 temp。state clock 只接受 64-byte、单链接普通文件；
+state 时间戳超过本机时间 24 小时的记录拒绝进入 ordering。
 
 ## Archive v3
 
@@ -45,6 +54,12 @@ path/size/hash。reader 按 archive 自身 format dispatch，不拿未来程序�
 `max_version` 比较。ruleset catalog 可以是历史子集；当前 ruleset 行严格校验，未知历史版本只以
 preserve-only 方式保留，默认排行榜仍只查询当前 ruleset。
 
+v3 的 `ruleset_catalog` 每个 game 只有一个字符串，这是冻结格式的已知限制：它表示 archive 的主要规则
+身份，不足以枚举一个游戏的全部历史版本。导入器不使用 catalog 猜测历史 pending；removed game 或旧
+ruleset pending 只写入 `imported-recovery/.../historical-pending/`，不激活。未来 Archive v4 应把目录改为
+每个 game 的 observed ruleset 集合，并分别记录 committed、active pending、evidence-only 三种来源；
+这项变化不得回填到 v3。
+
 `upgrade-archive` 可把严格 manifest format 2 的 v2 archive 重写为 v3，并保留其可证明的 complete 状态。
 format-less v2 没有 active reject/restore inventory，归档自身无法证明当时没有遗漏，因此升级结果明确为
 merge-only。这是证据边界，不允许通过补一个字段伪造成完整备份。
@@ -53,6 +68,14 @@ merge-only。这是证据边界，不允许通过补一个字段伪造成完整�
 `restore-replace` 只接受完整 v3 manifest；它在旁路构建全新 current-schema DB，导入后检查 foreign key、
 quick check 和完整 schema fingerprint，再在 exclusive locks 内原子替换目标。健康库使用 SQLite rollback
 image，坏库使用 authenticated raw image；旧数据库和 sidecar 另存为 evidence，不会混入 active pending。
+
+`.fresh-replace-*` 与 `.replace-plan-*` 是保留前缀；前者进入 recovery inventory/export/cleanup 盘点，导入
+和替换在任何 staging 写入前按数据库、archive、rollback 和 16 MiB 余量执行磁盘空间 preflight。
+
+`export` 默认只做 snapshot，遇到 orphan/reject/import transaction 会报告不完整而不修复；只有显式
+`--repair-before-export` 才先恢复，并在结果中返回该选择与 recovered transaction。`inspect-archive` 只读
+archive descriptor，不打开目标数据库；`preview-import` 会先恢复目标 import transaction，因此帮助文本不再
+称它为完全只读。
 
 v3 仍沿用有硬上限的 canonical JSON，不假称流式格式。若 128 MiB 上限内的实测峰值不可接受，下一版
 必须另行设计逐项 hash、随机访问索引和中断恢复，不能向已发布格式继续堆可选字段。

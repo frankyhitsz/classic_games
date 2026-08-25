@@ -80,7 +80,7 @@ GAMES_USE_HTTP=1 GAMES_API_URL=http://127.0.0.1:5010 ./run_launcher.sh
 服务端默认只监听本机。确需局域网调试时可显式指定监听地址：
 
 ```bash
-GAMES_HOST=0.0.0.0 GAMES_PORT=5010 ./run_server.sh
+GAMES_HOST=0.0.0.0 GAMES_PORT=5010 GAMES_UNSAFE_EXPOSE=1 ./run_server.sh
 ```
 
 该调试 API 没有身份验证。绑定 `0.0.0.0` 时，同一网络中的其他设备也可能
@@ -190,7 +190,8 @@ classic_games/
 发现其他实例后来写入的待保存文件。
 `pending-state/` 使用每个档案或存档键一个文件的状态日志，保存最新昵称、设置、关卡进度和
 自动存档。schema 3 日志冻结 ruleset，用跨进程文件锁串行同一 key，以持久 logical revision
-防止晚到旧值覆盖新值；progress 为每次贡献记录 component ID/hash 后按游戏规则单调合并。
+防止晚到旧值覆盖新值；`merge_progress` 为每次贡献记录 component ID/hash 后按游戏规则单调合并，
+兼容的 `set_progress` 则按完整 revision/operation ID 做 LWW，不会被误当成空 component 增量。
 数据库 schema v7 在同一事务保存状态值、业务值 hash 和胜出回执；旧库升级先为既有状态建立
 基线，因此 journal 已删除、业务行隔离或时钟损坏后仍能按权威值恢复。数据库解除锁定后会自动
 补写，成功后仅在 hash 仍匹配时删除对应日志。损坏的状态文件移入
@@ -207,6 +208,7 @@ score/state pending，记录包版本、导出时规则目录和 reader capabili
 ```bash
 python -m game_service.data_cli status
 python -m game_service.data_cli export classic-games-backup.json --include-recovery
+python -m game_service.data_cli inspect-archive classic-games-backup.json
 python -m game_service.data_cli preview-import classic-games-backup.json
 python -m game_service.data_cli transactions
 ```
@@ -219,7 +221,10 @@ replace 权限：
 python -m game_service.data_cli upgrade-archive old-v2.json upgraded-v3.json
 ```
 
-导出默认不覆盖任何现有文件，也不能写到数据库、SQLite sidecar、pending 或 recovery 路径。确认
+导出默认只做 snapshot，不修复 orphan 或 transaction；需要先恢复再导出时显式增加
+`--repair-before-export`。`inspect-archive` 不打开本机数据库，`preview-import` 则会先恢复目标目录中的
+未完成导入事务，再计算合并计划。导出默认不覆盖任何现有文件，也不能写到数据库、SQLite sidecar、
+pending 或 recovery 路径。确认
 要替换普通 archive 时才使用 `--force`。如果任何 active journal 因损坏或配额无法读取，完整导出
 会失败；仅用于取证时可加 `--allow-partial`，manifest 会记录遗漏：
 

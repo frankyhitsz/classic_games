@@ -98,7 +98,9 @@ class LocalGameStore:
                  legacy_db_path: Optional[Path | str] = None,
                  initialize: bool = True,
                  busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS):
-        self.db_path = Path(db_path) if db_path is not None else default_database_path()
+        self.db_path = (Path(db_path) if db_path is not None
+                        else default_database_path()).expanduser().resolve(
+                            strict=False)
         self.legacy_db_path = (Path(legacy_db_path)
                                if legacy_db_path is not None else None)
         self.busy_timeout_ms = max(0, int(busy_timeout_ms))

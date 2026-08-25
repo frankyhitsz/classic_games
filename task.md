@@ -1,52 +1,64 @@
-# 第十五次审查修复记录
+# 第十六次审查修复记录
 
 ## 状态
 
-- [x] 完整读取并核对 F01–F31 与 P0–P3 共 121 项；
-- [x] 关闭 handoff、transaction root、state journal 与 import planner 四项 P0；
-- [x] 完成 reject/temp/path/archive/坏库 replace 等关键恢复加固；
-- [x] 完成 2048 claim revision/hash 与 Sokoban PracticeSession 修复；
-- [x] 增加玩法与工程小项：Snake/Zuma RNG、Tetris hold 预览、固定 CI constraints；
-- [x] 第一轮完整 storage/gameplay 验证与问题修复；
-- [x] 第二轮独立复查、stress、资源和打包验证；
-- [x] 提交、推送并核验最终 GitHub CI。
+- [x] 完整读取并核对 F01–F26 与 P0–P3 共 121 项；
+- [x] 修复 score single-link 发布和 progress method matrix 两项 P0；
+- [x] 完成 orphan、clock、event、transaction、archive 与路径生命周期关键加固；
+- [x] 完成 2048 RNG/slot resolution 与 Sokoban single-flight/durable campaign 修复；
+- [x] 增加第十六次定向回归并完成第一轮 storage 验证；
+- [x] 第二轮独立复查、gameplay、stress、release 与打包验证；
+- [ ] 提交、推送并核验 GitHub CI。
 
-## 第一轮发现
+## 第一轮发现与修复
 
-- 初版 orphan temp 恢复会扫描其他进程仍在写入的文件，32 进程 score spool 用例出现 31/32。现加入
-  2 秒 grace；未到期 temp 保持原位并由 complete export 报告，陈旧完整 temp 才在 key lock 下提升。
-- practice schema 收紧后，旧 profile collision fixture 仍期待 practice `unlocked_level`。当前规则改为隔离该
-  旧字段，不恢复成活动解锁；测试改为验证其不会进入 progress。
-- 2048 claim fixture 只返回 owner 字段，没有 authoritative value hash。测试 fake 现按真实 Store hash 计算，
-  不通过放宽生产检查规避新不变量。
-- fresh-DB replace 不能直接复用只接受健康 SQLite 的 v2 rollback。ImportTransaction 在坏库灾难恢复时可写
-  authenticated raw rollback v3；正常 import 继续使用 v2 SQLite image。
+- score `os.link(temp, target)` 在 unlink temp 前确实让 canonical 短暂 `nlink=2`，与 reader 的 single-link
+  不变量直接冲突。改为 request lock 内 replace 后，scanner、remove、quarantine 和 retry 也统一进入锁。
+- resolver 只看 `kind=progress`，两个合法 `set_progress` 会进入只接受 components 的 merge。当前 method
+  matrix 让 set/set 和 merge/set 走 LWW；set/merge 把 set winner 变成带 hash 的 baseline component。
+- orphan 初版只在 lock 前看一次 mtime，且 broad `StoreError` catch 会把 lock timeout 当坏文件。现在 lock
+  后复查完整 fingerprint；timeout 保留，坏 canonical 先隔离，隔离失败不覆盖。
+- state current 的 quarantine 返回值此前被忽略；故障注入证明可覆盖唯一坏字节。当前返回 false 立即停止。
+- export 构造 outbox 时会恢复 orphan，preview 也会回滚 transaction，却都被描述成只读。export 默认改为
+  snapshot-only，并新增完全不打开目标库的 `inspect-archive`。
+- SQLite 打开坏库时可能处理既有 sidecar，因此 sidecar 存在性必须在尝试连接前记录；随后 raw fallback
+  才能可靠停止自动恢复。
+- Sokoban 的 per-key Future 不仅会覆盖运行中的写，也会覆盖已完成但尚未 poll 的结果。当前只要槽非空就
+  queue newest，消费旧结果后再提交；练习前 campaign 另写 durable `practice-return` slot。
 
-## 第二轮发现
+## 第一轮验证
 
-- fresh replace 在 transaction 发布后、数据库替换前写永久备份；原异常范围没有覆盖备份发布与 sidecar
-  迁移。现在整个发布阶段都受同一 rollback 保护，备份发布故障注入验证目标字节与 transaction root 均恢复。
-- v3 catalog 允许历史子集是正确的，但记录所属游戏也必须在该 archive 的 catalog 中声明。当前 import 对
-  attempts/progress/save slot 统一核对 catalog；export 会把 committed 历史游戏补入 catalog。空记录的旧
-  catalog 仍兼容，夹带未声明记录会在 preview 失败。
+- 新增 `tests/test_storage_v14.py` 25 项，覆盖 hard-link 不可达、两种 orphan timeout、坏 canonical、
+  quarantine failure、clock symlink、progress method matrix、event order、transaction root/raw sidecar、
+  snapshot export、pure archive inspect、historical pending、space preflight、constructor cleanup、API 暴露、
+  2048 RNG、Sokoban coalescing 和 durable campaign restore；
+- storage 初跑 257 项时发现旧 misnamed spool 恢复被过度收紧；增加稳定顺序的 multi-request lock，保留旧
+  canonical rename 行为且不重新引入扫描竞态；
+- 修正测试环境：系统 Python 3.13 未安装 pygame，不把依赖缺失误判为产品回归；正式验证统一使用项目
+  `games_env` 的 Python 3.11/pygame 2.6.1。
 
-## 已完成的本地验证
+## 第二轮发现与修复
 
-- Ruff 与 compileall 定向检查通过；
-- 235 项 storage 通过，本机仅跳过 Windows junction 专用用例；本轮新增 27 项测试；
+- worker 创建的 cleanup 最初只包住第二个 worker；第一个 worker 构造自身失败时 session 仍可能泄漏。
+  当前两个 worker 都在同一异常范围内，probe 也把 unsafe directory 转成不可写状态而非越过 cleanup。
+- reserved prefix 初版只拒绝数据库同目录下的直接文件名，尚可把 archive 写到不存在的
+  `.fresh-replace-*/child`。当前按相对路径第一段判断，目录不存在时同样拒绝。
+- historical pending 已正确转为 evidence，但 import 结果仍把它计入 `pending_restored`。当前只统计真正激活
+  的 score/state，并在非零时另报 `historical_evidence_only`，同时保持普通 archive 的旧返回结构。
+- campaign durable slot 的恢复数据需要与 archive 一样视为不可信输入。当前限制 level、坐标、箱子数、
+  history 长度、ledger 和 attempt identity；session load 未结束前不接收棋盘操作。
+- 精确固定的 setuptools 80.9.0 被 2026-08 的依赖审计识别为 `PYSEC-2026-3447`。build-system 与
+  constraints 同步更新为 83.0.0，重新审计为零已知漏洞。
+
+## 完整验证
+
+- Ruff、compileall 与 `git diff --check` 通过；
+- 260 项 storage 通过，本机仅跳过 Windows junction 专用用例；本轮新增 25 项；
 - 107 项 gameplay 回归通过；
-- POSIX 测试使用 spawn 子进程和真实 advisory lock，不用 mock 代替等待者；
-- 坏库 replace、missing journal、state conflict、planner silent drop、orphan temp、DB symlink、hard link、
-  evidence-bound v1、Archive future/catalog、Sokoban campaign return 均有定向覆盖。
-- release profile 全部通过：dependency audit/SBOM 无已知漏洞，wheel 与 sdist 以 0.8.0 安装冒烟通过；
-- stress 完成 20,000 个确定性步骤、240 次并发写，SQLite integrity check 通过，100 次资源循环 FD 19→19；
-  五款游戏 render p95 均低于 5 ms，locked-submit p99 为 0.027 ms。
-- 功能提交 `8338ea3` 的 GitHub CI #41 在 4 分 5 秒内成功：release gate、core-only、Python
-  3.12/3.13，以及 Linux、macOS、Windows 三平台矩阵共 7 个任务全部通过。
-- 纯文档提交触发的 CI #42 在 Windows 暴露启动器悬停用例的休眠竞态：慢机器会在 driver 发完移动与退出
-  事件后才进入首帧。用例改为等待首个 leaderboard draw，再等待目标标题 draw 后退出，不再依赖固定休眠。
-- 稳定性修复提交 `a88a56a` 的 GitHub CI #43 在 4 分 36 秒内成功，Windows 完整 gameplay 重新通过，
-  release gate、core-only、兼容矩阵和三平台矩阵共 7 个任务全部成功。
+- stress 完成 20,000 个确定性步骤、240 次并发写和 100 次资源循环，FD 19→19，SQLite
+  `integrity_check=ok`，五款游戏 render p95 均低于 5 ms；
+- release profile 在 Python 3.13 隔离环境通过：依赖审计与 SBOM 均为零已知漏洞，wheel/sdist 使用
+  setuptools 83.0.0 构建并从只读工作目录完成用户数据冒烟，随后重复通过 storage/stress/gameplay。
 
 ## 尚需外部决定
 

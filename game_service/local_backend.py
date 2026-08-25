@@ -16,7 +16,7 @@ import time
 import uuid
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional
@@ -36,6 +36,7 @@ from .store import LocalGameStore, StoreError, default_database_path
 SPOOL_SCHEMA_VERSION = 2
 MAX_PENDING_ATTEMPTS = 10_000
 MAX_STATE_TIMESTAMP = 1e20
+MAX_STATE_FUTURE_SKEW_SECONDS = 24 * 60 * 60
 MAX_SPOOL_FILE_BYTES = 64 * 1024
 MAX_SPOOL_FILES = 10_000
 MAX_SPOOL_TOTAL_BYTES = 64 * 1024 * 1024
@@ -110,7 +111,14 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
                 raise OSError("pending file changed while opening")
             with os.fdopen(descriptor, "rb", closefd=False) as handle:
                 raw = handle.read(limit + 1)
-            if len(raw) > limit:
+            final = os.fstat(descriptor)
+            if (len(raw) > limit or len(raw) != final.st_size
+                    or not stat.S_ISREG(final.st_mode)
+                    or final.st_nlink > 1
+                    or (after.st_dev, after.st_ino, after.st_size,
+                        after.st_mtime_ns)
+                    != (final.st_dev, final.st_ino, final.st_size,
+                        final.st_mtime_ns)):
                 raise OSError("pending file grew while reading")
             return raw
         finally:
@@ -434,6 +442,14 @@ class PersistentSaveOutbox:
         finally:
             os.close(descriptor)
 
+    @contextmanager
+    def _request_locks(self, *request_ids: str):
+        """Acquire multiple request locks in one stable cross-process order."""
+        with ExitStack() as stack:
+            for request_id in sorted(set(request_ids)):
+                stack.enter_context(self._request_lock(request_id))
+            yield
+
     @staticmethod
     def _try_lock_descriptor(descriptor: int) -> bool:
         if os.name == "nt":
@@ -483,7 +499,7 @@ class PersistentSaveOutbox:
             os.replace(path, target)
             self._fsync_directory(self.quarantine_path)
             self._fsync_directory(path.parent)
-        except OSError:
+        except (OSError, StoreError):
             return False
         self.quarantined_count += 1
         return True
@@ -533,8 +549,8 @@ class PersistentSaveOutbox:
             return
         for temporary in candidates[:MAX_SPOOL_FILES]:
             try:
-                if (time.time() - os.lstat(temporary).st_mtime
-                        < ORPHAN_TEMP_GRACE_SECONDS):
+                before = os.lstat(temporary)
+                if (time.time() - before.st_mtime < ORPHAN_TEMP_GRACE_SECONDS):
                     continue
                 raw = _read_regular_nofollow(
                     temporary, MAX_SPOOL_FILE_BYTES)
@@ -544,8 +560,24 @@ class PersistentSaveOutbox:
                 envelope, _mutation = PendingSaveEnvelope.parse(value)
                 target = self._target(envelope.request_id)
                 with self._request_lock(envelope.request_id):
-                    if target.is_file():
+                    after = os.lstat(temporary)
+                    if ((before.st_dev, before.st_ino, before.st_size,
+                         before.st_mtime_ns)
+                            != (after.st_dev, after.st_ino, after.st_size,
+                                after.st_mtime_ns)
+                            or time.time() - after.st_mtime
+                            < ORPHAN_TEMP_GRACE_SECONDS):
+                        continue
+                    try:
                         existing, _existing_mutation = self._read_file(target)
+                    except FileNotFoundError:
+                        existing = None
+                    except (OSError, StoreError, TypeError, ValueError,
+                            RecursionError, UnicodeError):
+                        if not self._quarantine(target, "invalid-current"):
+                            continue
+                        existing = None
+                    if existing is not None:
                         if existing.payload_hash != envelope.payload_hash:
                             if not self._quarantine(
                                     temporary, "orphan-request-conflict"):
@@ -559,7 +591,11 @@ class PersistentSaveOutbox:
                     else:
                         os.replace(temporary, target)
                         self._fsync_directory(self.path)
-            except (OSError, StoreError, TypeError, ValueError,
+            except StoreError as exc:
+                if exc.code == "spool_lock_timeout":
+                    continue
+                self._quarantine(temporary, "invalid-orphan-temp")
+            except (OSError, TypeError, ValueError,
                     RecursionError, UnicodeError):
                 self._quarantine(temporary, "invalid-orphan-temp")
 
@@ -694,25 +730,23 @@ class PersistentSaveOutbox:
             try:
                 with self._request_lock(mutation.request_id):
                     try:
-                        os.link(temp, target)
-                    except FileExistsError:
                         existing, _ = self._read_file(target)
+                    except FileNotFoundError:
+                        existing = None
+                    if existing is not None:
                         if existing.payload_hash != envelope.payload_hash:
                             raise self._conflict(existing, envelope)
                         return existing
-                    except OSError:
-                        # Hard links are unavailable on some filesystems.
-                        # The request lock retains no-clobber semantics.
-                        if target.exists():
-                            existing, _ = self._read_file(target)
-                            if existing.payload_hash != envelope.payload_hash:
-                                raise self._conflict(existing, envelope)
-                            return existing
-                        os.replace(temp, target)
-                        self._fsync_directory(self.path)
-                        return envelope
-                    else:
-                        self._fsync_directory(self.path)
+                    os.replace(temp, target)
+                    self._fsync_directory(self.path)
+                    # Re-open through the same bounded, no-follow reader used
+                    # by replay before reporting the journal as durable.
+                    published, _ = self._read_file(target)
+                    if published.payload_hash != envelope.payload_hash:
+                        raise StoreError(
+                            "spool_publish_mismatch",
+                            "published pending save could not be verified")
+                    return published
             finally:
                 try:
                     temp.unlink()
@@ -723,10 +757,11 @@ class PersistentSaveOutbox:
     def increment_attempt(self, request_id: str) -> None:
         target = self._target(request_id)
         with self._lock:
-            if not target.is_file():
-                return
             with self._request_lock(request_id):
-                envelope, _mutation = self._read_file(target)
+                try:
+                    envelope, _mutation = self._read_file(target)
+                except FileNotFoundError:
+                    return
                 updated = replace(
                     envelope,
                     attempt_count=min(
@@ -750,10 +785,11 @@ class PersistentSaveOutbox:
                 "invalid_spool_envelope", "pending retry count is out of range")
         target = self._target(request_id)
         with self._lock:
-            if not target.is_file():
-                return
             with self._request_lock(request_id):
-                envelope, _mutation = self._read_file(target)
+                try:
+                    envelope, _mutation = self._read_file(target)
+                except FileNotFoundError:
+                    return
                 if value <= envelope.attempt_count:
                     return
                 updated = replace(envelope, attempt_count=value)
@@ -795,6 +831,8 @@ class PersistentSaveOutbox:
             value = json.loads(original.decode("utf-8"),
                                parse_constant=_reject_json_constant)
             _validate_json_shape(value)
+        except FileNotFoundError:
+            raise
         except (OSError, StoreError, ValueError, RecursionError) as exc:
             raise StoreError("corrupt_spool_file",
                              "pending save is not valid JSON") from exc
@@ -827,11 +865,19 @@ class PersistentSaveOutbox:
                 paths = paths[:MAX_SPOOL_FILES]
             for path in paths:
                 try:
-                    envelope, mutation = self._read_file(path)
-                    canonical = self._target(envelope.request_id)
+                    with self._request_lock(path.stem):
+                        try:
+                            envelope, mutation = self._read_file(path)
+                        except StoreError as exc:
+                            self._quarantine(path, exc.code)
+                            continue
+                        canonical = self._target(envelope.request_id)
                     if path != canonical:
-                        with self._request_lock(envelope.request_id):
-                            if canonical.exists():
+                        with self._request_locks(
+                                path.stem, envelope.request_id):
+                            envelope, mutation = self._read_file(path)
+                            canonical = self._target(envelope.request_id)
+                            if canonical.exists() or canonical.is_symlink():
                                 existing, _ = self._read_file(canonical)
                                 if existing.payload_hash != envelope.payload_hash:
                                     self._quarantine(path, "filename-conflict")
@@ -842,7 +888,12 @@ class PersistentSaveOutbox:
                             self._fsync_directory(self.path)
                     result.append((envelope, mutation))
                 except StoreError as exc:
-                    self._quarantine(path, exc.code)
+                    if exc.code == "spool_lock_timeout":
+                        notices.append(
+                            f"{path.name} 正由另一个进程处理，已保留原文件")
+                    else:
+                        notices.append(
+                            f"{path.name} 暂时无法处理，已保留原文件")
                 except OSError:
                     notices.append(f"{path.name} 暂时无法处理，已保留原文件")
                     continue
@@ -914,24 +965,26 @@ class PersistentSaveOutbox:
             return False
 
     def remove(self, request_id: str) -> None:
-        try:
-            self._target(request_id).unlink()
-            self._fsync_directory(self.path)
-        except FileNotFoundError:
-            pass
+        with self._lock, self._request_lock(request_id):
+            try:
+                self._target(request_id).unlink()
+                self._fsync_directory(self.path)
+            except FileNotFoundError:
+                pass
 
     def quarantine_request(self, request_id: str, reason: str) -> bool:
         target = self._target(request_id)
-        if target.exists():
-            return self._quarantine(target, reason)
-        return False
+        with self._lock, self._request_lock(request_id):
+            if target.exists() or target.is_symlink():
+                return self._quarantine(target, reason)
+            return False
 
     def probe_writable(self) -> bool:
         probe = self.path / f".probe-{uuid.uuid4().hex}"
         try:
             _secure_data_directory(self.path, create=True)
             self._write_bytes(probe, b"ok")
-        except OSError:
+        except (OSError, StoreError):
             return False
         finally:
             try:
@@ -1013,13 +1066,14 @@ class PersistentStateOutbox:
         with self._lock, self._digest_lock("clock"):
             previous = 0
             try:
-                raw = clock_path.read_text(encoding="ascii").strip()
+                raw = _read_regular_nofollow(clock_path, 64).decode(
+                    "ascii").strip()
                 previous = int(raw)
                 if previous < 0:
                     raise ValueError
             except FileNotFoundError:
                 pass
-            except (OSError, UnicodeError, ValueError):
+            except (OSError, StoreError, UnicodeError, ValueError):
                 self._quarantine_clock_locked(clock_path)
                 previous = 0
             if previous > (1 << 63) - 2:
@@ -1137,7 +1191,8 @@ class PersistentStateOutbox:
         operation_id = operation_id or uuid.uuid4().hex
         timestamp = time.time() if updated_at is None else float(updated_at)
         if (not math.isfinite(timestamp)
-                or not 0 <= timestamp <= MAX_STATE_TIMESTAMP):
+                or not 0 <= timestamp <= MAX_STATE_TIMESTAMP
+                or timestamp > time.time() + MAX_STATE_FUTURE_SKEW_SECONDS):
             raise StoreError(
                 "invalid_state_timestamp", "invalid local state timestamp")
         operation = {
@@ -1252,7 +1307,13 @@ class PersistentStateOutbox:
             raise StoreError("invalid_progress", str(exc)) from exc
         components_by_id: dict[str, str] = {}
         for operation in (existing, incoming):
-            for component in operation["components"]:
+            components = operation["components"]
+            if operation["method"] == "set_progress":
+                components = [{
+                    "operation_id": operation["operation_id"],
+                    "payload_hash": operation["payload_hash"],
+                }]
+            for component in components:
                 component_id = component["operation_id"]
                 component_hash = component["payload_hash"]
                 prior_hash = components_by_id.get(component_id)
@@ -1292,6 +1353,15 @@ class PersistentStateOutbox:
                     "state operation ID was reused with different data", 409)
             return existing, "duplicate"
         if incoming["kind"] == "progress":
+            methods = existing["method"], incoming["method"]
+            if methods == ("set_progress", "set_progress"):
+                if incoming_order < existing_order:
+                    return existing, "superseded"
+                return incoming, "incoming"
+            if methods == ("merge_progress", "set_progress"):
+                if incoming_order < existing_order:
+                    return existing, "superseded"
+                return incoming, "incoming"
             return cls._merge_progress_operations(existing, incoming), "merged"
         if incoming_order < existing_order:
             return existing, "superseded"
@@ -1307,6 +1377,7 @@ class PersistentStateOutbox:
             time.time_ns() if logical_revision is None else logical_revision,
             operation_id, components=components, updated_at=updated_at)
         published = True
+        resolution = "incoming"
         previous_operation = None
         with self._lock, self._key_lock(key):
             target = self._target(key)
@@ -1317,7 +1388,11 @@ class PersistentStateOutbox:
                         target, MAX_SPOOL_FILE_BYTES))
                 except (OSError, StoreError, TypeError, ValueError,
                         RecursionError):
-                    self._quarantine_locked(target, "invalid-current")
+                    if not self._quarantine_locked(target, "invalid-current"):
+                        raise StoreError(
+                            "state_quarantine_failed",
+                            "damaged pending state could not be preserved", 500,
+                            retryable=True)
                     existed = False
                 else:
                     previous_operation = existing
@@ -1356,6 +1431,7 @@ class PersistentStateOutbox:
         return {
             "payload_hash": incoming["payload_hash"],
             "published": published,
+            "resolution": resolution,
             "operation": incoming,
             "previous_operation": previous_operation,
         }
@@ -1377,7 +1453,9 @@ class PersistentStateOutbox:
                     or not isinstance(value.get("args"), list)
                     or type(value.get("updated_at")) not in (int, float)
                     or not math.isfinite(float(value["updated_at"]))
-                    or not 0 <= float(value["updated_at"]) <= MAX_STATE_TIMESTAMP):
+                    or not 0 <= float(value["updated_at"]) <= MAX_STATE_TIMESTAMP
+                    or float(value["updated_at"])
+                    > time.time() + MAX_STATE_FUTURE_SKEW_SECONDS):
                 raise StoreError(
                     "invalid_state_journal", "invalid pending local state")
             legacy_hash = value.get("payload_hash")
@@ -1453,6 +1531,8 @@ class PersistentStateOutbox:
                 or type(value.get("updated_at")) not in (int, float)
                 or not math.isfinite(float(value["updated_at"]))
                 or not 0 <= float(value["updated_at"]) <= MAX_STATE_TIMESTAMP
+                or float(value["updated_at"])
+                > time.time() + MAX_STATE_FUTURE_SKEW_SECONDS
                 or not isinstance(value.get("components"), list)):
             raise StoreError(
                 "invalid_state_journal", "invalid pending local state")
@@ -1870,8 +1950,8 @@ class PersistentStateOutbox:
             if temporary.name.startswith(".reject-"):
                 continue
             try:
-                if (time.time() - os.lstat(temporary).st_mtime
-                        < ORPHAN_TEMP_GRACE_SECONDS):
+                before = os.lstat(temporary)
+                if time.time() - before.st_mtime < ORPHAN_TEMP_GRACE_SECONDS:
                     continue
             except OSError:
                 continue
@@ -1884,6 +1964,14 @@ class PersistentStateOutbox:
                         raise ValueError
                     clock_path = self.path / ".state-clock"
                     with self._digest_lock("clock"):
+                        after = os.lstat(temporary)
+                        if ((before.st_dev, before.st_ino, before.st_size,
+                             before.st_mtime_ns)
+                                != (after.st_dev, after.st_ino, after.st_size,
+                                    after.st_mtime_ns)
+                                or time.time() - after.st_mtime
+                                < ORPHAN_TEMP_GRACE_SECONDS):
+                            continue
                         try:
                             current_raw = _read_regular_nofollow(
                                 clock_path, MAX_SPOOL_FILE_BYTES)
@@ -1895,7 +1983,12 @@ class PersistentStateOutbox:
                         else:
                             temporary.unlink()
                         PersistentSaveOutbox._fsync_directory(self.path)
-                except (OSError, StoreError, UnicodeError, ValueError):
+                except StoreError as exc:
+                    if exc.code == "state_lock_timeout":
+                        continue
+                    self._quarantine_transaction(
+                        temporary, "invalid-state-clock-temp")
+                except (OSError, UnicodeError, ValueError):
                     self._quarantine_transaction(
                         temporary, "invalid-state-clock-temp")
                 continue
@@ -1907,9 +2000,26 @@ class PersistentStateOutbox:
                     raise StoreError(
                         "state_journal_bad_name", "orphan temp has another key")
                 with self._key_lock(operation["key"]):
-                    if target.is_file():
+                    after = os.lstat(temporary)
+                    if ((before.st_dev, before.st_ino, before.st_size,
+                         before.st_mtime_ns)
+                            != (after.st_dev, after.st_ino, after.st_size,
+                                after.st_mtime_ns)
+                            or time.time() - after.st_mtime
+                            < ORPHAN_TEMP_GRACE_SECONDS):
+                        continue
+                    try:
                         current = self._parse(_read_regular_nofollow(
                             target, MAX_SPOOL_FILE_BYTES))
+                    except FileNotFoundError:
+                        current = None
+                    except (OSError, StoreError, TypeError, ValueError,
+                            RecursionError, UnicodeError):
+                        if not self._quarantine_locked(
+                                target, "invalid-current"):
+                            continue
+                        current = None
+                    if current is not None:
                         winner, resolution = self.resolve_operations(
                             current, operation)
                         if resolution in {"incoming", "merged"}:
@@ -1919,7 +2029,12 @@ class PersistentStateOutbox:
                     else:
                         os.replace(temporary, target)
                         PersistentSaveOutbox._fsync_directory(self.path)
-            except (OSError, StoreError, TypeError, ValueError,
+            except StoreError as exc:
+                if exc.code == "state_lock_timeout":
+                    continue
+                self._quarantine_transaction(
+                    temporary, "invalid-state-orphan-temp")
+            except (OSError, TypeError, ValueError,
                     RecursionError, UnicodeError):
                 self._quarantine_transaction(
                     temporary, "invalid-state-orphan-temp")
@@ -2105,7 +2220,7 @@ class PersistentStateOutbox:
             PersistentSaveOutbox._write_bytes(probe, b"ok")
             probe.unlink()
             PersistentSaveOutbox._fsync_directory(self.path)
-        except OSError:
+        except (OSError, StoreError):
             return False
         return True
 
@@ -2199,6 +2314,10 @@ class LocalBackendClient:
                     else (store.db_path if store is not None
                           else default_database_path()))
         selected = selected.expanduser().resolve(strict=False)
+        if (store is not None
+                and store.db_path.expanduser().resolve(strict=False) != selected):
+            raise ValueError(
+                "prebuilt store and database path refer to different files")
         if (store is None and legacy_db_path is None and db_path is None
                 and not os.environ.get("GAMES_DB")):
             legacy_db_path = (Path(__file__).resolve().parents[1]
@@ -2269,8 +2388,6 @@ class LocalBackendClient:
                    self.state_outbox.recovery_notice]
         self.recovery_notice = "；".join(item for item in notices if item) or None
 
-        self._worker = LocalWriteWorker("games-local-write")
-        self._read_worker = LocalWriteWorker("games-local-read")
         self._closed = False
         self._lock = threading.RLock()
         self._state_publish_lock = threading.RLock()
@@ -2308,13 +2425,26 @@ class LocalBackendClient:
         self._last_reopen_error: Optional[str] = None
         self._retry_failure_count = 0
         self._next_auto_retry_at = 0.0
-        if self.store is None and defer_initialization:
-            self._read_worker.submit(self._try_reopen_store)
-        self._read_worker.submit(self._refresh_state_high_water)
-        if had_pending_scores or self._pending_state_count:
-            self.retry_failed_saves()
-        elif self.store is not None:
-            self._worker.submit(self._run_maintenance)
+        self._worker = None
+        self._read_worker = None
+        try:
+            self._worker = LocalWriteWorker("games-local-write")
+            self._read_worker = LocalWriteWorker("games-local-read")
+            if self.store is None and defer_initialization:
+                self._read_worker.submit(self._try_reopen_store)
+            self._read_worker.submit(self._refresh_state_high_water)
+            if had_pending_scores or self._pending_state_count:
+                self.retry_failed_saves()
+            elif self.store is not None:
+                self._worker.submit(self._run_maintenance)
+        except Exception:
+            if self._read_worker is not None:
+                self._read_worker.close(cancel_pending=True, timeout=2.0)
+            if self._worker is not None:
+                self._worker.close(cancel_pending=True, timeout=2.0)
+            self._application_session.close()
+            self._application_session = None
+            raise
 
     @property
     def pending_saves_are_durable(self) -> bool:
@@ -2563,11 +2693,14 @@ class LocalBackendClient:
             logical_revision=operation["logical_revision"],
             state=state,
             result=dict(result),
+            operation_id=str(operation.get("operation_id") or ""),
+            payload_hash=operation.get("payload_hash"),
         )
         with self._lock:
             current = self._local_state_status.get(event.key)
-            if (current is None
-                    or event.logical_revision >= current.logical_revision):
+            if (current is None or (
+                    event.logical_revision, event.operation_id) >= (
+                        current.logical_revision, current.operation_id)):
                 self._local_state_status[event.key] = event
             while len(self._local_state_status) > 1024:
                 self._local_state_status.pop(
@@ -2912,6 +3045,10 @@ class LocalBackendClient:
         result = {
             "ok": True, "durable_pending": True,
             "payload_hash": receipt["payload_hash"],
+            "published": receipt["published"],
+            "resolution": receipt["resolution"],
+            "winner_operation_id": receipt["operation"]["operation_id"],
+            "requested_operation_id": operation["operation_id"],
         }
         self._emit_local_state_event(
             receipt["operation"], SaveState.DURABLE_PENDING, result)
@@ -3075,7 +3212,9 @@ class LocalBackendClient:
                 logical_revision=operation["logical_revision"],
                 state=SaveState.NON_DURABLE_PENDING,
                 result={"ok": False, "pending_preserved": True,
-                        "durable_pending": False, "reconstructed": True})
+                        "durable_pending": False, "reconstructed": True},
+                operation_id=operation["operation_id"],
+                payload_hash=operation["payload_hash"])
         return event
 
     def _refresh_local_state_status(self, key: str) -> None:
@@ -3106,7 +3245,9 @@ class LocalBackendClient:
                     logical_revision=operation["logical_revision"],
                     state=SaveState.DURABLE_PENDING,
                     result={"ok": False, "pending_preserved": True,
-                            "durable_pending": True, "reconstructed": True})
+                            "durable_pending": True, "reconstructed": True},
+                    operation_id=operation["operation_id"],
+                    payload_hash=operation["payload_hash"])
             elif receipt is not None:
                 receipt_result = dict(receipt)
                 superseded = (
@@ -3118,17 +3259,24 @@ class LocalBackendClient:
                     logical_revision=receipt["logical_revision"],
                     state=(SaveState.SUPERSEDED
                            if superseded else SaveState.COMMITTED),
-                    result={**receipt_result, "reconstructed": True})
+                    result={**receipt_result, "reconstructed": True},
+                    operation_id=receipt["operation_id"],
+                    payload_hash=receipt["payload_hash"])
             else:
                 return
             with self._lock:
                 current = self._local_state_status.get(key)
             if (current is None
-                    or current.logical_revision < event.logical_revision
-                    or current.state != event.state):
+                    or (current.logical_revision, current.operation_id)
+                    < (event.logical_revision, event.operation_id)
+                    or ((current.logical_revision, current.operation_id)
+                        == (event.logical_revision, event.operation_id)
+                        and current.state != event.state)):
                 self._emit_local_state_event(
                     {"key": event.key, "kind": event.kind,
-                     "logical_revision": event.logical_revision},
+                     "logical_revision": event.logical_revision,
+                     "operation_id": event.operation_id,
+                     "payload_hash": event.payload_hash},
                     event.state, event.result)
         finally:
             with self._lock:

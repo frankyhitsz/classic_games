@@ -1,4 +1,5 @@
 # Full dependency closure used by the release verification environment.
+setuptools==83.0.0
 pygame==2.6.1
 build==1.5.0
 Flask==3.1.3

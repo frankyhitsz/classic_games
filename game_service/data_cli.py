@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sqlite3
 import stat
 import sys
@@ -72,6 +73,7 @@ MAX_JSON_STRING = 12 * 1024 * 1024
 MAX_RECOVERY_FILE_BYTES = 8 * 1024 * 1024
 MAX_RECOVERY_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_RECOVERY_FILES = 2_000
+MIN_IMPORT_SPACE_MARGIN = 16 * 1024 * 1024
 
 
 def _reject_json_constant(value: str):
@@ -132,6 +134,7 @@ def _recovery_paths(database: Path) -> list[Path]:
         "pending_saves.json.migrated-",
         "imported-recovery", f".{database.name}.import-",
         f".{database.name}.preparing-",
+        f".{database.name}.fresh-replace-",
     )
     try:
         entries = list(parent.iterdir())
@@ -146,6 +149,7 @@ def _recovery_source(database: Path, name: str) -> str:
     mappings = (
         (f".{database.name}.import-", "import_transaction"),
         (f".{database.name}.preparing-", "import_preparation"),
+        (f".{database.name}.fresh-replace-", "fresh_replace_staging"),
         (f"{database.name}.backup-", "database_backup"),
         (f"{database.name}.corrupt-", "corrupt_database"),
         ("pending-quarantine", "score_quarantine"),
@@ -191,8 +195,17 @@ def _guard_export_target(database: Path, requested: Path, *, force: bool) -> Pat
         database.with_name("pending-state"),
         *_recovery_paths(database),
     ]
-    if output.parent == database.parent and output.name.startswith(
-            f".{database.name}.import-"):
+    reserved_prefixes = (
+        f".{database.name}.import-", f".{database.name}.preparing-",
+        f".{database.name}.fresh-replace-",
+        f".{database.name}.replace-plan-",
+    )
+    try:
+        relative_output = output.relative_to(database.parent)
+    except ValueError:
+        relative_output = None
+    if (relative_output is not None and relative_output.parts
+            and relative_output.parts[0].startswith(reserved_prefixes)):
         raise StoreError(
             "unsafe_export_target", "export target overlaps an import transaction")
     if (_canonical_path(output) in protected_files
@@ -216,6 +229,8 @@ def _active_protocol_report(database: Path) -> dict:
     """List unresolved active journals that a complete snapshot cannot omit."""
     score_path, state_path = _pending_paths(database)
     candidates = [database.with_name("pending_saves.json")]
+    candidates.extend(database.parent.glob(f".{database.name}.import-*"))
+    candidates.extend(database.parent.glob(f".{database.name}.preparing-*"))
     try:
         with os.scandir(score_path) as entries:
             candidates.extend(
@@ -259,6 +274,27 @@ def _pending_paths(database: Path) -> tuple[Path, Path]:
     return database.with_name("pending"), database.with_name("pending-state")
 
 
+def _require_import_space(database: Path, archive_path: Path, *,
+                          replacement: bool) -> None:
+    """Refuse an import before staging when rollback space is insufficient."""
+    try:
+        database_bytes = database.stat().st_size if database.is_file() else 0
+        archive_bytes = archive_path.stat().st_size
+        free = shutil.disk_usage(database.parent).free
+    except OSError as exc:
+        raise StoreError(
+            "import_space_unknown", "available import space cannot be verified",
+            503, retryable=True) from exc
+    archive_copies = 3 if replacement else 1
+    required = (database_bytes * 2 + archive_bytes * archive_copies
+                + MIN_IMPORT_SPACE_MARGIN)
+    if free < required:
+        raise StoreError(
+            "insufficient_import_space",
+            "not enough free space for staging and authenticated rollback",
+            507, details={"required_bytes": required, "free_bytes": free})
+
+
 def _pending_file_count(path: Path) -> int:
     count = 0
     try:
@@ -266,6 +302,20 @@ def _pending_file_count(path: Path) -> int:
             for entry in entries:
                 if (entry.is_file(follow_symlinks=False)
                         and entry.name.endswith(".json")):
+                    count += 1
+                    if count >= MAX_TABLE_ROWS:
+                        break
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return 0
+    return count
+
+
+def _bounded_file_count(path: Path) -> int:
+    count = 0
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                if entry.is_file(follow_symlinks=False):
                     count += 1
                     if count >= MAX_TABLE_ROWS:
                         break
@@ -294,7 +344,14 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
                 raise OSError("file changed while opening")
             with os.fdopen(descriptor, "rb", closefd=False) as handle:
                 raw = handle.read(limit + 1)
-            if len(raw) > limit:
+            final = os.fstat(descriptor)
+            if (len(raw) > limit or len(raw) != final.st_size
+                    or not stat.S_ISREG(final.st_mode)
+                    or final.st_nlink > 1
+                    or (after.st_dev, after.st_ino, after.st_size,
+                        after.st_mtime_ns)
+                    != (final.st_dev, final.st_ino, final.st_size,
+                        final.st_mtime_ns)):
                 raise OSError("file grew while reading")
             return raw
         finally:
@@ -965,20 +1022,42 @@ def _archive_ruleset_catalog(tables: dict[str, list[dict]]) -> dict[str, str]:
 
 def export_data(database: Path, output: Path,
                 include_recovery: bool = False, *, force: bool = False,
-                allow_partial: bool = False) -> dict:
+                allow_partial: bool = False,
+                repair_before_export: bool = False) -> dict:
     database = database.expanduser().resolve(strict=False)
     output = _guard_export_target(database, output, force=force)
     score_path, state_path = _pending_paths(database)
     try:
         with (inactive_application_lock(database, timeout=2.0),
               maintenance_lock(database, exclusive=True, timeout=2.0)):
-            recovered_imports = recover_import_transactions(database)
+            active_before_repair = _active_protocol_report(database)
+            state_quarantine_before = _bounded_file_count(
+                state_path.with_name(f"{state_path.name}-quarantine"))
+            recovered_imports = (recover_import_transactions(database)
+                                 if repair_before_export else [])
             store = _existing_store(database)
             score_outbox = PersistentSaveOutbox(
                 score_path,
-                legacy_path=database.with_name("pending_saves.json"))
-            state_outbox = PersistentStateOutbox(state_path, recover=True)
+                legacy_path=database.with_name("pending_saves.json"),
+                maintain=repair_before_export)
+            state_outbox = PersistentStateOutbox(
+                state_path, recover=repair_before_export)
             active_report = _active_protocol_report(database)
+            unresolved_after = {
+                item["path"] for item in active_report["unresolved"]}
+            repair_report = {
+                "requested": repair_before_export,
+                "recovered_imports": recovered_imports,
+                "resolved_active_paths": sorted(
+                    item["path"]
+                    for item in active_before_repair["unresolved"]
+                    if item["path"] not in unresolved_after),
+                "score_migrated": score_outbox.migrated_spool_count,
+                "score_quarantined": score_outbox.quarantined_count,
+                "state_quarantined": max(
+                    0, state_outbox.quarantined_count
+                    - state_quarantine_before),
+            }
             with store.connection() as connection:
                 connection.execute("BEGIN")
                 schema_row = connection.execute(
@@ -1114,16 +1193,14 @@ def export_data(database: Path, output: Path,
         "recovery_files": len(recovery_evidence),
         "complete": payload["manifest"]["complete"],
         "recovered_imports": recovered_imports,
+        "repair_before_export": repair_before_export,
+        "repair_report": repair_report,
     }
 
 
 def _load_archive(path: Path) -> dict:
     try:
-        size = path.stat().st_size
-        if size > MAX_ARCHIVE_BYTES:
-            raise StoreError(
-                "archive_too_large", "archive exceeds the 128 MiB limit")
-        raw = path.read_bytes()
+        raw = _read_regular_nofollow(path, MAX_ARCHIVE_BYTES)
         archive = json.loads(
             raw.decode("utf-8"), parse_constant=_reject_json_constant)
         _validate_json_shape(archive)
@@ -1214,6 +1291,26 @@ def _load_archive(path: Path) -> dict:
         if not isinstance(archive.get(field), list):
             raise StoreError("invalid_archive", f"invalid {field}")
     return archive
+
+
+def inspect_archive(archive_path: Path) -> dict:
+    """Validate and summarize an archive without opening local game data."""
+    archive = _load_archive(archive_path.expanduser().resolve(strict=False))
+    return {
+        "ok": True,
+        "archive": str(archive_path),
+        "archive_version": archive["archive_version"],
+        "schema_version": archive.get("schema_version"),
+        "manifest_hash": archive.get("manifest_hash"),
+        "counts": {
+            table: len(archive["tables"].get(table, []))
+            for table in IMPORT_TABLES
+        },
+        "pending_scores": len(archive.get("pending_scores", [])),
+        "pending_state": len(archive.get("pending_state", [])),
+        "recovery_evidence": len(archive.get("recovery_evidence", [])),
+        "complete": archive.get("manifest", {}).get("complete"),
+    }
 
 
 def _valid_ruleset_catalog(value) -> bool:
@@ -1642,7 +1739,8 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
             target = _pending_paths(database)[0] / f"{envelope.request_id}.json"
             if target.is_file():
                 current_value = json.loads(
-                    target.read_text(encoding="utf-8"),
+                    _read_bounded_target(
+                        target, MAX_SPOOL_FILE_BYTES).decode("utf-8"),
                     parse_constant=_reject_json_constant)
                 current, _current_mutation = PendingSaveEnvelope.parse(
                     current_value)
@@ -1651,7 +1749,8 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
                         "request_id_conflict",
                         "target pending request ID has another payload")
         except (StoreError, TypeError, ValueError, MutationError):
-            errors.append(f"pending_scores[{index}] is invalid")
+            if not _is_historical_pending(value, state=False):
+                errors.append(f"pending_scores[{index}] is invalid")
     for index, value in enumerate(archive["pending_state"]):
         try:
             operation = PersistentStateOutbox._parse(
@@ -1666,7 +1765,8 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
                 PersistentStateOutbox.resolve_operations(existing, operation)
         except (StoreError, TypeError, ValueError, MutationError,
                 RecursionError, OSError, UnicodeError, json.JSONDecodeError):
-            errors.append(f"pending_state[{index}] is invalid")
+            if not _is_historical_pending(value, state=True):
+                errors.append(f"pending_state[{index}] is invalid")
     try:
         _validated_recovery_items(archive)
     except StoreError as exc:
@@ -1699,6 +1799,12 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
         "pending": {
             "scores": len(archive["pending_scores"]),
             "state": len(archive["pending_state"]),
+            "historical_evidence_only": {
+                "scores": sum(_is_historical_pending(value, state=False)
+                              for value in archive["pending_scores"]),
+                "state": sum(_is_historical_pending(value, state=True)
+                             for value in archive["pending_state"]),
+            },
             "state_resolution": pending_resolution,
         },
         "plan_fingerprint": plan_fingerprint,
@@ -1877,6 +1983,49 @@ def _read_bounded_target(path: Path, limit: int) -> bytes:
         ) from exc
 
 
+def _is_historical_pending(value, *, state: bool) -> bool:
+    """Identify pending data that cannot be active under the current catalog."""
+    if not isinstance(value, dict):
+        return False
+    if state:
+        method = value.get("method")
+        args = value.get("args")
+        if method not in {"set_progress", "merge_progress", "save_slot"}:
+            return False
+        if not isinstance(args, list) or len(args) < 5:
+            return False
+        game_id = args[1]
+        ruleset = value.get("ruleset_version") or args[4]
+    else:
+        payload = value.get("payload")
+        if not isinstance(payload, dict):
+            return False
+        game_id = payload.get("game_id")
+        ruleset = payload.get("ruleset_version")
+    if not isinstance(game_id, str) or not isinstance(ruleset, str):
+        return False
+    current = GAME_BY_ID.get(game_id)
+    return current is None or ruleset != current.ruleset_version
+
+
+def _historical_pending_operation(database: Path, archive: dict, value,
+                                  *, state: bool, index: int) -> FileOperation:
+    raw = canonical_json(value).encode("utf-8")
+    if len(raw) > MAX_RECOVERY_FILE_BYTES:
+        raise StoreError(
+            "historical_pending_too_large",
+            "historical pending evidence exceeds the recovery file limit")
+    archive_id = archive.get("manifest_hash") or hashlib.sha256(
+        canonical_json(archive).encode("utf-8")).hexdigest()
+    category = "state" if state else "scores"
+    digest = hashlib.sha256(raw).hexdigest()
+    target = (database.parent / "imported-recovery" / archive_id[:24]
+              / "historical-pending" / category
+              / f"{index:06d}-{digest[:24]}.json")
+    validate_file_operations(database, [FileOperation(target, b"")])
+    return FileOperation(target, raw)
+
+
 def _planned_file_operations(
         database: Path, archive: dict,
         state_resolution: dict[str, int] | None = None,
@@ -1884,8 +2033,17 @@ def _planned_file_operations(
     """Build final pending/evidence bytes without changing the target."""
     score_path, state_path = _pending_paths(database)
     score_values: dict[Path, PendingSaveEnvelope] = {}
-    for value in archive["pending_scores"]:
-        envelope, _mutation = PendingSaveEnvelope.parse(value)
+    historical_operations: list[FileOperation] = []
+    for index, value in enumerate(archive["pending_scores"]):
+        try:
+            envelope, _mutation = PendingSaveEnvelope.parse(value)
+        except (StoreError, TypeError, ValueError, MutationError,
+                RecursionError):
+            if not _is_historical_pending(value, state=False):
+                raise
+            historical_operations.append(_historical_pending_operation(
+                database, archive, value, state=False, index=index))
+            continue
         target = score_path / f"{envelope.request_id}.json"
         validate_file_operations(database, [FileOperation(target, b"")])
         current = score_values.get(target)
@@ -1908,9 +2066,17 @@ def _planned_file_operations(
         score_values[target] = envelope
 
     state_values: dict[Path, dict] = {}
-    for value in archive["pending_state"]:
-        operation = PersistentStateOutbox._parse(
-            canonical_json(value).encode("utf-8"))
+    for index, value in enumerate(archive["pending_state"]):
+        try:
+            operation = PersistentStateOutbox._parse(
+                canonical_json(value).encode("utf-8"))
+        except (StoreError, TypeError, ValueError, MutationError,
+                RecursionError):
+            if not _is_historical_pending(value, state=True):
+                raise
+            historical_operations.append(_historical_pending_operation(
+                database, archive, value, state=True, index=index))
+            continue
         LocalGameStore.validate_state_operation(operation)
         if operation["method"] == "save_slot":
             validate_save_slot_payload(
@@ -1943,6 +2109,7 @@ def _planned_file_operations(
         FileOperation(target, canonical_json(operation).encode("utf-8"))
         for target, operation in sorted(
             state_values.items(), key=lambda item: str(item[0])))
+    operations.extend(historical_operations)
 
     prepared = _validated_recovery_items(archive)
     if prepared:
@@ -2011,6 +2178,7 @@ def import_data(database: Path, archive_path: Path) -> dict:
     try:
         with (inactive_application_lock(database, timeout=2.0),
               maintenance_lock(database, exclusive=True, timeout=2.0)):
+            _require_import_space(database, archive_path, replacement=False)
             recovered = recover_import_transactions(database)
             # Initialization and migration belong inside the exclusive gate.
             store = LocalGameStore(database)
@@ -2053,11 +2221,23 @@ def import_data(database: Path, archive_path: Path) -> dict:
                     "import_rolled_back",
                     "import failed after preparation and was rolled back") from exc
             transaction.finish()
+            historical_scores = sum(
+                _is_historical_pending(value, state=False)
+                for value in archive["pending_scores"])
+            historical_state = sum(
+                _is_historical_pending(value, state=True)
+                for value in archive["pending_state"])
             pending = {
-                "scores": len(archive["pending_scores"]),
-                "state": len(archive["pending_state"]),
+                "scores": len(archive["pending_scores"]) - historical_scores,
+                "state": len(archive["pending_state"]) - historical_state,
             }
-            restored_evidence = len(_validated_recovery_items(archive))
+            if historical_scores or historical_state:
+                pending["historical_evidence_only"] = {
+                    "scores": historical_scores,
+                    "state": historical_state,
+                }
+            restored_evidence = (len(_validated_recovery_items(archive))
+                                 + historical_scores + historical_state)
             evidence_root = (
                 database.parent / "imported-recovery"
                 / str(archive.get("manifest_hash") or "")[:24])
@@ -2186,6 +2366,7 @@ def restore_replace_data(database: Path, archive_path: Path) -> dict:
     try:
         with (inactive_application_lock(database, timeout=2.0),
               maintenance_lock(database, exclusive=True, timeout=2.0)):
+            _require_import_space(database, archive_path, replacement=True)
             recovered = recover_import_transactions(database)
             preview, plan, file_operations, expected_schema = _replacement_plan(
                 database, archive)
@@ -2244,13 +2425,22 @@ def restore_replace_data(database: Path, archive_path: Path) -> dict:
     except MaintenanceBusyError as exc:
         raise StoreError(
             "maintenance_busy", str(exc), 409, retryable=True) from exc
+    historical_pending = preview["pending"].get(
+        "historical_evidence_only", {})
+    pending_restored = {
+        "scores": len(archive["pending_scores"]) - sum(
+            _is_historical_pending(value, state=False)
+            for value in archive["pending_scores"]),
+        "state": len(archive["pending_state"]) - sum(
+            _is_historical_pending(value, state=True)
+            for value in archive["pending_state"]),
+    }
+    if any(historical_pending.values()):
+        pending_restored["historical_evidence_only"] = historical_pending
     return {
         "ok": True, "mode": "replace", "backup": str(backup),
         "inserted": inserted, "preview": preview,
-        "pending_restored": {
-            "scores": len(archive["pending_scores"]),
-            "state": len(archive["pending_state"]),
-        },
+        "pending_restored": pending_restored,
         "recovered_imports": recovered,
     }
 
@@ -2299,6 +2489,9 @@ def _parser() -> argparse.ArgumentParser:
     export.add_argument(
         "--force", action="store_true",
         help="replace an existing ordinary archive file")
+    export.add_argument(
+        "--repair-before-export", action="store_true",
+        help="recover unfinished local journals before taking the snapshot")
     upgrade = commands.add_parser(
         "upgrade-archive",
         help="rewrite a verified v2 archive with the v3 reader contract")
@@ -2307,8 +2500,13 @@ def _parser() -> argparse.ArgumentParser:
     upgrade.add_argument(
         "--force", action="store_true",
         help="replace an existing ordinary upgraded archive")
+    inspect_archive_parser = commands.add_parser(
+        "inspect-archive",
+        help="validate an archive without opening or repairing local data")
+    inspect_archive_parser.add_argument("archive", type=Path)
     preview = commands.add_parser(
-        "preview-import", help="validate an archive without changing data")
+        "preview-import",
+        help="recover local import journals, then compare an archive")
     preview.add_argument("archive", type=Path)
     restore = commands.add_parser(
         "import", help="insert new archive rows after an explicit confirmation")
@@ -2351,7 +2549,10 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "export":
             result = export_data(
                 database, args.output, args.include_recovery,
-                force=args.force, allow_partial=args.allow_partial)
+                force=args.force, allow_partial=args.allow_partial,
+                repair_before_export=args.repair_before_export)
+        elif args.command == "inspect-archive":
+            result = inspect_archive(args.archive)
         elif args.command == "upgrade-archive":
             result = upgrade_archive(
                 database, args.source, args.output, force=args.force)
