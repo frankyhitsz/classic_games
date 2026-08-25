@@ -289,10 +289,15 @@ class Sokoban(BaseGame):
         self.level_scores: dict[int, int] = {}
         self.completed_levels: set[int] = set()
         self.practice_mode = False
+        self.practice_level_scores: dict[int, int] = {}
+        self.practice_completed_levels: set[int] = set()
+        self.practice_best_moves: dict[int, int] = {}
+        self.practice_best_pushes: dict[int, int] = {}
         self.unlocked_level = 1
         self.saved_completed_levels: set[int] = set()
-        self._progress_generation = 0
+        self._progress_generation = {"campaign": 0, "practice": 0}
         self._progress_future = None
+        self._practice_progress_future = None
         self._progress_write_future = None
         self._progress_status_key = "campaign"
         self.progress_save_message = ""
@@ -302,13 +307,19 @@ class Sokoban(BaseGame):
         super().__init__(max(500, w * CELL + 40), max(380, h * CELL + 132),
                          fps=60, backend=backend, player=player,
                          profile_id=profile_id)
-        self.load_level(0)
+        self._practice_select_target: Optional[int] = None
+        self._practice_select_deadline = 0
+        self.load_level(0, practice=False, new_campaign=True)
         load_progress = getattr(self.backend, "get_progress_async", None)
         if callable(load_progress):
             self._progress_future = (
                 load_progress(
                     self.profile_id, self.game_id, "campaign", {}),
-                self._progress_generation)
+                self._progress_generation["campaign"])
+            self._practice_progress_future = (
+                load_progress(
+                    self.profile_id, self.game_id, "practice", {}),
+                self._progress_generation["practice"])
 
     def _poll_progress(self) -> None:
         write = self._progress_write_future
@@ -324,7 +335,7 @@ class Sokoban(BaseGame):
                         "进度已进入待写入队列" if result.get("durable_pending")
                         else "进度暂时未保存")
                 elif isinstance(result, dict):
-                    self._apply_progress(result, write[1])
+                    self._apply_progress(result, write[1], write[2])
                     self.progress_save_message = ""
         if self.progress_save_message:
             getter = getattr(self.backend, "get_local_state_status", None)
@@ -335,25 +346,45 @@ class Sokoban(BaseGame):
                     f"{ruleset}:{self._progress_status_key}")
                 if getattr(event, "state", None) == SaveState.COMMITTED:
                     self.progress_save_message = ""
-        pending = self._progress_future
-        if pending is None or not pending[0].done():
-            return
-        self._progress_future = None
-        try:
-            value = pending[0].result()
-        except Exception:  # noqa: BLE001 - a new campaign remains playable
-            return
-        self._apply_progress(value, pending[1])
+        for attribute, progress_key in (
+                ("_progress_future", "campaign"),
+                ("_practice_progress_future", "practice")):
+            pending = getattr(self, attribute)
+            if pending is None or not pending[0].done():
+                continue
+            setattr(self, attribute, None)
+            try:
+                value = pending[0].result()
+            except Exception:  # noqa: BLE001 - play remains available
+                continue
+            self._apply_progress(value, pending[1], progress_key)
 
-    def _apply_progress(self, value, generation: int) -> None:
-        if generation != self._progress_generation:
+    def _apply_progress(self, value, generation: int,
+                        progress_key: str = "campaign") -> None:
+        if generation != self._progress_generation[progress_key]:
             return
         if not isinstance(value, dict):
             return
         if isinstance(value.get("value"), dict):
             value = value["value"]
-        unlocked = value.get("unlocked_level", 1)
         completed = value.get("completed_levels", [])
+        if progress_key == "practice":
+            if (isinstance(completed, list)
+                    and all(type(item) is int and 0 <= item < len(LEVELS)
+                            for item in completed)):
+                self.practice_completed_levels = set(completed)
+            for field, target in (
+                    ("level_scores", self.practice_level_scores),
+                    ("best_moves", self.practice_best_moves),
+                    ("best_pushes", self.practice_best_pushes)):
+                values = value.get(field, {})
+                if isinstance(values, dict):
+                    target.update({int(key): metric
+                                   for key, metric in values.items()
+                                   if isinstance(key, str) and key.isdigit()
+                                   and type(metric) is int})
+            return
+        unlocked = value.get("unlocked_level", 1)
         if type(unlocked) is int:
             self.unlocked_level = min(len(LEVELS), max(1, unlocked))
         if (isinstance(completed, list)
@@ -361,7 +392,13 @@ class Sokoban(BaseGame):
                         for item in completed)):
             self.saved_completed_levels = set(completed)
 
-    def load_level(self, idx: int):
+    def load_level(self, idx: int, *, practice: Optional[bool] = None,
+                   new_campaign: Optional[bool] = None):
+        selected_practice = (
+            self.practice_mode if practice is None else practice)
+        if new_campaign is None:
+            new_campaign = idx == 0 and not selected_practice
+        self.practice_mode = selected_practice
         self.level_idx = idx
         level = LEVELS[idx]
         # NOTE: parse_level returns the player POSITION as a tuple. We
@@ -379,7 +416,7 @@ class Sokoban(BaseGame):
         # Loading level 0 starts a new run. Other reloads preserve the run's
         # per-level ledger so replaying a level can improve its score without
         # adding the same level twice.
-        if idx == 0:
+        if new_campaign:
             self.begin_score_session()
             self.total_score = 0
             self.level_scores = {}
@@ -402,10 +439,21 @@ class Sokoban(BaseGame):
 
     def _select_practice_level(self, index: int) -> bool:
         """Open an unlocked level without changing the ranked campaign run."""
-        if not 0 <= index < min(self.unlocked_level, len(LEVELS)):
+        if (self.state != "playing"
+                or not 0 <= index < min(self.unlocked_level, len(LEVELS))):
             return False
-        self.load_level(index)
-        self.practice_mode = True
+        now = pygame.time.get_ticks()
+        if (not self.practice_mode and self.moves > 0
+                and not (self._practice_select_target == index
+                         and now <= self._practice_select_deadline)):
+            self._practice_select_target = index
+            self._practice_select_deadline = now + 3000
+            self.progress_save_message = (
+                f"再按一次确认进入第 {index + 1} 关练习")
+            return False
+        self._practice_select_target = None
+        self._practice_select_deadline = 0
+        self.load_level(index, practice=True, new_campaign=False)
         return True
 
     def handle_event(self, event):
@@ -423,15 +471,17 @@ class Sokoban(BaseGame):
         # N advances normally from a win overlay. During active play it is an
         # explicit practice/skip action and cannot create a ranked clear.
         if event.key == pygame.K_n:
-            if (self.state == "won"
-                    and self.level_idx in self.completed_levels):
+            if self.state == "won" and (
+                    self.practice_mode
+                    or self.level_idx in self.completed_levels):
                 self.request_destructive_action(
                     "advance", self._advance_after_win)
                 return
-            next_idx = (self.level_idx + 1) % len(LEVELS)
-            self.load_level(next_idx)
-            if next_idx != 0:
-                self.practice_mode = True
+            if self.state != "playing":
+                return
+            count = min(self.unlocked_level, len(LEVELS))
+            next_idx = (self.level_idx + 1) % count
+            self._select_practice_level(next_idx)
             return
         if event.key == pygame.K_k and self.unlocked_level > 1:
             self._select_practice_level(self.unlocked_level - 1)
@@ -496,45 +546,73 @@ class Sokoban(BaseGame):
     def _check_win(self):
         if self.boxes == self.targets:
             level_score = max(0, 1000 - self.moves)
-            # Keep only this run's best score for each level. Replaying a
-            # solved level can improve the total, never duplicate it.
-            previous = self.level_scores.get(self.level_idx, 0)
-            self.level_scores[self.level_idx] = max(previous, level_score)
-            self.completed_levels.add(self.level_idx)
-            self.total_score = sum(self.level_scores.values())
+            if self.practice_mode:
+                previous = self.practice_level_scores.get(self.level_idx, 0)
+                self.practice_level_scores[self.level_idx] = max(
+                    previous, level_score)
+                self.practice_completed_levels.add(self.level_idx)
+                self.practice_best_moves[self.level_idx] = min(
+                    self.practice_best_moves.get(self.level_idx, self.moves),
+                    self.moves)
+                self.practice_best_pushes[self.level_idx] = min(
+                    self.practice_best_pushes.get(self.level_idx, self.pushes),
+                    self.pushes)
+                counted_score = self.practice_level_scores[self.level_idx]
+                completed_count = len(self.practice_completed_levels)
+                completed_all = False
+                progress_key = "practice"
+                progress_value = {
+                    "completed_levels": sorted(
+                        self.practice_completed_levels),
+                    "level_scores": {
+                        str(key): value for key, value
+                        in self.practice_level_scores.items()},
+                    "best_moves": {
+                        str(key): value for key, value
+                        in self.practice_best_moves.items()},
+                    "best_pushes": {
+                        str(key): value for key, value
+                        in self.practice_best_pushes.items()},
+                }
+            else:
+                # A ranked run keeps one best score per completed level.
+                previous = self.level_scores.get(self.level_idx, 0)
+                self.level_scores[self.level_idx] = max(previous, level_score)
+                self.completed_levels.add(self.level_idx)
+                self.total_score = sum(self.level_scores.values())
+                counted_score = self.level_scores[self.level_idx]
+                completed_count = len(self.completed_levels)
+                completed_all = len(self.completed_levels) == len(LEVELS)
+                progress_key = "campaign"
+                progress_value = {
+                    "unlocked_level": min(
+                        len(LEVELS), max(self.completed_levels) + 2),
+                    "completed_levels": sorted(self.completed_levels),
+                    "level_scores": {
+                        str(key): value
+                        for key, value in self.level_scores.items()},
+                }
+                self.unlocked_level = max(
+                    self.unlocked_level, progress_value["unlocked_level"])
+                self.saved_completed_levels.update(
+                    progress_value["completed_levels"])
             self.score = self.total_score  # display the running total
-            completed_all = (len(self.completed_levels) == len(LEVELS)
-                             and not self.practice_mode)
             result = {"level": self.level_idx + 1,
                       "level_index": self.level_idx,
                       "level_score": level_score,
-                      "counted_level_score": self.level_scores[self.level_idx],
+                      "counted_level_score": counted_score,
                       "total_score": self.total_score,
                       "moves": self.moves,
                       "pushes": self.pushes,
                       "won": True,
-                      "completed_levels": len(self.completed_levels),
+                      "completed_levels": completed_count,
                       "practice": self.practice_mode,
                       "completed_all": completed_all}
             save_progress = getattr(self.backend, "merge_progress_async", None)
             if callable(save_progress):
                 try:
-                    self._progress_generation += 1
-                    generation = self._progress_generation
-                    progress_value = {
-                        "unlocked_level": min(
-                            len(LEVELS), max(self.completed_levels) + 2),
-                        "completed_levels": sorted(self.completed_levels),
-                        "level_scores": {
-                            str(key): value
-                            for key, value in self.level_scores.items()}}
-                    self.unlocked_level = max(
-                        self.unlocked_level,
-                        progress_value["unlocked_level"])
-                    self.saved_completed_levels.update(
-                        progress_value["completed_levels"])
-                    progress_key = (
-                        "practice" if self.practice_mode else "campaign")
+                    self._progress_generation[progress_key] += 1
+                    generation = self._progress_generation[progress_key]
                     self._progress_status_key = progress_key
                     self._progress_write_future = (save_progress(
                         self.profile_id, self.game_id,
@@ -565,8 +643,14 @@ class Sokoban(BaseGame):
         self._pending_total = payload["score"]
 
     def _advance_after_win(self) -> None:
+        if self.practice_mode:
+            count = min(self.unlocked_level, len(LEVELS))
+            next_idx = (self.level_idx + 1) % count
+            self.load_level(next_idx, practice=True, new_campaign=False)
+            return
         next_idx = (self.level_idx + 1) % len(LEVELS)
-        self.load_level(next_idx)
+        self.load_level(
+            next_idx, practice=False, new_campaign=next_idx == 0)
 
     def draw(self):
         self._poll_progress()

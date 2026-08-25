@@ -21,8 +21,18 @@ SUPPORTED_GAMES = public_games()
 
 
 def init_db(db_path: Path | str | None = None) -> LocalGameStore:
-    """Explicit initialization helper for scripts and migrations."""
-    return LocalGameStore(db_path or DB_PATH)
+    """Initialize a store while retaining its application lifetime lease."""
+    selected = db_path or DB_PATH
+    session = recovered_application_session(selected, timeout=2.0)
+    try:
+        store = LocalGameStore(selected)
+    except Exception:
+        session.close()
+        raise
+    store._application_session = session
+    store._application_session_finalizer = weakref.finalize(
+        store, session.close)
+    return store
 
 
 def create_app(config: dict | None = None) -> Flask:

@@ -442,7 +442,8 @@ class IdentityAndProfileTimeTests(unittest.TestCase):
 
     def test_progress_write_results_are_unwrapped_for_game_hud(self):
         sokoban = SimpleNamespace(
-            _progress_generation=2, unlocked_level=1,
+            _progress_generation={"campaign": 2, "practice": 0},
+            unlocked_level=1,
             saved_completed_levels=set())
         Sokoban._apply_progress(
             sokoban, {"ok": True, "value": {

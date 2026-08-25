@@ -1,11 +1,24 @@
 # 更新记录
 
-## 未发布
+## 0.7.0
+
+- 启动恢复将 exclusive application lease 原子交接为 shared session，不再在 import recovery 与数据库
+  打开之间释放 application gate；Windows control file 使用 reparse-point-aware open。
+- state reject transaction 升级为 prepare-before-replace v3；完整临时 marker 可继续恢复，SQLite 永久
+  拒绝后始终能找回上一条 pending。
+- 2048 owner claim 必须由权威 token/epoch 回执确认；superseded 或 recovery-required 不开放输入，退出
+  中的 claim 由更高 revision 的 released intent 取消。
+- archive 升级到 v3，记录包版本与 reader contract，允许历史 ruleset；增加安全 v2 upgrader，replace
+  会重建并核对 table/index/trigger/view schema fingerprint。
+- ImportTransaction 直接使用校验返回的 bytes；未认证 v1 默认人工处理，多份未完成 transaction 不再
+  按目录名猜测 rollback 顺序。
+- 推箱子练习与 ranked campaign ledger 分离，练习不再解锁后续关卡；N 和选关快捷键统一遵守已解锁范围。
+- 包版本升为 0.7.0；单游戏入口复用 launcher 的恢复页，`server.init_db()` 纳入 application lease。
 
 - 普通客户端与 Flask 在打开数据库前恢复中断导入；import transaction v2 为 rollback image、
   staged 和 before 内容加 hash，并限制目标 namespace、符号链接和发布竞态。
-- archive manifest format 2 校验应用、规则、计数和 completeness；recovery 扫描 no-follow，
-  replace restore 清理未知表和完整 active journal namespace。
+- v2 compatibility reader 校验应用、规则、计数和 completeness；recovery 扫描 no-follow，
+  replace restore 清理完整 active journal namespace。
 - 2048 在 owner claim ACK 前保持输入门禁，关闭时同步发布 durable release intent；旧的 in-flight
   保存不能再覆盖较新的退出状态。
 - 俄罗斯方块采用 7-bag，并增加落点影子和每块一次的保留交换；规则版本升为

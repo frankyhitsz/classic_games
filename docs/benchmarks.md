@@ -5,6 +5,9 @@
 
 ## Archive v2 内存
 
+该数据用于旧 v2 与 v3 的 bounded canonical-JSON 路径；v3 只增加小型 compatibility metadata，表和
+evidence 编码方式未改变。
+
 2026-08-25 在 macOS 13.7.8 arm64、Python 3.11.15 上，以一个档案写入 5,000 条合法 Snake
 attempt，然后在 `tracemalloc` 下执行完整导出：
 

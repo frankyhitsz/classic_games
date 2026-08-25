@@ -18,15 +18,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from client.common.ui import (  # noqa: E402
-                              COLORS, draw_card, draw_playroom_backdrop,
+                              COLORS, create_local_backend_with_recovery_ui,
+                              draw_card, draw_playroom_backdrop,
                               draw_leaderboard, draw_text, font)
 from client.profile_controller import ProfileController  # noqa: E402
 from game_service.catalog import GAME_BY_ID, GAMES  # noqa: E402
-from game_service.local_backend import LocalBackendClient  # noqa: E402
-from game_service.maintenance import MaintenanceBusyError  # noqa: E402
 from game_service.profile import ProfileIdentity  # noqa: E402
 from game_service.service import SaveState  # noqa: E402
-from game_service.store import StoreError  # noqa: E402
 
 WIDTH, HEIGHT = 980, 680
 LEADERBOARD_REFRESH_SECS = 4.0
@@ -180,41 +178,6 @@ def draw_game_icon(surf, gid: str, cx: int, cy: int, size: int = 56) -> None:
         pygame.draw.circle(surf, COLORS["accent"], (cx, cy), s // 2)
 
 
-def _create_local_backend(screen, clock):
-    """Offer retry/exit when maintenance or recovery blocks safe startup."""
-    error = None
-    while True:
-        if error is None:
-            try:
-                return LocalBackendClient(defer_initialization=True)
-            except (MaintenanceBusyError, StoreError, OSError) as exc:
-                error = exc
-        screen.fill((239, 247, 255))
-        draw_text(screen, "本机数据暂时无法安全打开",
-                  (WIDTH // 2, HEIGHT // 2 - 48), size=24,
-                  color=COLORS["danger"], bold=True, center=True)
-        message = ("另一个维护操作仍在进行，请稍后重试"
-                   if isinstance(error, MaintenanceBusyError)
-                   else "检测到未完成或损坏的恢复事务，未改动成绩库")
-        draw_text(screen, message, (WIDTH // 2, HEIGHT // 2), size=15,
-                  color=COLORS["text"], center=True)
-        draw_text(screen, "R 重试 · Esc 退出",
-                  (WIDTH // 2, HEIGHT // 2 + 42), size=14,
-                  color=COLORS["text_dim"], center=True)
-        pygame.display.flip()
-        retry = False
-        for event in pygame.event.get():
-            if (event.type == pygame.QUIT
-                    or event.type == pygame.KEYDOWN
-                    and event.key == pygame.K_ESCAPE):
-                return None
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                retry = True
-        if retry:
-            error = None
-        clock.tick(30)
-
-
 def main():
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -230,7 +193,7 @@ def main():
                 "HTTP 调试模式需要安装可选依赖：pip install '.[api]'") from exc
         backend = BackendClient()
     else:
-        backend = _create_local_backend(screen, clock)
+        backend = create_local_backend_with_recovery_ui(screen, clock)
         if backend is None:
             pygame.display.quit()
             return

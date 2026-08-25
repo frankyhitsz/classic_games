@@ -164,7 +164,8 @@ classic_games/
 │   ├── test_storage_v8.py
 │   ├── test_storage_v9.py
 │   ├── test_storage_v10.py
-│   └── test_storage_v11.py
+│   ├── test_storage_v11.py
+│   └── test_storage_v12.py
 ├── docs/               # 审查记录、设计决策和维护文档
 ├── pyproject.toml
 ├── environment.yml
@@ -191,17 +192,27 @@ classic_games/
 数据库 schema v7 在同一事务保存状态值、业务值 hash 和胜出回执；旧库升级先为既有状态建立
 基线，因此 journal 已删除、业务行隔离或时钟损坏后仍能按权威值恢复。数据库解除锁定后会自动
 补写，成功后仅在 hash 仍匹配时删除对应日志。损坏的状态文件移入
-`pending-state-quarantine/`；v1 升级原件保存在 `pending-state-migration-backup/`。
+`pending-state-quarantine/`；v1 升级原件保存在 `pending-state-migration-backup/`。替换同一状态键前会先
+持久化 reject v3 prepared marker；数据库永久拒绝新值时，即使中途退出也能恢复上一条 pending。
+`pending/`、`pending-state/` 及其 quarantine/migration 目录不能是符号链接或 Windows reparse point。
 
 查看和迁移本机数据时，可以先使用下列命令。数据维护要求先关闭启动器和游戏；后端的进程级
-lease 会阻止导出遗漏尚在 worker 队列中的动作。archive v2 同时包含已提交表和 active
-score/state pending，并用 manifest hash 检测损坏：
+lease 会阻止导出遗漏尚在 worker 队列中的动作。archive v3 同时包含已提交表和 active
+score/state pending，记录包版本、导出时规则目录和 reader capability，并用 manifest hash 检测损坏：
 
 ```bash
 python -m game_service.data_cli status
 python -m game_service.data_cli export classic-games-backup.json --include-recovery
 python -m game_service.data_cli preview-import classic-games-backup.json
 python -m game_service.data_cli transactions
+```
+
+0.6.0 生成的 manifest format 2 archive 可先升级，再用于精确替换。更早的 format-less v2 没有
+active reject/restore inventory，升级命令会保留为 merge-only 并列出无法证明的部分，不会擅自授予
+replace 权限：
+
+```bash
+python -m game_service.data_cli upgrade-archive old-v2.json upgraded-v3.json
 ```
 
 导出默认不覆盖任何现有文件，也不能写到数据库、SQLite sidecar、pending 或 recovery 路径。确认
@@ -237,8 +248,13 @@ python -m game_service.data_cli export-transaction .games.db.import-... import-t
 python -m game_service.data_cli recover-transactions --apply
 ```
 
-事务 v2 对 SQLite rollback image、staged 和 before 文件校验 size/sha256；发布时还会确认目标自
-prepare 后未变化。同一目标的相同内容会去重，不同内容会拒绝整次计划。完整协议说明见
+transaction v1 没有 staged/before/rollback hash，普通启动不会自动使用这些字节。保存
+`export-transaction` 证据并人工核对后，才可显式运行
+`recover-transactions --apply --allow-legacy-v1`。同时出现多份未完成事务时工具不会猜测 rollback 顺序。
+
+事务 v2 对 SQLite rollback image、staged 和 before 文件校验 size/sha256，并直接使用同一次验证返回
+的 bytes；发布时还会确认目标自 prepare 后未变化。同一目标的相同内容会去重，不同内容会拒绝整次
+计划。完整协议说明见
 [`docs/storage-protocol.md`](docs/storage-protocol.md)。
 
 `--include-recovery` 中的 quarantine/backup 是证据，不是 active journal。导入时只恢复到

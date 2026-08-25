@@ -632,7 +632,7 @@ run("2048-score-once", """
 """)
 
 # ===========================================================================
-print("\n=== 22. Sokoban R/N keys work during playing ===")
+print("\n=== 22. Sokoban R/N respect the unlocked practice boundary ===")
 run("sokoban-rn-keys", """
     import os; os.environ['SDL_VIDEODRIVER']='dummy'
     import pygame; pygame.init()
@@ -643,8 +643,9 @@ run("sokoban-rn-keys", """
     assert g.moves >= 1
     g.handle_event(pygame.event.Event(pygame.KEYDOWN, {'key':pygame.K_r,'unicode':''}))
     assert g.moves == 0 and g.level_idx == 0
+    g.unlocked_level = 2
     g.handle_event(pygame.event.Event(pygame.KEYDOWN, {'key':pygame.K_n,'unicode':''}))
-    assert g.level_idx == 1
+    assert g.level_idx == 1 and g.practice_mode
     pygame.quit()
 """)
 

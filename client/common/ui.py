@@ -15,8 +15,10 @@ from typing import Callable, List, Optional
 import pygame
 
 from game_service.local_backend import LocalBackendClient
+from game_service.maintenance import MaintenanceBusyError
 from game_service.service import (AttemptContext, GameDataService, SaveState,
                                   parse_score_response)
+from game_service.store import StoreError
 
 OVERLAY_INPUT_GUARD_MS = 180
 DESTRUCTIVE_CONFIRM_MS = 3000
@@ -366,6 +368,43 @@ def draw_leaderboard(surf, rect: pygame.Rect, entries: List[dict],
     surf.set_clip(clip)
 
 
+def create_local_backend_with_recovery_ui(screen: pygame.Surface,
+                                          clock: pygame.time.Clock):
+    """Open local data or show the same safe retry page in every entrypoint."""
+    error = None
+    center = screen.get_rect().center
+    while True:
+        if error is None:
+            try:
+                return LocalBackendClient(defer_initialization=True)
+            except (MaintenanceBusyError, StoreError, OSError) as exc:
+                error = exc
+        screen.fill((239, 247, 255))
+        draw_text(screen, "本机数据暂时无法安全打开",
+                  (center[0], center[1] - 48), size=24,
+                  color=COLORS["danger"], bold=True, center=True)
+        message = ("另一个维护操作仍在进行，请稍后重试"
+                   if isinstance(error, MaintenanceBusyError)
+                   else "检测到未完成或损坏的恢复事务，未改动成绩库")
+        draw_text(screen, message, center, size=15,
+                  color=COLORS["text"], center=True)
+        draw_text(screen, "R 重试 · Esc 退出",
+                  (center[0], center[1] + 42), size=14,
+                  color=COLORS["text_dim"], center=True)
+        pygame.display.flip()
+        retry = False
+        for event in pygame.event.get():
+            if (event.type == pygame.QUIT
+                    or event.type == pygame.KEYDOWN
+                    and event.key == pygame.K_ESCAPE):
+                return None
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                retry = True
+        if retry:
+            error = None
+        clock.tick(30)
+
+
 # ----------------------------------------------------------------------------
 # BaseGame skeleton
 # ----------------------------------------------------------------------------
@@ -395,7 +434,12 @@ class BaseGame(abc.ABC):
         self.clock = pygame.time.Clock()
         self.fps = fps
         self._owns_backend = backend is None
-        self.backend = backend if backend is not None else LocalBackendClient()
+        self.backend = (backend if backend is not None
+                        else create_local_backend_with_recovery_ui(
+                            self.screen, self.clock))
+        if self.backend is None:
+            pygame.display.quit()
+            raise SystemExit(0)
         self.player = player
         self.attempt_context = AttemptContext.for_game(
             self.game_id, player, profile_id=profile_id)

@@ -474,6 +474,7 @@ class StateAndGameTests(unittest.TestCase):
         class Backend:
             def __init__(self):
                 self.claim = Future()
+                self.claim_state = None
                 self.saved = {
                     "state": {
                         "version": 5, "game_state": "playing", "score": 0,
@@ -501,6 +502,7 @@ class StateAndGameTests(unittest.TestCase):
                 return future
 
             def save_slot_async(self, *_args):
+                self.claim_state = _args[3]
                 return self.claim
 
             def failed_save_count(self):
@@ -517,7 +519,9 @@ class StateAndGameTests(unittest.TestCase):
         after = [[game.grid[row][col].value if game.grid[row][col] else 0
                   for col in range(4)] for row in range(4)]
         self.assertEqual(after, before)
-        backend.claim.set_result({"ok": True})
+        backend.claim.set_result({
+            "ok": True, "state_apply": "committed",
+            "value": backend.claim_state})
         game._poll_slot_save()
         self.assertEqual(game.slot_load_state, "ready")
         pygame.display.quit()

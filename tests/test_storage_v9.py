@@ -48,7 +48,7 @@ class ArchiveSafetyTests(unittest.TestCase):
                 export_data(database, archive)
             self.assertEqual(raised.exception.code, "export_target_exists")
             export_data(database, archive, force=True)
-            self.assertEqual(json.loads(archive.read_text())["archive_version"], 2)
+            self.assertEqual(json.loads(archive.read_text())["archive_version"], 3)
 
     def test_active_pending_round_trip_preserves_envelopes_and_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -294,7 +294,9 @@ class GameAndReleaseTests(unittest.TestCase):
 
         def save_slot_async(self, *args):
             self.saves.append(args)
-            return completed({"ok": True})
+            return completed({
+                "ok": True, "state_apply": "committed",
+                "value": args[3]})
 
         def submit_score_reliable_async(self, *args, **kwargs):
             self.submissions.append((args, kwargs))

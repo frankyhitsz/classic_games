@@ -521,16 +521,45 @@ class Game2048(BaseGame):
                          >= AUTOSAVE_MAX_DIRTY_MS))):
             self._save_autosave_slot()
 
+    def _clear_slot_claim_expectations(self) -> None:
+        self._slot_expected_owner_token = None
+        self._slot_expected_owner_epoch = None
+        self._slot_expected_revision = None
+        self._slot_expected_value_hash = None
+
+    def _claim_result_is_authoritative(self, result) -> bool:
+        if (not isinstance(result, dict)
+                or result.get("ok") is not True
+                or result.get("superseded") is True
+                or result.get("state_apply") == "superseded"):
+            return False
+        value = result.get("value")
+        return (isinstance(value, dict)
+                and value.get("owner_status") == "active"
+                and value.get("owner_token") == self._slot_owner_token
+                and value.get("owner_epoch") == self._slot_owner_epoch)
+
+    def _reload_after_unproven_claim(self, message: str) -> None:
+        self._slot_save_pending = False
+        self._allow_slot_takeover = False
+        self._clear_slot_claim_expectations()
+        self._begin_slot_load()
+        self.slot_save_error = message
+
     def _poll_slot_save(self) -> None:
         self._poll_slot_save_status()
         future = self._slot_save_future
         if future is None or not future.done():
             return
+        was_claiming = self.slot_load_state == "claiming"
         self._slot_save_future = None
         try:
             result = future.result()
         except Exception:  # noqa: BLE001 - keep the board playable
             self.slot_save_error = "自动存档暂时未保存"
+            if was_claiming:
+                self.slot_load_state = "failed"
+                self.slot_load_error = "自动存档占用权确认失败，请重试"
         else:
             if isinstance(result, dict) and result.get("ok") is False:
                 if result.get("durable_pending"):
@@ -540,14 +569,8 @@ class Game2048(BaseGame):
                     # The slot changed between the fresh load and CAS write.
                     # Stop accepting moves and reload the current owner/value
                     # before offering takeover again.
-                    self._slot_save_pending = False
-                    self._allow_slot_takeover = False
-                    self._slot_expected_owner_token = None
-                    self._slot_expected_owner_epoch = None
-                    self._slot_expected_revision = None
-                    self._slot_expected_value_hash = None
-                    self._begin_slot_load()
-                    self.slot_save_error = "自动存档已变化，正在重新读取"
+                    self._reload_after_unproven_claim(
+                        "自动存档已变化，正在重新读取")
                 else:
                     self._slot_save_pending = False
                     self.slot_save_error = str(
@@ -555,14 +578,14 @@ class Game2048(BaseGame):
                     if self.slot_load_state == "claiming":
                         self.slot_load_state = "failed"
                         self.slot_load_error = "自动存档占用权确认失败，请重试"
+            elif was_claiming and not self._claim_result_is_authoritative(result):
+                self._reload_after_unproven_claim(
+                    "自动存档占用权未确认，正在读取当前存档")
             else:
                 self._slot_save_pending = False
                 self.slot_save_error = None
-                self._slot_expected_owner_token = None
-                self._slot_expected_owner_epoch = None
-                self._slot_expected_revision = None
-                self._slot_expected_value_hash = None
-                if self.slot_load_state == "claiming":
+                self._clear_slot_claim_expectations()
+                if was_claiming:
                     self.slot_load_state = "ready"
         self._poll_slot_save_status()
         if self._autosave_queued and self.slot_load_state == "ready":
@@ -580,10 +603,35 @@ class Game2048(BaseGame):
         event = getter(key)
         state = getattr(event, "state", None)
         if state == SaveState.COMMITTED:
-            self._slot_save_pending = False
-            self.slot_save_error = None
             if self.slot_load_state == "claiming":
-                self.slot_load_state = "ready"
+                result = getattr(event, "result", {})
+                if self._claim_result_is_authoritative(result):
+                    self._slot_save_pending = False
+                    self.slot_save_error = None
+                    self._clear_slot_claim_expectations()
+                    self.slot_load_state = "ready"
+                else:
+                    self._reload_after_unproven_claim(
+                        "自动存档占用权未确认，正在读取当前存档")
+            else:
+                self._slot_save_pending = False
+                self.slot_save_error = None
+        elif state == SaveState.SUPERSEDED:
+            if self.slot_load_state == "claiming":
+                self._reload_after_unproven_claim(
+                    "另一个窗口先取得了自动存档，正在重新读取")
+            else:
+                self._slot_save_pending = False
+                self.slot_save_error = "自动存档已由较新的状态替代"
+        elif state == SaveState.DURABLE_PENDING:
+            self.slot_save_error = "自动存档已进入待写入队列"
+        elif state in (SaveState.NON_DURABLE_PENDING,
+                       SaveState.RECOVERY_REQUIRED):
+            self._slot_save_pending = False
+            self.slot_save_error = "自动存档需要恢复后才能继续"
+            if self.slot_load_state == "claiming":
+                self.slot_load_state = "failed"
+                self.slot_load_error = "占用权尚未安全保存，请重试或返回"
         elif state in (SaveState.PERMANENT_FAILURE, SaveState.QUARANTINED):
             self._slot_save_pending = False
             result = getattr(event, "result", {})
@@ -802,6 +850,8 @@ class Game2048(BaseGame):
             self._slot_expected_revision = slot_revision
             self._slot_expected_value_hash = saved.get("value_hash")
             self._slot_owner_epoch = current_epoch + 1
+        else:
+            self._clear_slot_claim_expectations()
         self._allow_slot_takeover = False
         self._takeover_reload_expected = None
         self._slot_conflict_saved = None
@@ -1137,15 +1187,11 @@ class Game2048(BaseGame):
             self.draw_gameover_overlay("游戏结束", buttons=btns)
 
     def before_close(self) -> None:
-        if self.slot_load_state == "claiming":
-            future = self._slot_save_future
-            if future is not None:
-                try:
-                    future.result(timeout=1.0)
-                except Exception:  # noqa: BLE001
-                    pass
-                self._poll_slot_save()
-        if self.slot_load_state != "ready":
+        # A release with a newer state-journal revision cancels an unfinished
+        # claim as well as releasing an acknowledged owner. Waiting for the
+        # claim first can leave a stale active owner if the window exits while
+        # SQLite is slow and the durable claim replays later.
+        if self.slot_load_state not in {"ready", "claiming"}:
             return
         publish_intent = getattr(self.backend, "publish_slot_intent", None)
         if callable(publish_intent):
@@ -1158,6 +1204,16 @@ class Game2048(BaseGame):
                 return
             except Exception:  # noqa: BLE001 - fall back to async pipeline
                 self.slot_save_error = "退出状态正在等待后台保存"
+        if self.slot_load_state == "claiming":
+            future = self._slot_save_future
+            if future is not None:
+                try:
+                    future.result(timeout=0.5)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._poll_slot_save()
+            if self.slot_load_state != "ready":
+                return
         self._save_autosave_slot(owner_status="released")
         future = self._slot_save_future
         if future is not None:

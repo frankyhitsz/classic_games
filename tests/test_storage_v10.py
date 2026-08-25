@@ -389,7 +389,9 @@ class BackendAndGameTests(unittest.TestCase):
             self.saves.append(args)
             if self.block:
                 return Future()
-            return completed({"ok": True})
+            return completed({
+                "ok": True, "state_apply": "committed",
+                "value": args[3]})
 
         def leaderboard(self, *_args, **_kwargs):
             return []

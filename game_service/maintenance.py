@@ -13,17 +13,75 @@ class MaintenanceBusyError(OSError):
     """Raised when an application/maintenance lock cannot be acquired."""
 
 
+def _open_windows_control_file(path: Path) -> int:
+    """Open the reparse point itself so it cannot masquerade as a lock."""
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create_file.restype = wintypes.HANDLE
+    close_handle = ctypes.windll.kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+    get_attributes = ctypes.windll.kernel32.GetFileInformationByHandleEx
+    get_attributes.argtypes = (
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    get_attributes.restype = wintypes.BOOL
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = [("file_attributes", wintypes.DWORD),
+                    ("reparse_tag", wintypes.DWORD)]
+
+    generic_read = 0x80000000
+    generic_write = 0x40000000
+    share_all = 0x00000001 | 0x00000002 | 0x00000004
+    open_always = 4
+    file_attribute_normal = 0x00000080
+    file_flag_open_reparse_point = 0x00200000
+    file_attribute_reparse_point = 0x00000400
+    file_attribute_tag_info = 9
+    invalid_handle = ctypes.c_void_p(-1).value
+    handle = create_file(
+        str(path), generic_read | generic_write, share_all, None, open_always,
+        file_attribute_normal | file_flag_open_reparse_point, None)
+    if handle == invalid_handle:
+        raise MaintenanceBusyError(
+            f"unsafe or unavailable data lock: {path.name}")
+    try:
+        attributes = FileAttributeTagInfo()
+        if not get_attributes(
+                handle, file_attribute_tag_info, ctypes.byref(attributes),
+                ctypes.sizeof(attributes)):
+            raise MaintenanceBusyError(
+                f"cannot inspect data lock: {path.name}")
+        if attributes.file_attributes & file_attribute_reparse_point:
+            raise MaintenanceBusyError(
+                f"data lock is a Windows reparse point: {path.name}")
+        descriptor = msvcrt.open_osfhandle(int(handle), os.O_RDWR)
+    except Exception:
+        close_handle(handle)
+        raise
+    return descriptor
+
+
 def _open_control_file(path: Path) -> int:
     """Open a lock without following a user-controlled final symlink."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_RDWR | os.O_CREAT
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        descriptor = os.open(path, flags, 0o600)
-    except OSError as exc:
-        raise MaintenanceBusyError(
-            f"unsafe or unavailable data lock: {path.name}") from exc
+    if os.name == "nt":
+        descriptor = _open_windows_control_file(path)
+    else:
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(path, flags, 0o600)
+        except OSError as exc:
+            raise MaintenanceBusyError(
+                f"unsafe or unavailable data lock: {path.name}") from exc
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
@@ -84,6 +142,24 @@ def _unlock(descriptor: int) -> None:
     import fcntl
 
     fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+def _try_windows_range_lock(descriptor: int, offset: int, length: int) -> bool:
+    import msvcrt
+
+    try:
+        os.lseek(descriptor, offset, os.SEEK_SET)
+        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, length)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock_windows_range(descriptor: int, offset: int, length: int) -> None:
+    import msvcrt
+
+    os.lseek(descriptor, offset, os.SEEK_SET)
+    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, length)
 
 
 class ApplicationSession:
@@ -150,47 +226,91 @@ class ApplicationSession:
             pass
 
 
+class InactiveApplicationLease:
+    """Exclusive application lease that can atomically become a session."""
+
+    def __init__(self, descriptor: int):
+        self._descriptor = descriptor
+
+    @classmethod
+    def acquire(cls, database: Path | str, timeout: float = 2.0):
+        descriptor = _open_control_file(application_lock_path(database))
+        deadline = time.monotonic() + max(0.0, timeout)
+        try:
+            if os.fstat(descriptor).st_size < 256:
+                os.ftruncate(descriptor, 256)
+                os.fsync(descriptor)
+            while True:
+                if os.name == "nt":
+                    acquired = _try_windows_range_lock(descriptor, 0, 1)
+                    if acquired:
+                        acquired = _try_windows_range_lock(descriptor, 1, 255)
+                        if not acquired:
+                            _unlock_windows_range(descriptor, 0, 1)
+                else:
+                    acquired = _try_lock(descriptor, exclusive=True)
+                if acquired:
+                    return cls(descriptor)
+                if time.monotonic() >= deadline:
+                    raise MaintenanceBusyError(
+                        "Classic Games is active; close it before data maintenance")
+                time.sleep(0.02)
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def handoff(self) -> ApplicationSession:
+        """Downgrade without exposing an interval to another maintainer."""
+        descriptor = self._descriptor
+        if descriptor < 0:
+            raise RuntimeError("inactive application lease is already closed")
+        if os.name == "nt":
+            # Byte 0 is a transition gate used by every maintenance process.
+            # Keep it while releasing the application range and acquiring our
+            # shared slot, then release the gate last.
+            _unlock_windows_range(descriptor, 1, 255)
+            slot = next(
+                (candidate for candidate in range(1, 256)
+                 if _try_windows_range_lock(descriptor, candidate, 1)),
+                None)
+            if slot is None:
+                _unlock_windows_range(descriptor, 0, 1)
+                raise MaintenanceBusyError(
+                    "could not complete the application lease handoff")
+            _unlock_windows_range(descriptor, 0, 1)
+        else:
+            import fcntl
+
+            # flock converts the lock attached to this open descriptor. There
+            # is no unlock/relock interval for an exclusive waiter to enter.
+            fcntl.flock(descriptor, fcntl.LOCK_SH)
+            slot = None
+        self._descriptor = -1
+        return ApplicationSession(descriptor, slot)
+
+    def close(self) -> None:
+        descriptor = self._descriptor
+        if descriptor < 0:
+            return
+        self._descriptor = -1
+        try:
+            if os.name == "nt":
+                _unlock_windows_range(descriptor, 1, 255)
+                _unlock_windows_range(descriptor, 0, 1)
+            else:
+                _unlock(descriptor)
+        finally:
+            os.close(descriptor)
+
+
 @contextmanager
 def inactive_application_lock(database: Path | str, timeout: float = 2.0):
     """Hold an exclusive lease after every cooperating backend has closed."""
-    path = application_lock_path(database)
-    descriptor = _open_control_file(path)
+    lease = InactiveApplicationLease.acquire(database, timeout=timeout)
     try:
-        if os.fstat(descriptor).st_size < 256:
-            os.ftruncate(descriptor, 256)
-            os.fsync(descriptor)
-        deadline = time.monotonic() + max(0.0, timeout)
-        while True:
-            if os.name == "nt":
-                import msvcrt
-
-                try:
-                    os.lseek(descriptor, 0, os.SEEK_SET)
-                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 256)
-                except OSError:
-                    acquired = False
-                else:
-                    acquired = True
-            else:
-                acquired = _try_lock(descriptor, exclusive=True)
-            if acquired:
-                break
-            if time.monotonic() >= deadline:
-                raise MaintenanceBusyError(
-                    "Classic Games is active; close it before data maintenance")
-            time.sleep(0.02)
-        try:
-            yield
-        finally:
-            if os.name == "nt":
-                import msvcrt
-
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 256)
-            else:
-                _unlock(descriptor)
+        yield lease
     finally:
-        os.close(descriptor)
+        lease.close()
 
 
 @contextmanager
@@ -221,13 +341,15 @@ def recovered_application_session(database: Path | str,
                                   timeout: float = 2.0) -> ApplicationSession:
     """Recover interrupted imports before granting an application lease."""
     database = Path(database).expanduser().resolve(strict=False)
-    with (inactive_application_lock(database, timeout=timeout),
-          maintenance_lock(database, exclusive=True, timeout=timeout)):
-        # Imported lazily so the recovery module can keep using StoreError
-        # without creating an import cycle at module load time.
-        from .import_transaction import recover_import_transactions
+    with inactive_application_lock(database, timeout=timeout) as inactive:
+        with maintenance_lock(database, exclusive=True, timeout=timeout):
+            # Imported lazily so the recovery module can keep using StoreError
+            # without creating an import cycle at module load time.
+            from .import_transaction import recover_import_transactions
 
-        recover_import_transactions(database)
-    # If maintenance starts in the small hand-off window it wins the
-    # exclusive application lock; this shared acquisition then waits for it.
-    return ApplicationSession.acquire(database, timeout=timeout)
+            recover_import_transactions(database)
+        # Keep the exclusive application lease after releasing the separate
+        # maintenance-file gate, then atomically turn that same lease into the
+        # lifetime shared session. No cooperating importer can create a new
+        # transaction between recovery and the application's database open.
+        return inactive.handoff()

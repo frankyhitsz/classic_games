@@ -120,6 +120,43 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
         ) from exc
 
 
+def _secure_data_directory(path: Path, *, create: bool = False) -> Path:
+    """Reject a journal root that is a symlink, junction, or shared path."""
+    path = Path(os.path.abspath(path.expanduser()))
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        if not create:
+            return path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+        metadata = os.lstat(path)
+    except OSError as exc:
+        raise StoreError(
+            "unsafe_data_directory", "journal directory metadata is unreadable"
+        ) from exc
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    if (not stat.S_ISDIR(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or os.name == "nt" and attributes & reparse_flag):
+        raise StoreError(
+            "unsafe_data_directory",
+            "journal directory cannot be a symlink or Windows reparse point")
+    if os.name == "posix":
+        if metadata.st_uid != os.getuid():
+            raise StoreError(
+                "unsafe_data_directory", "journal directory has another owner")
+        if metadata.st_mode & 0o022:
+            raise StoreError(
+                "unsafe_data_directory",
+                "journal directory is writable by another account")
+    return path
+
+
 @dataclass(frozen=True)
 class StorageFailure:
     kind: StorageErrorKind
@@ -321,11 +358,11 @@ class PersistentSaveOutbox:
                  maintain: bool = True):
         selected = Path(path)
         if selected.suffix.lower() == ".json":
-            self.path = selected.with_suffix("")
+            self.path = _secure_data_directory(selected.with_suffix(""))
             self.legacy_path = (Path(legacy_path) if legacy_path is not None
                                 else selected)
         else:
-            self.path = selected
+            self.path = _secure_data_directory(selected)
             self.legacy_path = (Path(legacy_path)
                                 if legacy_path is not None else None)
         self.quarantine_path = self.path.with_name(f"{self.path.name}-quarantine")
@@ -436,7 +473,7 @@ class PersistentSaveOutbox:
 
     def _quarantine(self, path: Path, reason: str) -> bool:
         try:
-            self.quarantine_path.mkdir(parents=True, exist_ok=True)
+            _secure_data_directory(self.quarantine_path, create=True)
             target = self.quarantine_path / (
                 f"{path.name}.{reason}-{time.time_ns()}-{uuid.uuid4().hex[:8]}")
             os.replace(path, target)
@@ -449,7 +486,7 @@ class PersistentSaveOutbox:
 
     def _quarantine_value(self, value, reason: str) -> bool:
         try:
-            self.quarantine_path.mkdir(parents=True, exist_ok=True)
+            _secure_data_directory(self.quarantine_path, create=True)
             target = self.quarantine_path / (
                 f"legacy-item.{reason}-{time.time_ns()}-{uuid.uuid4().hex[:8]}.json")
             try:
@@ -581,7 +618,7 @@ class PersistentSaveOutbox:
             mutation, created_at=created_at)
         encoded = canonical_json(envelope.to_dict()).encode("utf-8")
         with self._lock:
-            self.path.mkdir(parents=True, exist_ok=True)
+            _secure_data_directory(self.path, create=True)
             target = self._target(mutation.request_id)
             temp = self.path / (
                 f".{mutation.request_id}.{uuid.uuid4().hex}.tmp")
@@ -667,7 +704,7 @@ class PersistentSaveOutbox:
 
     def _upgrade_v1_file(self, path: Path, original: bytes,
                          envelope: PendingSaveEnvelope) -> None:
-        self.migration_backup_path.mkdir(parents=True, exist_ok=True)
+        _secure_data_directory(self.migration_backup_path, create=True)
         backup = self.migration_backup_path / (
             f"{path.name}.v1-{time.time_ns()}-{uuid.uuid4().hex[:8]}")
         temp = path.parent / f".{path.name}.{uuid.uuid4().hex}.upgrade"
@@ -825,7 +862,7 @@ class PersistentSaveOutbox:
     def probe_writable(self) -> bool:
         probe = self.path / f".probe-{uuid.uuid4().hex}"
         try:
-            self.path.mkdir(parents=True, exist_ok=True)
+            _secure_data_directory(self.path, create=True)
             self._write_bytes(probe, b"ok")
         except OSError:
             return False
@@ -860,7 +897,7 @@ class PersistentStateOutbox:
     }
 
     def __init__(self, path: Path | str, *, recover: bool = True):
-        self.path = Path(path)
+        self.path = _secure_data_directory(Path(path))
         self.quarantine_path = self.path.with_name(
             f"{self.path.name}-quarantine")
         self.migration_backup_path = self.path.with_name(
@@ -940,7 +977,7 @@ class PersistentStateOutbox:
     def _quarantine_clock_locked(self, clock_path: Path) -> None:
         """Preserve a damaged clock before rebuilding it from a known high-water."""
         try:
-            self.quarantine_path.mkdir(parents=True, exist_ok=True)
+            _secure_data_directory(self.quarantine_path, create=True)
             target = self.quarantine_path / (
                 f"state-clock.invalid-{time.time_ns()}-{uuid.uuid4().hex[:8]}")
             os.replace(clock_path, target)
@@ -961,7 +998,7 @@ class PersistentStateOutbox:
 
     @contextmanager
     def _digest_lock(self, digest: str):
-        self.path.mkdir(parents=True, exist_ok=True)
+        _secure_data_directory(self.path, create=True)
         descriptor = _open_control_file(
             self.path / f".state-{digest}.lock")
         deadline = time.monotonic() + REQUEST_LOCK_TIMEOUT_SECONDS
@@ -1087,6 +1124,49 @@ class PersistentStateOutbox:
             if key != "payload_hash"})
         return revised
 
+    def _reject_marker_path(self, key: str, payload_hash: str) -> Path:
+        target = self._target(key)
+        return self.path / (
+            f".reject-{target.stem}-{payload_hash[:24]}.txn")
+
+    def _reject_transaction(self, key: str, payload_hash: str,
+                            previous: Optional[dict], *, phase: str,
+                            reason: str) -> dict:
+        transaction = {
+            "version": 3,
+            "phase": phase,
+            "key": key,
+            "rejected_payload_hash": payload_hash,
+            "previous_operation": previous,
+            "reason": reason,
+        }
+        transaction["marker_hash"] = self._digest(transaction)
+        return transaction
+
+    def _write_reject_marker_locked(self, marker: Path,
+                                    transaction: dict) -> None:
+        temporary = marker.with_suffix(".tmp")
+        PersistentSaveOutbox._write_bytes(
+            temporary, canonical_json(transaction).encode("utf-8"))
+        try:
+            os.replace(temporary, marker)
+            PersistentSaveOutbox._fsync_directory(self.path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _prepare_reject_transaction_locked(
+            self, key: str, incoming: dict,
+            previous: Optional[dict]) -> Path:
+        marker = self._reject_marker_path(key, incoming["payload_hash"])
+        transaction = self._reject_transaction(
+            key, incoming["payload_hash"], previous,
+            phase="prepared", reason="pending-database-apply")
+        self._write_reject_marker_locked(marker, transaction)
+        return marker
+
     @classmethod
     def _merge_progress_operations(cls, existing: dict,
                                    incoming: dict) -> dict:
@@ -1177,6 +1257,12 @@ class PersistentStateOutbox:
                 raise StoreError(
                     "value_too_large", "pending local state is too large")
             if published or not target.is_file():
+                # Make the prior winner durable before replacing the
+                # canonical journal. A later permanent SQLite rejection can
+                # therefore restore it after a crash at any following step.
+                if previous_operation is not None:
+                    self._prepare_reject_transaction_locked(
+                        key, incoming, previous_operation)
                 temp = self.path / f".{target.name}.{uuid.uuid4().hex}.tmp"
                 PersistentSaveOutbox._write_bytes(temp, encoded)
                 try:
@@ -1333,7 +1419,7 @@ class PersistentStateOutbox:
 
     def _quarantine_locked(self, path: Path, reason: str) -> bool:
         try:
-            self.quarantine_path.mkdir(parents=True, exist_ok=True)
+            _secure_data_directory(self.quarantine_path, create=True)
             target = self.quarantine_path / (
                 f"{path.name}.{reason}-{time.time_ns()}-{uuid.uuid4().hex[:8]}")
             os.replace(path, target)
@@ -1459,7 +1545,7 @@ class PersistentStateOutbox:
 
     def _upgrade_v1_locked(self, source: Path, raw: bytes,
                            operation: dict) -> dict:
-        self.migration_backup_path.mkdir(parents=True, exist_ok=True)
+        _secure_data_directory(self.migration_backup_path, create=True)
         backup = self.migration_backup_path / (
             f"{source.name}.v1-{time.time_ns()}-{uuid.uuid4().hex[:8]}")
         PersistentSaveOutbox._write_bytes(backup, raw)
@@ -1498,6 +1584,23 @@ class PersistentStateOutbox:
             except FileNotFoundError:
                 pass
 
+    def _remove_prepared_reject_markers_locked(self, key: str) -> None:
+        prefix = f".reject-{self._target(key).stem}-"
+        for marker in self.path.glob(f"{prefix}*.txn"):
+            try:
+                transaction = self._validated_reject_transaction(json.loads(
+                    _read_regular_nofollow(
+                        marker, MAX_SPOOL_FILE_BYTES).decode("utf-8"),
+                    parse_constant=_reject_json_constant))
+                if (transaction.get("version") == 3
+                        and transaction.get("phase") == "prepared"
+                        and transaction.get("key") == key):
+                    marker.unlink()
+            except (OSError, StoreError, TypeError, ValueError,
+                    RecursionError, UnicodeError):
+                continue
+        PersistentSaveOutbox._fsync_directory(self.path)
+
     def remove_if_current(self, key: str, payload_hash: str) -> bool:
         with self._lock, self._key_lock(key):
             target = self._target(key)
@@ -1507,6 +1610,7 @@ class PersistentStateOutbox:
                 if current["payload_hash"] != payload_hash:
                     return False
                 target.unlink()
+                self._remove_prepared_reject_markers_locked(key)
                 PersistentSaveOutbox._fsync_directory(self.path)
                 self._count = max(0, self._count - 1)
                 return True
@@ -1519,7 +1623,7 @@ class PersistentStateOutbox:
     def reject_and_restore_if_current(
             self, key: str, payload_hash: str,
             previous_operation: Optional[dict], reason: str) -> bool:
-        """Quarantine a rejected winner through a startup-recoverable marker."""
+        """Mark a prepared winner rejected, then restore its prior journal."""
         safe_reason = "".join(
             char if char.isalnum() or char in "-_" else "-"
             for char in str(reason))[:80] or "rejected"
@@ -1543,45 +1647,96 @@ class PersistentStateOutbox:
                     return False
                 if previous["key"] != key:
                     return False
-            marker = self.path / (
-                f".reject-{target.stem}-{uuid.uuid4().hex}.txn")
-            temporary = marker.with_suffix(".tmp")
-            transaction = {
-                "version": 2, "key": key,
-                "rejected_payload_hash": payload_hash,
-                "previous_operation": previous,
-                "reason": safe_reason,
-            }
-            transaction["marker_hash"] = self._digest(transaction)
+            marker = self._reject_marker_path(key, payload_hash)
             try:
-                PersistentSaveOutbox._write_bytes(
-                    temporary, canonical_json(transaction).encode("utf-8"))
-                os.replace(temporary, marker)
-                PersistentSaveOutbox._fsync_directory(self.path)
+                prepared = self._validated_reject_transaction(json.loads(
+                    _read_regular_nofollow(
+                        marker, MAX_SPOOL_FILE_BYTES).decode("utf-8"),
+                    parse_constant=_reject_json_constant))
+            except FileNotFoundError:
+                prepared = None
+            except (OSError, StoreError, TypeError, ValueError,
+                    RecursionError, UnicodeError):
+                return False
+            if prepared is not None:
+                if (prepared.get("version") != 3
+                        or prepared["key"] != key
+                        or prepared["rejected_payload_hash"] != payload_hash):
+                    return False
+                previous = prepared["previous_operation"]
+            transaction = self._reject_transaction(
+                key, payload_hash, previous,
+                phase="rejected", reason=safe_reason)
+            try:
+                self._write_reject_marker_locked(marker, transaction)
             except (MutationError, OSError):
                 return False
-            finally:
-                try:
-                    temporary.unlink()
-                except FileNotFoundError:
-                    pass
             if not self._complete_reject_transaction(marker, transaction):
                 return False
             return True
 
-    def _complete_reject_transaction(self, marker: Path,
-                                     transaction: dict) -> bool:
-        version = transaction.get("version") if isinstance(transaction, dict) else None
-        if version == 2:
+    def _validated_reject_transaction(self, transaction: dict) -> dict:
+        if not isinstance(transaction, dict):
+            raise StoreError(
+                "invalid_reject_transaction", "reject marker is not an object")
+        version = transaction.get("version")
+        if version == 3:
+            fields = {
+                "version", "phase", "key", "rejected_payload_hash",
+                "previous_operation", "reason", "marker_hash"}
             expected = self._digest({
                 name: value for name, value in transaction.items()
                 if name != "marker_hash"})
-            if (set(transaction) != {
-                    "version", "key", "rejected_payload_hash",
-                    "previous_operation", "reason", "marker_hash"}
+            if (set(transaction) != fields
+                    or transaction.get("phase") not in {"prepared", "rejected"}
                     or transaction.get("marker_hash") != expected):
-                return False
+                raise StoreError(
+                    "invalid_reject_transaction", "reject marker hash is invalid")
+        elif version == 2:
+            fields = {
+                "version", "key", "rejected_payload_hash",
+                "previous_operation", "reason", "marker_hash"}
+            expected = self._digest({
+                name: value for name, value in transaction.items()
+                if name != "marker_hash"})
+            if (set(transaction) != fields
+                    or transaction.get("marker_hash") != expected):
+                raise StoreError(
+                    "invalid_reject_transaction", "reject marker hash is invalid")
         elif version != 1:
+            raise StoreError(
+                "invalid_reject_transaction", "reject marker version is invalid")
+        key = transaction.get("key")
+        rejected_hash = transaction.get("rejected_payload_hash")
+        if (not isinstance(key, str) or not key
+                or not isinstance(rejected_hash, str)
+                or len(rejected_hash) != 64):
+            raise StoreError(
+                "invalid_reject_transaction", "reject marker identity is invalid")
+        previous = transaction.get("previous_operation")
+        if previous is not None:
+            try:
+                previous = self._parse(
+                    canonical_json(previous).encode("utf-8"))
+            except (MutationError, StoreError, TypeError, ValueError,
+                    RecursionError, MemoryError) as exc:
+                raise StoreError(
+                    "invalid_reject_transaction",
+                    "reject marker previous operation is invalid") from exc
+            if previous["key"] != key:
+                raise StoreError(
+                    "invalid_reject_transaction",
+                    "reject marker previous operation has another key")
+        return {**transaction, "previous_operation": previous}
+
+    def _complete_reject_transaction(self, marker: Path,
+                                     transaction: dict) -> bool:
+        try:
+            transaction = self._validated_reject_transaction(transaction)
+        except StoreError:
+            return False
+        if (transaction["version"] == 3
+                and transaction["phase"] != "rejected"):
             return False
         key = transaction.get("key")
         previous = transaction.get("previous_operation")
@@ -1603,13 +1758,9 @@ class PersistentStateOutbox:
             current = None
         if previous is not None and current is None:
             try:
-                previous = self._parse(canonical_json(previous).encode("utf-8"))
-                if previous["key"] != key:
-                    return False
                 self._rewrite_locked(target, previous)
                 self._count += 1
-            except (MutationError, OSError, StoreError, TypeError,
-                    ValueError, RecursionError, MemoryError):
+            except OSError:
                 return False
         try:
             marker.unlink()
@@ -1620,7 +1771,7 @@ class PersistentStateOutbox:
 
     def _quarantine_transaction(self, marker: Path, reason: str) -> None:
         try:
-            self.quarantine_path.mkdir(parents=True, exist_ok=True)
+            _secure_data_directory(self.quarantine_path, create=True)
             target = self.quarantine_path / (
                 f"{marker.name}.{reason}-{time.time_ns()}-{uuid.uuid4().hex[:8]}")
             os.replace(marker, target)
@@ -1631,27 +1782,85 @@ class PersistentStateOutbox:
         self.quarantined_count += 1
         self._update_notice()
 
+    def _recover_prepared_reject(self, marker: Path,
+                                 transaction: dict) -> None:
+        """Keep an incoming winner replayable; clean markers with no winner."""
+        target = self._target(transaction["key"])
+        try:
+            current = self._parse(_read_regular_nofollow(
+                target, MAX_SPOOL_FILE_BYTES))
+        except FileNotFoundError:
+            current = None
+        except (OSError, StoreError, TypeError, ValueError, RecursionError):
+            return
+        previous = transaction["previous_operation"]
+        previous_hash = (
+            previous["payload_hash"] if previous is not None else None)
+        if (current is None
+                or current["payload_hash"] == previous_hash):
+            try:
+                marker.unlink()
+                PersistentSaveOutbox._fsync_directory(self.path)
+            except OSError:
+                pass
+
+    def _promote_reject_temporary(self, temporary: Path) -> None:
+        final = temporary.with_suffix(".txn")
+        transaction = self._validated_reject_transaction(json.loads(
+            _read_regular_nofollow(
+                temporary, MAX_SPOOL_FILE_BYTES).decode("utf-8"),
+            parse_constant=_reject_json_constant))
+        if not final.exists():
+            os.replace(temporary, final)
+            PersistentSaveOutbox._fsync_directory(self.path)
+            return
+        current = self._validated_reject_transaction(json.loads(
+            _read_regular_nofollow(
+                final, MAX_SPOOL_FILE_BYTES).decode("utf-8"),
+            parse_constant=_reject_json_constant))
+        same_identity = (
+            current["key"] == transaction["key"]
+            and current["rejected_payload_hash"]
+            == transaction["rejected_payload_hash"])
+        promote_rejected = (
+            same_identity and transaction.get("version") == 3
+            and current.get("version") == 3
+            and transaction.get("phase") == "rejected"
+            and current.get("phase") == "prepared")
+        if transaction == current:
+            temporary.unlink()
+        elif promote_rejected:
+            os.replace(temporary, final)
+        else:
+            raise StoreError(
+                "invalid_reject_transaction",
+                "reject temporary conflicts with its final marker")
+        PersistentSaveOutbox._fsync_directory(self.path)
+
     def _recover_reject_transactions(self) -> None:
         """Finish reject markers and legacy restore files after a crash."""
         if not self.path.is_dir():
             return
         for temporary in sorted(
                 self.path.glob(".reject-*.tmp"))[:MAX_SPOOL_FILES]:
-            self._quarantine_transaction(temporary, "incomplete-reject")
+            try:
+                self._promote_reject_temporary(temporary)
+            except (OSError, StoreError, TypeError, ValueError,
+                    RecursionError, UnicodeError):
+                self._quarantine_transaction(temporary, "invalid-reject-temp")
         for marker in sorted(self.path.glob(".reject-*.txn"))[:MAX_SPOOL_FILES]:
             try:
-                transaction = json.loads(
+                transaction = self._validated_reject_transaction(json.loads(
                     _read_regular_nofollow(
                         marker, MAX_SPOOL_FILE_BYTES).decode("utf-8"),
-                    parse_constant=_reject_json_constant)
-                if not isinstance(transaction, dict):
-                    continue
+                    parse_constant=_reject_json_constant))
                 key = transaction.get("key")
-                if not isinstance(key, str):
-                    raise StoreError(
-                        "invalid_reject_transaction", "reject key is invalid")
                 with self._key_lock(key):
-                    if not self._complete_reject_transaction(marker, transaction):
+                    if (transaction.get("version") == 3
+                            and transaction.get("phase") == "prepared"):
+                        self._recover_prepared_reject(marker, transaction)
+                    elif not self._complete_reject_transaction(
+                            marker, transaction):
                         raise StoreError(
                             "invalid_reject_transaction",
                             "reject transaction hash or contents are invalid")
@@ -1672,9 +1881,12 @@ class PersistentStateOutbox:
                             target, MAX_SPOOL_FILE_BYTES))
                         if current["payload_hash"] == previous["payload_hash"]:
                             restore.unlink()
+                        else:
+                            self._quarantine_transaction(
+                                restore, "superseded-restore")
             except (OSError, StoreError, TypeError, ValueError,
                     RecursionError):
-                continue
+                self._quarantine_transaction(restore, "invalid-restore")
 
     def recover_transactions(self) -> None:
         """Retry crash markers after a transient filesystem failure clears."""
@@ -1733,7 +1945,7 @@ class PersistentStateOutbox:
 
     def probe_writable(self) -> bool:
         try:
-            self.path.mkdir(parents=True, exist_ok=True)
+            _secure_data_directory(self.path, create=True)
             probe = self.path / f".state-probe-{uuid.uuid4().hex}"
             PersistentSaveOutbox._write_bytes(probe, b"ok")
             probe.unlink()
@@ -2723,12 +2935,17 @@ class LocalBackendClient:
                     result={"ok": False, "pending_preserved": True,
                             "durable_pending": True, "reconstructed": True})
             elif receipt is not None:
+                receipt_result = dict(receipt)
+                superseded = (
+                    receipt_result.get("superseded") is True
+                    or receipt_result.get("state_apply") == "superseded")
                 event = LocalStateEvent(
                     key=key,
                     kind=PersistentStateOutbox._kind(receipt["method"]),
                     logical_revision=receipt["logical_revision"],
-                    state=SaveState.COMMITTED,
-                    result={**receipt, "reconstructed": True})
+                    state=(SaveState.SUPERSEDED
+                           if superseded else SaveState.COMMITTED),
+                    result={**receipt_result, "reconstructed": True})
             else:
                 return
             with self._lock:
