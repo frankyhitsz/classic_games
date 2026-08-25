@@ -105,7 +105,9 @@ class ImportTransaction:
             finally:
                 rollback.close()
                 source.close()
-            with (root / "database-before.sqlite").open("rb") as handle:
+            # Windows rejects fsync on a read-only CRT descriptor (EBADF).
+            # Open update-capable without changing the rollback image.
+            with (root / "database-before.sqlite").open("rb+") as handle:
                 os.fsync(handle.fileno())
             for index, operation in enumerate(operations):
                 target = _ensure_safe_target(database, operation.target)
