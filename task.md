@@ -49,6 +49,9 @@
   history 长度、ledger 和 attempt identity；session load 未结束前不接收棋盘操作。
 - 精确固定的 setuptools 80.9.0 被 2026-08 的依赖审计识别为 `PYSEC-2026-3447`。build-system 与
   constraints 同步更新为 83.0.0，重新审计为零已知漏洞。
+- GitHub CI #45 的 core-only 环境没有可选 Flask 依赖；新增 API 暴露测试却无条件导入 server adapter，
+  导致产品核心依赖模型被测试破坏。用例现与其他 Flask 边界测试一致，在 optional dependency 缺失时跳过；
+  全新仅安装 `-e .` 的 Python 3.13 环境已验证 260 项通过、6 项可选依赖用例跳过。
 
 ## 完整验证
 

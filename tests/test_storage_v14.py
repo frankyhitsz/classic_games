@@ -467,7 +467,10 @@ class GameAndAdapterTests(unittest.TestCase):
                 pass
 
     def test_non_loopback_api_requires_explicit_unsafe_confirmation(self):
-        from server import app as server_app
+        try:
+            from server import app as server_app
+        except ImportError:
+            self.skipTest("optional Flask dependency is unavailable")
 
         with patch.dict(os.environ, {"GAMES_HOST": "0.0.0.0"}, clear=False):
             os.environ.pop("GAMES_UNSAFE_EXPOSE", None)
