@@ -558,6 +558,7 @@ class FilesystemAndGameTests(unittest.TestCase):
         game.completed_levels = {0}
         game.level_scores = {0: 900}
         game.total_score = 900
+        self.assertFalse(game._select_practice_level(1))
         self.assertTrue(game._select_practice_level(1))
         game.boxes = set(game.targets)
         game._check_win()
@@ -579,6 +580,7 @@ class FilesystemAndGameTests(unittest.TestCase):
         self.assertFalse(game._select_practice_level(2))
         self.assertEqual(game.level_idx, 0)
         game.state = "playing"
+        self.assertFalse(game._select_practice_level(0))
         self.assertTrue(game._select_practice_level(0))
         self.assertTrue(game.practice_mode)
         self.assertEqual(game.completed_levels, {0, 1})

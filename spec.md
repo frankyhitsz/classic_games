@@ -1,51 +1,51 @@
-# 第十四次审查修复规格
+# 第十五次审查修复规格
 
 ## 目标
 
-逐条核对第十四次审查提出的 28 条发现和 P0–P3 建议。优先关闭启动恢复交接、被拒状态的旧
-pending 保全和 2048 所有权确认三个数据正确性问题；随后处理可证明的归档兼容、事务恢复、练习
-模式隔离和独立启动问题。审查建议与真实平台行为冲突时，以不变量、代码和可复现测试为准。
+核对第十五次审查提出的 31 条 Finding 与 P0–P3 建议。首先关闭启动 lease 交接、import root、state
+journal 错误分类和 pending import 冲突四项数据正确性问题；随后处理能够在当前本地运行架构内安全闭环的
+恢复、Archive 演进、2048 claim 与推箱子练习会话问题。
 
-## 本轮范围
+## 范围
 
-- 导入恢复持有 exclusive application lease，并把同一 lease 原子交接为 shared session；恢复与数据库
-  打开之间不再释放 application gate；
-- state outbox 在替换 canonical winner 前发布 reject v3 `prepared` marker；永久拒绝先把 marker 改为
-  `rejected`，完整临时 marker 可在启动时提升，损坏临时文件才隔离；
-- 2048 owner claim 只有权威回执中的 token、epoch 和 active 状态匹配当前窗口才开放输入；关闭时用更高
-  revision 的 released intent 取消未完成 claim；
-- archive v3 记录包版本、导出时 ruleset 目录和 reader capability 范围；历史 ruleset 行可恢复但不参加
-  当前规则默认排行；v2 upgrader 只在证据足够时保留 replace eligibility；
-- import transaction 的 hash 校验与实际使用共用同一批 bytes；未认证 v1 默认要求人工确认，多份未完成
-  transaction 在没有 lineage 时拒绝猜测顺序；
-- journal、quarantine 和 migration root 拒绝符号链接及 Windows reparse point；迁移后的 legacy score 文件
-  纳入 status/export/cleanup/replace inventory；
-- replace restore 移除未知 table/view/trigger/index、重建当前显式 schema object、清空 sequence，并核对
-  完整 schema fingerprint；
-- Sokoban campaign 与 practice ledger 分离；练习不解锁关卡、不改变 ranked total，paused/won 不接受选关，
-  N 与 selector 使用同一 unlocked 规则；
-- launcher 与单游戏入口共用 maintenance/recovery 重试页，`server.init_db()` 持有 application lease；
-- 包版本升为 0.7.0，README、CHANGELOG 和存储协议与实现同步。
+- POSIX application lock 使用独立 transition gate 包住 EX→SH 转换，并在 shared lease 下重新扫描
+  transaction root；Windows 保留 byte-range transition gate；
+- import 准备目录使用 `.preparing-*`，只有完整 journal 发布后才改名为 `.import-*`；已发布目录缺
+  journal 时保留全部 evidence 并阻止启动；
+- state journal 的非重试 StoreError 不再绕过 journal 写 SQLite；在线 outbox 与 import planner 复用同一
+  duplicate、superseded、merge、conflict resolver；
+- prepared reject 的 canonical target 缺失或损坏时恢复 previous；永久 replay 无法完成 reject 时发出
+  SUPERSEDED 或 RECOVERY_REQUIRED，不再热循环；
+- score/state/clock orphan temp 在 grace window 后校验、合并或隔离；complete export 和 replace 覆盖未决
+  temp；legacy pending 使用 no-follow 读取；
+- database、lease 与默认 pending 路径使用同一 canonical identity；outbox 构造失败显式释放 application
+  session；control hard link 被拒绝；
+- Archive v3 按 archive 自身 format dispatch，允许历史 catalog 子集；当前 ruleset 使用严格 validator，
+  历史 ruleset 采用 preserve-only 策略；坏目标数据库通过 fresh DB、原子替换和 authenticated rollback
+  image 恢复；v1 CLI 恢复绑定导出 evidence SHA-256；
+- 2048 claim ACK 同时核对 owner、epoch、slot revision 和 authoritative value hash；
+- 推箱子练习保存原 campaign board 并提供返回入口；campaign/practice write Future 和状态消息分离；
+  practice schema 不接受 unlock，结果页显示练习成绩；
+- Snake 与 Zuma 支持注入 RNG，俄罗斯方块 hold 区绘制方块预览；CI 的 pip 与 dev 安装使用固定 constraints；
+- 版本升为 0.8.0，审查任务书归档到 `docs/audits/`。
 
 ## 约束与非目标
 
-- 不通过二次无锁目录扫描冒充原子交接；协作维护必须先取得 application exclusive lease；
-- format-less v2 没有 active reject/restore inventory，单凭归档内容无法证明当时不存在遗漏，因此只能升级
-  为 merge-only v3，并明确报告不可证明项；
-- archive 中的导出时 ruleset 目录是解释信息，不是必须等于当前目录的全局门禁；业务行仍按 game ID、
-  自身 ruleset 和 payload 语义校验；
-- 低层 `LocalGameStore` 继续供迁移和测试使用；正式运行入口必须走 service/lease；
-- branch protection、三平台 hash lock、签名制品和 LICENSE 需要仓库管理或权利人决定，不以代码注释冒充；
-- 本轮不为完成清单而重写 pygame 架构或同时引入另一套 journal。
+- 不新增另一套 journal/receipt；transition gate 是无业务 payload 的协作锁文件；
+- orphan temp grace 用于避免扫描仍在写入的跨进程文件；未到期 temp 会使 complete export 报告未决；
+- 未知历史 ruleset 只保留，不按当前规则执行或进入当前默认排行；
+- 默认 outbox 跟随 canonical database parent；显式 custom outbox 仍是测试和高级调用边界；
+- branch protection、三平台 hash lock、LICENSE、商标与签名需要仓库管理员或权利人决定，不写成已完成；
+- P2/P3 大型重构和新模式不与本轮存储协议修复混做，也不把未实现建议标成已完成。
 
 ## 验收标准
 
-- F01–F28 均有成立性、处理状态与证据；P0–P3 每个 ID 均有状态；
-- recovery handoff 无 unlock/reacquire 调用，shared session 存续期间维护 exclusive 获取失败；
-- reject 在 incoming publish 前已有 previous，valid temp 可提升，所有拒绝路径可恢复 previous；
-- superseded/unproven claim 不进入 ready、不接受移动，claim 中关闭留下 released winner；
-- v3 archive 可 replace；严格 v2 可升级；format-less v2 明确 merge-only；ruleset 升级不使无关历史失效；
-- v1 transaction 默认不自动使用未认证 bytes；多 transaction 默认 recovery-required；
-- practice clear 不改变 campaign ledger/unlock；paused/won selector 无效；
-- 完成至少两轮“发现问题—修复—重新验证”，并通过 lint、compile、storage、gameplay、stress 和 release；
-- 变更提交并推送到 `origin/main`，最终远端多平台 CI 成功且本地与远端 SHA 一致。
+- F01–F31 均有成立性与处理结论，P0–P3 共 121 项均有状态；
+- 全部 P0 有真实进程、故障或冲突测试，任何语义 conflict 都不写 SQLite；
+- missing-journal `.import-*` 保留 rollback image，`.preparing-*` 可清理；
+- 同 identity 不同 payload 的 import preview 明确失败，lower order 在 preview 中报告 superseded；
+- target 缺失不删除 previous 最后副本，reject 失败产生稳定状态；
+- v3 在未来 reader 常量变化和 catalog 增加时仍可读；坏目标 DB 可 replace restore；
+- 练习可返回原 campaign board，两个 progress Future 不互相覆盖；
+- 至少两轮“发现—修复—复验”，并通过 Ruff、compile、storage、gameplay、stress、release 与远端多平台 CI；
+- 本地与 `origin/main` 最终 SHA 一致，工作区干净。

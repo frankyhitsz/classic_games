@@ -84,9 +84,9 @@ def _open_control_file(path: Path) -> int:
                 f"unsafe or unavailable data lock: {path.name}") from exc
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode):
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
             raise MaintenanceBusyError(
-                f"data lock is not an ordinary file: {path.name}")
+                f"data lock is not a private ordinary file: {path.name}")
         if os.name == "posix":
             if metadata.st_uid != os.getuid():
                 raise MaintenanceBusyError(
@@ -108,6 +108,12 @@ def lock_path(database: Path | str) -> Path:
 def application_lock_path(database: Path | str) -> Path:
     path = Path(database)
     return path.with_name(f".{path.name}.application.lock")
+
+
+def application_transition_lock_path(database: Path | str) -> Path:
+    """Serialize POSIX application-lock acquisition and conversion."""
+    path = Path(database)
+    return path.with_name(f".{path.name}.application-transition.lock")
 
 
 def _try_lock(descriptor: int, exclusive: bool) -> bool:
@@ -173,17 +179,28 @@ class ApplicationSession:
     def acquire(cls, database: Path | str, timeout: float = 2.0):
         path = application_lock_path(database)
         descriptor = _open_control_file(path)
+        transition_descriptor = None
         deadline = time.monotonic() + max(0.0, timeout)
         try:
             if os.fstat(descriptor).st_size < 256:
                 os.ftruncate(descriptor, 256)
                 os.fsync(descriptor)
             if os.name != "nt":
+                transition_descriptor = _open_control_file(
+                    application_transition_lock_path(database))
+                while not _try_lock(transition_descriptor, exclusive=True):
+                    if time.monotonic() >= deadline:
+                        raise MaintenanceBusyError(
+                            "local data startup transition is active; retry shortly")
+                    time.sleep(0.02)
                 while not _try_lock(descriptor, exclusive=False):
                     if time.monotonic() >= deadline:
                         raise MaintenanceBusyError(
                             "local data maintenance is active; retry shortly")
                     time.sleep(0.02)
+                _unlock(transition_descriptor)
+                os.close(transition_descriptor)
+                transition_descriptor = None
                 return cls(descriptor)
             import msvcrt
 
@@ -200,6 +217,12 @@ class ApplicationSession:
                         "local data maintenance is active; retry shortly")
                 time.sleep(0.02)
         except Exception:
+            if transition_descriptor is not None:
+                try:
+                    _unlock(transition_descriptor)
+                except OSError:
+                    pass
+                os.close(transition_descriptor)
             os.close(descriptor)
             raise
 
@@ -229,17 +252,28 @@ class ApplicationSession:
 class InactiveApplicationLease:
     """Exclusive application lease that can atomically become a session."""
 
-    def __init__(self, descriptor: int):
+    def __init__(self, descriptor: int,
+                 transition_descriptor: int | None = None):
         self._descriptor = descriptor
+        self._transition_descriptor = transition_descriptor
 
     @classmethod
     def acquire(cls, database: Path | str, timeout: float = 2.0):
         descriptor = _open_control_file(application_lock_path(database))
+        transition_descriptor = None
         deadline = time.monotonic() + max(0.0, timeout)
         try:
             if os.fstat(descriptor).st_size < 256:
                 os.ftruncate(descriptor, 256)
                 os.fsync(descriptor)
+            if os.name != "nt":
+                transition_descriptor = _open_control_file(
+                    application_transition_lock_path(database))
+                while not _try_lock(transition_descriptor, exclusive=True):
+                    if time.monotonic() >= deadline:
+                        raise MaintenanceBusyError(
+                            "Classic Games is starting; retry data maintenance")
+                    time.sleep(0.02)
             while True:
                 if os.name == "nt":
                     acquired = _try_windows_range_lock(descriptor, 0, 1)
@@ -250,12 +284,18 @@ class InactiveApplicationLease:
                 else:
                     acquired = _try_lock(descriptor, exclusive=True)
                 if acquired:
-                    return cls(descriptor)
+                    return cls(descriptor, transition_descriptor)
                 if time.monotonic() >= deadline:
                     raise MaintenanceBusyError(
                         "Classic Games is active; close it before data maintenance")
                 time.sleep(0.02)
         except Exception:
+            if transition_descriptor is not None:
+                try:
+                    _unlock(transition_descriptor)
+                except OSError:
+                    pass
+                os.close(transition_descriptor)
             os.close(descriptor)
             raise
 
@@ -281,10 +321,16 @@ class InactiveApplicationLease:
         else:
             import fcntl
 
-            # flock converts the lock attached to this open descriptor. There
-            # is no unlock/relock interval for an exclusive waiter to enter.
+            # flock conversion itself may temporarily remove the old lock.
+            # Every cooperating POSIX acquirer first takes the separate
+            # transition gate, which remains held across this conversion.
             fcntl.flock(descriptor, fcntl.LOCK_SH)
             slot = None
+            transition_descriptor = self._transition_descriptor
+            self._transition_descriptor = None
+            if transition_descriptor is not None:
+                _unlock(transition_descriptor)
+                os.close(transition_descriptor)
         self._descriptor = -1
         return ApplicationSession(descriptor, slot)
 
@@ -301,6 +347,13 @@ class InactiveApplicationLease:
                 _unlock(descriptor)
         finally:
             os.close(descriptor)
+            transition_descriptor = self._transition_descriptor
+            self._transition_descriptor = None
+            if transition_descriptor is not None:
+                try:
+                    _unlock(transition_descriptor)
+                finally:
+                    os.close(transition_descriptor)
 
 
 @contextmanager
@@ -341,15 +394,30 @@ def recovered_application_session(database: Path | str,
                                   timeout: float = 2.0) -> ApplicationSession:
     """Recover interrupted imports before granting an application lease."""
     database = Path(database).expanduser().resolve(strict=False)
-    with inactive_application_lock(database, timeout=timeout) as inactive:
-        with maintenance_lock(database, exclusive=True, timeout=timeout):
-            # Imported lazily so the recovery module can keep using StoreError
-            # without creating an import cycle at module load time.
-            from .import_transaction import recover_import_transactions
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        remaining = max(0.0, deadline - time.monotonic())
+        with inactive_application_lock(database, timeout=remaining) as inactive:
+            with maintenance_lock(database, exclusive=True, timeout=remaining):
+                # Imported lazily so the recovery module can keep using
+                # StoreError without creating an import cycle at module load.
+                from .import_transaction import (
+                    has_import_transaction_roots,
+                    recover_import_transactions,
+                )
 
-            recover_import_transactions(database)
-        # Keep the exclusive application lease after releasing the separate
-        # maintenance-file gate, then atomically turn that same lease into the
-        # lifetime shared session. No cooperating importer can create a new
-        # transaction between recovery and the application's database open.
-        return inactive.handoff()
+                recover_import_transactions(database)
+            session = inactive.handoff()
+        try:
+            # Defense in depth for platforms or remote filesystems with
+            # different conversion behavior. While this SH lease is held, no
+            # cooperating importer can add a new transaction root.
+            if not has_import_transaction_roots(database):
+                return session
+        except Exception:
+            session.close()
+            raise
+        session.close()
+        if time.monotonic() >= deadline:
+            raise MaintenanceBusyError(
+                "an import transaction appeared during application startup")

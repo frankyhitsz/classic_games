@@ -19,6 +19,21 @@ MAX_TRANSACTION_FILE_BYTES = 16 * 1024 * 1024
 MAX_TRANSACTION_TOTAL_BYTES = 128 * 1024 * 1024
 
 
+def _transaction_pattern(database: Path) -> str:
+    return f".{database.name}.import-*"
+
+
+def _preparing_pattern(database: Path) -> str:
+    return f".{database.name}.preparing-*"
+
+
+def has_import_transaction_roots(database: Path) -> bool:
+    """Report any published or incomplete preparation root without changing it."""
+    database = database.expanduser().resolve(strict=False)
+    return any(database.parent.glob(_transaction_pattern(database))) or any(
+        database.parent.glob(_preparing_pattern(database)))
+
+
 @dataclass(frozen=True)
 class FileOperation:
     target: Path
@@ -108,15 +123,18 @@ def _read_verified_file(path: Path, size: int, digest: str, *,
 
 def _allowed_relative_target(relative: Path) -> bool:
     parts = relative.parts
-    if (len(parts) == 2 and parts[0] == "pending"
-            and parts[1].endswith(".json")):
-        return len(parts[1]) <= 160
+    if len(parts) == 2 and parts[0] == "pending":
+        name = parts[1]
+        return (name.endswith(".json") and len(name) <= 160
+                or name.startswith(".") and len(name) <= 220
+                and name.endswith((".tmp", ".upgrade")))
     if len(parts) == 2 and parts[0] == "pending-state":
         name = parts[1]
         return (name.endswith(".json") and len(name) <= 160
                 or name.startswith(".reject-")
                 and name.endswith((".txn", ".tmp"))
-                or name.startswith(".") and name.endswith(".restore"))
+                or name.startswith(".") and len(name) <= 220
+                and name.endswith((".restore", ".tmp")))
     if (parts == ("pending_saves.json",)
             or len(parts) == 1
             and parts[0].startswith("pending_saves.json.migrated-")):
@@ -146,11 +164,14 @@ def _deletion_only_relative(relative: Path) -> bool:
     return ((parts == ("pending_saves.json",)
              or len(parts) == 1
              and parts[0].startswith("pending_saves.json.migrated-"))
+            or (len(parts) == 2 and parts[0] == "pending"
+                and parts[1].startswith(".")
+                and parts[1].endswith((".tmp", ".upgrade")))
             or (len(parts) == 2 and parts[0] == "pending-state"
                 and ((parts[1].startswith(".reject-")
                       and parts[1].endswith((".txn", ".tmp")))
                      or (parts[1].startswith(".")
-                         and parts[1].endswith(".restore")))))
+                         and parts[1].endswith((".restore", ".tmp"))))))
 
 
 def _ensure_safe_target(database: Path, target: Path) -> Path:
@@ -257,30 +278,49 @@ class ImportTransaction:
         self.journal = journal
 
     @classmethod
-    def prepare(cls, database: Path, operations: list[FileOperation]):
+    def prepare(cls, database: Path, operations: list[FileOperation], *,
+                allow_raw_database_fallback: bool = False):
         database, operations = _translate_parent_alias(database, operations)
         operations = _normalized_operations(database, operations)
-        root = database.parent / (
-            f".{database.name}.import-{time.time_ns()}-{uuid.uuid4().hex[:8]}")
-        root.mkdir(mode=0o700)
-        _fsync_directory(root.parent)
+        identity = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+        preparing_root = database.parent / (
+            f".{database.name}.preparing-{identity}")
+        root = database.parent / f".{database.name}.import-{identity}"
+        preparing_root.mkdir(mode=0o700)
+        _fsync_directory(preparing_root.parent)
         records = []
         transaction_bytes = 0
+        published = False
         try:
-            source = sqlite3.connect(str(database))
-            rollback = sqlite3.connect(str(root / "database-before.sqlite"))
+            rollback_path = preparing_root / "database-before.sqlite"
             try:
-                source.backup(rollback)
-                rollback.commit()
-            finally:
-                rollback.close()
-                source.close()
+                source = sqlite3.connect(str(database))
+                rollback = sqlite3.connect(str(rollback_path))
+                try:
+                    if source.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                        raise sqlite3.DatabaseError("source database is corrupt")
+                    source.backup(rollback)
+                    rollback.commit()
+                finally:
+                    rollback.close()
+                    source.close()
+                restore_mode = "sqlite"
+            except sqlite3.Error:
+                try:
+                    rollback_path.unlink()
+                except FileNotFoundError:
+                    pass
+                if not allow_raw_database_fallback:
+                    raise
+                raw_database, _size, _digest = _read_file_snapshot(
+                    database, MAX_TRANSACTION_TOTAL_BYTES)
+                _write_file(rollback_path, raw_database)
+                restore_mode = "raw"
             # Windows rejects fsync on a read-only CRT descriptor (EBADF).
             # Open update-capable without changing the rollback image.
-            with (root / "database-before.sqlite").open("rb+") as handle:
+            with rollback_path.open("rb+") as handle:
                 os.fsync(handle.fileno())
-            rollback_size, rollback_hash = _file_digest(
-                root / "database-before.sqlite")
+            rollback_size, rollback_hash = _file_digest(rollback_path)
             for index, operation in enumerate(operations):
                 target = _ensure_safe_target(database, operation.target)
                 relative = target.relative_to(database.parent.resolve(strict=False))
@@ -295,7 +335,7 @@ class ImportTransaction:
                             "import_staging_too_large",
                             "staged import files exceed rollback limits")
                     staged_name = f"staged-{index}.bin"
-                    _write_file(root / staged_name, operation.data)
+                    _write_file(preparing_root / staged_name, operation.data)
                     staged_size = len(operation.data)
                     staged_hash = hashlib.sha256(operation.data).hexdigest()
                 before_name = None
@@ -312,7 +352,7 @@ class ImportTransaction:
                         raise StoreError(
                             "import_target_too_large",
                             "existing import target exceeds rollback limits")
-                    _write_file(root / before_name, before_data)
+                    _write_file(preparing_root / before_name, before_data)
                     before_size = len(before_data)
                 records.append({
                     "target": relative.as_posix(),
@@ -324,20 +364,29 @@ class ImportTransaction:
                     "before_sha256": before_hash,
                     "had_before": had_before,
                 })
-            journal = {
-                "version": 2, "phase": "PREPARED",
-                "database": database.name, "operations": records,
-                "database_before": {
-                    "path": "database-before.sqlite",
-                    "size": rollback_size,
-                    "sha256": rollback_hash,
-                },
+            transaction_version = 3 if restore_mode == "raw" else 2
+            database_before = {
+                "path": "database-before.sqlite",
+                "size": rollback_size,
+                "sha256": rollback_hash,
             }
-            transaction = cls(database, root, journal)
+            if transaction_version == 3:
+                database_before["restore_mode"] = restore_mode
+            journal = {
+                "version": transaction_version, "phase": "PREPARED",
+                "database": database.name, "operations": records,
+                "database_before": database_before,
+            }
+            transaction = cls(database, preparing_root, journal)
             transaction._write_journal()
+            os.replace(preparing_root, root)
+            published = True
+            _fsync_directory(root.parent)
+            transaction.root = root
             return transaction
         except Exception:
-            shutil.rmtree(root, ignore_errors=True)
+            if not published:
+                shutil.rmtree(preparing_root, ignore_errors=True)
             raise
 
     @classmethod
@@ -370,7 +419,7 @@ class ImportTransaction:
                 "import_recovery_required", "import phase journal is unreadable"
             ) from exc
         version = journal.get("version") if isinstance(journal, dict) else None
-        if (not isinstance(journal, dict) or version not in {1, 2}
+        if (not isinstance(journal, dict) or version not in {1, 2, 3}
                 or journal.get("database") != database.name
                 or not isinstance(journal.get("operations"), list)):
             raise StoreError(
@@ -427,7 +476,7 @@ class ImportTransaction:
                     "import_recovery_required",
                     "import phase journal contains duplicate targets")
             targets.add(target)
-            if version == 2:
+            if version in {2, 3}:
                 for prefix in ("staged", "before"):
                     name = record[prefix]
                     size = record[f"{prefix}_size"]
@@ -444,15 +493,21 @@ class ImportTransaction:
                             "import phase journal file metadata is invalid")
             # Verify all phase inputs before an automatic recovery changes
             # the database or any published file.
-        if version == 2:
+        if version in {2, 3}:
             database_before = journal.get("database_before")
+            expected_database_fields = ({"path", "size", "sha256"}
+                                        if version == 2 else {
+                                            "path", "size", "sha256",
+                                            "restore_mode"})
             if (not isinstance(database_before, dict)
-                    or set(database_before) != {"path", "size", "sha256"}
+                    or set(database_before) != expected_database_fields
                     or database_before.get("path") != "database-before.sqlite"
                     or type(database_before.get("size")) is not int
                     or database_before["size"] <= 0
                     or not isinstance(database_before.get("sha256"), str)
-                    or len(database_before["sha256"]) != 64):
+                    or len(database_before["sha256"]) != 64
+                    or version == 3
+                    and database_before.get("restore_mode") != "raw"):
                 raise StoreError(
                     "import_recovery_required",
                     "import database rollback metadata is invalid")
@@ -479,7 +534,7 @@ class ImportTransaction:
 
     def publish_files(self) -> None:
         staged_data: dict[int, bytes] = {}
-        if self.journal["version"] == 2:
+        if self.journal["version"] in {2, 3}:
             for index, record in enumerate(self.journal["operations"]):
                 if record["staged"] is not None:
                     staged_data[index] = _read_verified_file(
@@ -523,7 +578,7 @@ class ImportTransaction:
             target.parent.mkdir(parents=True, exist_ok=True)
             _ensure_safe_target(self.database, target)
             data = (staged_data[index]
-                    if self.journal["version"] == 2
+                    if self.journal["version"] in {2, 3}
                     else (self.root / record["staged"]).read_bytes())
             _write_file(target, data)
         self.mark("FILES_PUBLISHED")
@@ -533,7 +588,7 @@ class ImportTransaction:
             backup = self.root / "database-before.sqlite"
             verified_before: dict[int, bytes] = {}
             verified_database = None
-            if self.journal["version"] == 2:
+            if self.journal["version"] in {2, 3}:
                 database_before = self.journal["database_before"]
                 verified_database = _read_verified_file(
                     backup, database_before["size"],
@@ -548,29 +603,34 @@ class ImportTransaction:
                 raise StoreError(
                     "import_recovery_required",
                     "import database rollback image is missing")
+            restore_mode = self.journal.get(
+                "database_before", {}).get("restore_mode", "sqlite")
             verified_backup = backup
-            if verified_database is not None:
+            if verified_database is not None and restore_mode == "raw":
+                _write_file(self.database, verified_database)
+            elif verified_database is not None:
                 verified_backup = self.root / (
                     f"verified-database-before-{uuid.uuid4().hex}.sqlite")
                 _write_file(verified_backup, verified_database)
-            source = sqlite3.connect(str(verified_backup))
-            if source.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-                source.close()
-                raise StoreError(
-                    "import_recovery_required",
-                    "import database rollback image is corrupt")
-            target = sqlite3.connect(str(self.database))
-            try:
-                source.backup(target)
-                target.commit()
-            finally:
-                target.close()
-                source.close()
-                if verified_backup != backup:
-                    try:
-                        verified_backup.unlink()
-                    except FileNotFoundError:
-                        pass
+            if restore_mode != "raw":
+                source = sqlite3.connect(str(verified_backup))
+                if source.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                    source.close()
+                    raise StoreError(
+                        "import_recovery_required",
+                        "import database rollback image is corrupt")
+                target = sqlite3.connect(str(self.database))
+                try:
+                    source.backup(target)
+                    target.commit()
+                finally:
+                    target.close()
+                    source.close()
+                    if verified_backup != backup:
+                        try:
+                            verified_backup.unlink()
+                        except FileNotFoundError:
+                            pass
             for suffix in ("-wal", "-shm"):
                 try:
                     Path(f"{self.database}{suffix}").unlink()
@@ -583,7 +643,7 @@ class ImportTransaction:
                 if record["had_before"]:
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     data = (verified_before[index]
-                            if self.journal["version"] == 2
+                            if self.journal["version"] in {2, 3}
                             else (self.root / record["before"]).read_bytes())
                     _write_file(
                         target_path, data)
@@ -619,9 +679,15 @@ def recover_import_transactions(database: Path, *,
     """Roll back one authenticated transaction; never guess a lineage."""
     database = database.resolve(strict=False)
     recovered = []
-    pattern = f".{database.name}.import-*"
+    for root in sorted(database.parent.glob(_preparing_pattern(database))):
+        if root.is_symlink() or not root.is_dir():
+            raise StoreError(
+                "import_recovery_required",
+                f"unsafe import preparation root: {root.name}")
+        shutil.rmtree(root)
+        _fsync_directory(database.parent)
     unfinished: list[ImportTransaction] = []
-    for root in sorted(database.parent.glob(pattern)):
+    for root in sorted(database.parent.glob(_transaction_pattern(database))):
         if root.is_symlink():
             raise StoreError(
                 "import_recovery_required",
@@ -632,10 +698,10 @@ def recover_import_transactions(database: Path, *,
         try:
             os.lstat(journal_path)
         except FileNotFoundError:
-            # The phase journal is the final prepare step. Without it no
-            # caller was allowed to start the database transaction.
-            shutil.rmtree(root, ignore_errors=True)
-            continue
+            raise StoreError(
+                "import_recovery_required",
+                "published import transaction has no phase journal; preserve "
+                f"{root.name} for manual recovery")
         transaction = ImportTransaction.open(database, root)
         phase = transaction.journal.get("phase")
         if phase in {"COMPLETED", "ROLLED_BACK"}:

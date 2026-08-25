@@ -294,9 +294,13 @@ class GameAndReleaseTests(unittest.TestCase):
 
         def save_slot_async(self, *args):
             self.saves.append(args)
+            value = args[3]
             return completed({
                 "ok": True, "state_apply": "committed",
-                "value": args[3]})
+                "value": value,
+                "value_hash": LocalGameStore._state_value_hash({
+                    "state": value, "state_version": value["version"],
+                    "ruleset_version": args[4]})})
 
         def submit_score_reliable_async(self, *args, **kwargs):
             self.submissions.append((args, kwargs))

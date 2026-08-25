@@ -45,12 +45,13 @@ class Snake(BaseGame):
 
     def __init__(self, backend: Optional[GameDataService] = None,
                  player: str = "anonymous",
-                 profile_id: Optional[str] = None):
+                 profile_id: Optional[str] = None, rng=None):
         # Render and process input at 60 FPS; movement has its own timer.
         # Tying both to the old 12 FPS movement rate made early input feel
         # abrupt and prevented us from expressing an explicit level curve.
         super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player,
                          profile_id=profile_id)
+        self.rng = rng or random
         self.reset()
 
     def reset(self):
@@ -73,7 +74,7 @@ class Snake(BaseGame):
         occupied = set(self.body)
         empties = [(x, y) for y in range(ROWS) for x in range(COLS)
                    if (x, y) not in occupied]
-        return random.choice(empties) if empties else None
+        return self.rng.choice(empties) if empties else None
 
     def update(self, dt: float):
         if self.state != "playing":

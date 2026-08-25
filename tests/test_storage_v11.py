@@ -521,7 +521,11 @@ class StateAndGameTests(unittest.TestCase):
         self.assertEqual(after, before)
         backend.claim.set_result({
             "ok": True, "state_apply": "committed",
-            "value": backend.claim_state})
+            "value": backend.claim_state,
+            "value_hash": LocalGameStore._state_value_hash({
+                "state": backend.claim_state,
+                "state_version": backend.claim_state["version"],
+                "ruleset_version": GAME_BY_ID["2048"].ruleset_version})})
         game._poll_slot_save()
         self.assertEqual(game.slot_load_state, "ready")
         pygame.display.quit()

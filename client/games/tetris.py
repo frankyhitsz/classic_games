@@ -642,9 +642,27 @@ class Tetris(BaseGame):
                       color=COLORS["accent"])
         # Controls
         hold_text = self.held_kind or "—"
-        draw_text(self.screen, f"保留: {hold_text} · C 交换",
+        hold_label = (f"保留: {hold_text} · C 交换"
+                      if self.held_kind is None else "保留 · C 交换")
+        draw_text(self.screen, hold_label,
                   (rect2.x + 16, rect2.y + 150), size=12,
                   color=COLORS["accent"])
+        if self.held_kind is not None:
+            held_cells = SHAPES[self.held_kind][0]
+            held_color = GAME_COLORS["tetris"][
+                "IOTSZJL".index(self.held_kind)]
+            held_xs = [cell[0] for cell in held_cells]
+            held_ys = [cell[1] for cell in held_cells]
+            mini = 11
+            held_width = (max(held_xs) - min(held_xs) + 1) * mini
+            held_ox = rect2.right - 12 - held_width - min(held_xs) * mini
+            held_oy = rect2.y + 148 - min(held_ys) * mini
+            for cell_x, cell_y in held_cells:
+                pygame.draw.rect(
+                    self.screen, held_color,
+                    pygame.Rect(held_ox + cell_x * mini,
+                                held_oy + cell_y * mini, mini - 1, mini - 1),
+                    border_radius=2)
         draw_text(self.screen, "←→移动 ↑旋 ↓软降",
                   (rect2.x + 16, rect2.y + 168), size=12,
                   color=COLORS["text_dim"])

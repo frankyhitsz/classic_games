@@ -1,5 +1,26 @@
 # 更新记录
 
+## 0.8.0
+
+- POSIX application lease 增加 transition gate 与 shared-lease 后二次 transaction 扫描，不再依赖
+  `flock` EX→SH 转换本身原子；control file 拒绝额外 hard link。
+- ImportTransaction 分开 `.preparing-*` 与已发布 `.import-*`；缺 journal 的已发布 root 保留证据并阻止
+  启动。坏库 replace 可使用 authenticated raw rollback v3，普通 import 继续使用 v2。
+- state journal 永久语义错误不再绕过 journal 写 SQLite；import planner 与在线 outbox 共用
+  duplicate/superseded/merge/conflict resolver，同 identity 不同 payload 拒绝整次导入。
+- prepared reject 在 target 缺失或损坏时恢复 previous；reject 无法完成时报告 SUPERSEDED 或
+  RECOVERY_REQUIRED。score/state/clock orphan temp 在 grace window 后安全提升、合并或隔离。
+- legacy pending 改为 no-follow 读取；database、lease 与默认 outbox 统一 canonical identity；构造失败
+  显式释放 application session，损坏 score target 可在保留 evidence 后重新发布。
+- Archive v3 按自身 format 分派并允许历史 catalog 子集；当前 ruleset 严格校验，历史 ruleset
+  preserve-only。replace 在旁路生成 fresh DB，坏目标数据库也可恢复。
+- legacy transaction v1 的 CLI 恢复必须绑定导出的 evidence 文件与 SHA-256；CI 固定 pip 并让所有 dev
+  matrix 使用 release constraints。
+- 2048 claim ACK 增加 slot revision 与 authoritative value hash 核对，单档案继续采用单活动 autosave 槽。
+- 推箱子练习保存 campaign board 并可按 C 返回，两个 progress Future 分离，practice schema 不再接受
+  unlock，结果页显示练习成绩。
+- Snake 与 Zuma 支持注入 RNG；俄罗斯方块 hold 区显示方块图形；包版本升为 0.8.0。
+
 ## 0.7.0
 
 - 启动恢复将 exclusive application lease 原子交接为 shared session，不再在 import recovery 与数据库

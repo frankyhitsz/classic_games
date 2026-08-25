@@ -389,9 +389,13 @@ class BackendAndGameTests(unittest.TestCase):
             self.saves.append(args)
             if self.block:
                 return Future()
+            value = args[3]
             return completed({
                 "ok": True, "state_apply": "committed",
-                "value": args[3]})
+                "value": value,
+                "value_hash": LocalGameStore._state_value_hash({
+                    "state": value, "state_version": value["version"],
+                    "ruleset_version": args[4]})})
 
         def leaderboard(self, *_args, **_kwargs):
             return []

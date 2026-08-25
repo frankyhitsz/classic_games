@@ -22,7 +22,8 @@ Flask API 作为可选适配器保留。
 可按 T 重试、按 N 两次确认新开，或按 Esc 返回菜单，不会把读取故障当成空存档。
 终局存档会恢复原棋盘和结果页，不会自动换成随机新局。同一档案已有另一个活动中的 2048
 窗口时，新窗口会停止写入；按 K 会重新读取存档，再以 owner epoch、slot revision 和完整内容
-hash 做原子接管，或可按 Esc 返回。
+hash 做原子接管，ACK 还必须返回相同 revision 与权威 value hash，或可按 Esc 返回。每个档案只有一个
+2048 `autosave` 槽，因此同一档案只允许一个活动 2048 窗口。
 若启动器读取最近档案失败，点击游戏会重试读取；也可以按 G 明确改用 guest。
 
 ## 环境要求
@@ -101,10 +102,10 @@ python -m client.games.zuma
 
 | 游戏 | 操作 | 其他按键 |
 | --- | --- | --- |
-| 俄罗斯方块 | ←/→ 移动，↑/X 顺时针旋转，Z 逆时针旋转，↓ 软降，空格硬降 | P 暂停，R 重开，Esc 返回菜单 |
+| 俄罗斯方块 | ←/→ 移动，↑/X 顺时针旋转，Z 逆时针旋转，↓ 软降，空格硬降 | C 保留/交换，P 暂停，R 重开，Esc 返回菜单 |
 | 贪吃蛇 | 方向键或 WASD | P 暂停，R 重开，Esc 返回菜单 |
 | 2048 | 方向键、WASD 或鼠标滑动 | R 重开，C 在达成 2048 后继续，Esc 返回菜单 |
-| 推箱子 | 方向键或 WASD | U/退格撤销，R 重置，K 前往已解锁最高关，N 跳关（练习），Esc 返回菜单 |
+| 推箱子 | 方向键或 WASD | U/退格撤销，R 重置，K 前往已解锁最高关，N 跳关（练习），C 返回闯关，Esc 返回菜单 |
 | 祖玛 | 鼠标瞄准，左键发射，右键或 S 切换备弹 | N/回车下一关，R 重开，P 暂停，Esc 返回菜单 |
 
 ## 测试
@@ -165,7 +166,8 @@ classic_games/
 │   ├── test_storage_v9.py
 │   ├── test_storage_v10.py
 │   ├── test_storage_v11.py
-│   └── test_storage_v12.py
+│   ├── test_storage_v12.py
+│   └── test_storage_v13.py
 ├── docs/               # 审查记录、设计决策和维护文档
 ├── pyproject.toml
 ├── environment.yml
@@ -195,6 +197,8 @@ classic_games/
 `pending-state-quarantine/`；v1 升级原件保存在 `pending-state-migration-backup/`。替换同一状态键前会先
 持久化 reject v3 prepared marker；数据库永久拒绝新值时，即使中途退出也能恢复上一条 pending。
 `pending/`、`pending-state/` 及其 quarantine/migration 目录不能是符号链接或 Windows reparse point。
+完整但未发布的 score/state temp 在跨进程写入 grace window 后会提升或合并；冲突 temp 进入 quarantine，
+未到期 temp 会让 complete export 明确失败，避免扫描器抢走仍在写入的文件。
 
 查看和迁移本机数据时，可以先使用下列命令。数据维护要求先关闭启动器和游戏；后端的进程级
 lease 会阻止导出遗漏尚在 worker 队列中的动作。archive v3 同时包含已提交表和 active
@@ -232,7 +236,9 @@ python -m game_service.data_cli import classic-games-backup.json --apply
 ```
 
 普通 `import` 是严格合并。要把数据库和 active pending 恢复到一个完整 archive 的状态，可使用
-替换模式；它会先保存当前数据库及 journal 回滚镜像，缺少完整性标记的旧 archive 不允许替换：
+替换模式；它先在旁路生成并验证全新的当前 schema 数据库，再通过 authenticated transaction 原子替换。
+即使目标是非 SQLite 或严重损坏的文件，也会把原始 bytes 保存为 rollback evidence；缺少完整性标记的旧
+archive 不允许替换：
 
 ```bash
 python -m game_service.data_cli restore-replace classic-games-backup.json --apply
@@ -249,8 +255,15 @@ python -m game_service.data_cli recover-transactions --apply
 ```
 
 transaction v1 没有 staged/before/rollback hash，普通启动不会自动使用这些字节。保存
-`export-transaction` 证据并人工核对后，才可显式运行
-`recover-transactions --apply --allow-legacy-v1`。同时出现多份未完成事务时工具不会猜测 rollback 顺序。
+`export-transaction` 证据并人工核对后，必须把命令返回的 SHA-256 一并提供，才可显式运行：
+
+```bash
+python -m game_service.data_cli recover-transactions --apply --allow-legacy-v1 \
+  --evidence import-txn.json --evidence-sha256 <sha256>
+```
+
+同时出现多份未完成事务时工具不会猜测 rollback 顺序。准备期使用 `.preparing-*`；只有 journal 完整发布
+后才改名为 `.import-*`。已发布目录缺 journal 时会保留 rollback evidence 并阻止启动。
 
 事务 v2 对 SQLite rollback image、staged 和 before 文件校验 size/sha256，并直接使用同一次验证返回
 的 bytes；发布时还会确认目标自 prepare 后未变化。同一目标的相同内容会去重，不同内容会拒绝整次

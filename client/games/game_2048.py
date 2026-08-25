@@ -21,6 +21,7 @@ Controls:
 """
 from __future__ import annotations
 
+import hashlib
 import random
 import uuid
 from collections import deque
@@ -32,7 +33,7 @@ import pygame
 from client.common.ui import (COLORS, SAVE_PENDING, SAVE_SAVING, BaseGame, Button,
                               draw_gradient_bg, draw_text, ease_out_back,
                               ease_out_cubic)
-from game_service.mutation import MAX_SCORE
+from game_service.mutation import MAX_SCORE, canonical_json
 from game_service.save_slot_validation import validate_2048_state
 from game_service.store import StoreError
 from game_service.service import (GameDataService, SaveState, SlotLoadResult,
@@ -128,6 +129,8 @@ class Game2048(BaseGame):
         self._slot_expected_owner_epoch: Optional[int] = None
         self._slot_expected_revision: Optional[int] = None
         self._slot_expected_value_hash: Optional[str] = None
+        self._slot_claim_revision: Optional[int] = None
+        self._slot_claim_value_hash: Optional[str] = None
         self._slot_conflict_saved = None
         self._slot_conflict_owner: Optional[str] = None
         self._takeover_reload_expected = None
@@ -469,6 +472,15 @@ class Game2048(BaseGame):
         self._autosave_dirty_since = 0
         self._autosave_release_queued = False
         state = self._build_autosave_state(owner_status)
+        if self.slot_load_state == "claiming":
+            self._slot_claim_revision = state["slot_revision"]
+            claimed_value = {
+                "state": state,
+                "state_version": state["version"],
+                "ruleset_version": self.attempt_context.ruleset_version,
+            }
+            self._slot_claim_value_hash = hashlib.sha256(
+                canonical_json(claimed_value).encode("utf-8")).hexdigest()
         try:
             self._slot_save_future = save_slot(
                 self.profile_id, self.game_id, "autosave", state,
@@ -526,6 +538,8 @@ class Game2048(BaseGame):
         self._slot_expected_owner_epoch = None
         self._slot_expected_revision = None
         self._slot_expected_value_hash = None
+        self._slot_claim_revision = None
+        self._slot_claim_value_hash = None
 
     def _claim_result_is_authoritative(self, result) -> bool:
         if (not isinstance(result, dict)
@@ -537,7 +551,9 @@ class Game2048(BaseGame):
         return (isinstance(value, dict)
                 and value.get("owner_status") == "active"
                 and value.get("owner_token") == self._slot_owner_token
-                and value.get("owner_epoch") == self._slot_owner_epoch)
+                and value.get("owner_epoch") == self._slot_owner_epoch
+                and value.get("slot_revision") == self._slot_claim_revision
+                and result.get("value_hash") == self._slot_claim_value_hash)
 
     def _reload_after_unproven_claim(self, message: str) -> None:
         self._slot_save_pending = False

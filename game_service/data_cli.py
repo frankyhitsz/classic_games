@@ -27,7 +27,8 @@ from .import_transaction import (FileOperation, ImportTransaction,
 from .local_backend import (MAX_SPOOL_FILE_BYTES, PendingSaveEnvelope,
                             PersistentSaveOutbox, PersistentStateOutbox)
 from .maintenance import (MaintenanceBusyError, inactive_application_lock,
-                          maintenance_lock, application_lock_path, lock_path)
+                          maintenance_lock, application_lock_path,
+                          application_transition_lock_path, lock_path)
 from .mutation import MutationError, canonical_json
 from .profile import ProfileIdentity, ProfileIdentityError
 from .progress import ProgressPolicyError, validate_progress
@@ -130,6 +131,7 @@ def _recovery_paths(database: Path) -> list[Path]:
         "pending-migration-backup", "pending-state-migration-backup",
         "pending_saves.json.migrated-",
         "imported-recovery", f".{database.name}.import-",
+        f".{database.name}.preparing-",
     )
     try:
         entries = list(parent.iterdir())
@@ -143,6 +145,7 @@ def _recovery_paths(database: Path) -> list[Path]:
 def _recovery_source(database: Path, name: str) -> str:
     mappings = (
         (f".{database.name}.import-", "import_transaction"),
+        (f".{database.name}.preparing-", "import_preparation"),
         (f"{database.name}.backup-", "database_backup"),
         (f"{database.name}.corrupt-", "corrupt_database"),
         ("pending-quarantine", "score_quarantine"),
@@ -180,6 +183,7 @@ def _guard_export_target(database: Path, requested: Path, *, force: bool) -> Pat
           for suffix in ("-wal", "-shm", "-journal")),
         _canonical_path(lock_path(database)),
         _canonical_path(application_lock_path(database)),
+        _canonical_path(application_transition_lock_path(database)),
         _canonical_path(database.with_name("pending_saves.json")),
     }
     protected_directories = [
@@ -210,8 +214,16 @@ def _guard_export_target(database: Path, requested: Path, *, force: bool) -> Pat
 
 def _active_protocol_report(database: Path) -> dict:
     """List unresolved active journals that a complete snapshot cannot omit."""
-    _score_path, state_path = _pending_paths(database)
+    score_path, state_path = _pending_paths(database)
     candidates = [database.with_name("pending_saves.json")]
+    try:
+        with os.scandir(score_path) as entries:
+            candidates.extend(
+                Path(entry.path) for entry in entries
+                if entry.name.startswith(".")
+                and entry.name.endswith((".tmp", ".upgrade")))
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        pass
     try:
         with os.scandir(state_path) as entries:
             candidates.extend(
@@ -219,7 +231,7 @@ def _active_protocol_report(database: Path) -> dict:
                 if (entry.name.startswith(".reject-")
                     and entry.name.endswith((".txn", ".tmp")))
                 or (entry.name.startswith(".")
-                    and entry.name.endswith(".restore")))
+                    and entry.name.endswith((".restore", ".tmp"))))
     except (FileNotFoundError, NotADirectoryError, OSError):
         pass
     unresolved = []
@@ -232,8 +244,9 @@ def _active_protocol_report(database: Path) -> dict:
             unresolved.append({"path": path.name, "reason": "unreadable"})
             continue
         unresolved.append({
-            "path": (path.name if path.parent == database.parent else
-                     f"pending-state/{path.name}"),
+            "path": (
+                path.name if path.parent == database.parent
+                else f"{path.parent.name}/{path.name}"),
             "reason": ("unsafe_type" if not stat.S_ISREG(metadata.st_mode)
                        else "unfinished_transaction"),
             "size": metadata.st_size,
@@ -414,12 +427,54 @@ def inspect_transactions(database: Path) -> dict:
                 "COMPLETED", "ROLLED_BACK"} for item in transactions)}
 
 
-def recover_transactions_data(database: Path, *,
-                              allow_legacy_v1: bool = False) -> dict:
+def _validated_transaction_evidence(
+        database: Path, evidence: Path, expected_hash: str) -> str:
+    if (not isinstance(expected_hash, str) or len(expected_hash) != 64
+            or any(char not in "0123456789abcdef" for char in expected_hash)):
+        raise StoreError(
+            "invalid_transaction_evidence", "evidence SHA-256 is required")
+    raw = _read_regular_nofollow(evidence, MAX_ARCHIVE_BYTES)
+    if hashlib.sha256(raw).hexdigest() != expected_hash:
+        raise StoreError(
+            "transaction_evidence_mismatch", "transaction evidence hash differs")
+    try:
+        payload = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_json_constant)
+    except (UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        raise StoreError(
+            "invalid_transaction_evidence", "transaction evidence is invalid") from exc
+    if (not isinstance(payload, dict)
+            or payload.get("format")
+            != "classic-games-import-transaction-evidence-v1"
+            or payload.get("database") != database.name
+            or payload.get("complete") is not True
+            or not isinstance(payload.get("transaction"), str)):
+        raise StoreError(
+            "invalid_transaction_evidence", "transaction evidence is incomplete")
+    return payload["transaction"]
+
+
+def recover_transactions_data(
+        database: Path, *, allow_legacy_v1: bool = False,
+        evidence: Path | None = None, evidence_sha256: str | None = None,
+) -> dict:
     database = database.expanduser().resolve(strict=False)
     try:
         with (inactive_application_lock(database, timeout=2.0),
               maintenance_lock(database, exclusive=True, timeout=2.0)):
+            if allow_legacy_v1:
+                if evidence is None or evidence_sha256 is None:
+                    raise StoreError(
+                        "transaction_evidence_required",
+                        "legacy v1 recovery requires exported evidence and SHA-256")
+                transaction_name = _validated_transaction_evidence(
+                    database, evidence, evidence_sha256)
+                roots = list(database.parent.glob(
+                    f".{database.name}.import-*"))
+                if len(roots) != 1 or roots[0].name != transaction_name:
+                    raise StoreError(
+                        "transaction_evidence_mismatch",
+                        "evidence does not name the unfinished transaction")
             recovered = recover_import_transactions(
                 database, allow_legacy_v1=allow_legacy_v1)
     except MaintenanceBusyError as exc:
@@ -516,9 +571,11 @@ def export_transaction_data(database: Path, transaction_name: str,
             temporary.unlink()
         except FileNotFoundError:
             pass
+    evidence_sha256 = hashlib.sha256(encoded).hexdigest()
     return {"ok": True, "output": str(output),
             "transaction": transaction_name, "files": len(files),
-            "bytes": len(encoded), "complete": payload["complete"]}
+            "bytes": len(encoded), "complete": payload["complete"],
+            "sha256": evidence_sha256}
 
 
 def cleanup_recovery_data(database: Path, *, older_than_days: int,
@@ -887,6 +944,25 @@ def _publish_output(database: Path, output: Path, encoded: bytes, *,
             pass
 
 
+def _archive_ruleset_catalog(tables: dict[str, list[dict]]) -> dict[str, str]:
+    """Include removed games still represented by committed archive rows."""
+    catalog = {
+        game_id: GAME_BY_ID[game_id].ruleset_version
+        for game_id in sorted(VALID_GAME_IDS)
+    }
+    for table in ("attempts", "progress", "save_slots"):
+        for row in tables.get(table, []):
+            game_id = row.get("game_id")
+            ruleset = row.get("ruleset_version")
+            if game_id not in catalog and isinstance(ruleset, str):
+                catalog[game_id] = ruleset
+    if not _valid_ruleset_catalog(catalog):
+        raise StoreError(
+            "invalid_archive_source",
+            "committed game or ruleset identifiers cannot be archived safely")
+    return dict(sorted(catalog.items()))
+
+
 def export_data(database: Path, output: Path,
                 include_recovery: bool = False, *, force: bool = False,
                 allow_partial: bool = False) -> dict:
@@ -1004,9 +1080,7 @@ def export_data(database: Path, output: Path,
             "application": {
                 "id": "classic-games-hub",
                 "version": PACKAGE_VERSION,
-                "rulesets": {
-                    game_id: GAME_BY_ID[game_id].ruleset_version
-                    for game_id in sorted(VALID_GAME_IDS)},
+                "rulesets": _archive_ruleset_catalog(tables),
             },
             "reader": {
                 "min_version": MANIFEST_FORMAT_VERSION,
@@ -1065,7 +1139,7 @@ def _load_archive(path: Path) -> dict:
             or not isinstance(archive.get("tables"), dict)):
         raise StoreError("invalid_archive", "unsupported archive format")
     version = archive["archive_version"]
-    if version in {2, ARCHIVE_VERSION}:
+    if version in {2, 3}:
         for table in IMPORT_TABLES:
             rows = archive["tables"].get(table, [])
             if (not isinstance(rows, list)
@@ -1093,8 +1167,8 @@ def _load_archive(path: Path) -> dict:
         if not isinstance(manifest, dict):
             raise StoreError("invalid_archive", "archive manifest is missing")
         manifest_format = manifest.get("format_version")
-        if version == ARCHIVE_VERSION:
-            if manifest_format != MANIFEST_FORMAT_VERSION:
+        if version == 3:
+            if manifest_format != 3:
                 raise StoreError(
                     "invalid_archive", "archive v3 requires manifest format 3")
             _validate_current_manifest(archive)
@@ -1144,7 +1218,13 @@ def _load_archive(path: Path) -> dict:
 
 def _valid_ruleset_catalog(value) -> bool:
     return (isinstance(value, dict)
-            and set(value) == set(VALID_GAME_IDS)
+            and bool(value)
+            and all(isinstance(game_id, str)
+                    and 1 <= len(game_id) <= 64
+                    and all(char.isascii()
+                            and (char.isalnum() or char in "-_.")
+                            for char in game_id)
+                    for game_id in value)
             and all(isinstance(item, str) and 1 <= len(item) <= 32
                     and all(char.isascii()
                             and (char.isalnum() or char in "-_.")
@@ -1172,14 +1252,14 @@ def _validate_current_manifest(archive: dict) -> None:
             or not _valid_ruleset_catalog(application.get("rulesets"))):
         raise StoreError(
             "invalid_archive", "archive application or rulesets are inconsistent")
-    if format_version == MANIFEST_FORMAT_VERSION:
+    if format_version == 3:
         reader = manifest.get("reader")
         if (not isinstance(application.get("version"), str)
                 or not application["version"]
                 or not isinstance(reader, dict)
                 or type(reader.get("min_version")) is not int
                 or type(reader.get("max_version")) is not int
-                or not reader["min_version"] <= MANIFEST_FORMAT_VERSION
+                or not reader["min_version"] <= format_version
                 <= reader["max_version"]
                 or not isinstance(reader.get("required_capabilities"), list)
                 or any(not isinstance(capability, str)
@@ -1360,7 +1440,10 @@ def _existing_attempt_collision(
         + " LIMIT 1", params).fetchone()
 
 
-def _semantic_row_check(table: str, row: dict) -> None:
+def _semantic_row_check(
+        table: str, row: dict,
+        archive_rulesets: dict[str, str] | None = None,
+) -> None:
     for key, value in row.items():
         if key.endswith("_at") and (type(value) not in (int, float)
                                     or not math.isfinite(float(value))
@@ -1387,17 +1470,44 @@ def _semantic_row_check(table: str, row: dict) -> None:
         decoded[field] = json.loads(
             raw, parse_constant=_reject_json_constant)
         _validate_json_shape(decoded[field])
+    if table in {"attempts", "progress", "save_slots"}:
+        game_id = row.get("game_id")
+        if not isinstance(game_id, str) or not game_id:
+            raise ValueError("invalid game identifier")
+        if (isinstance(archive_rulesets, dict)
+                and game_id not in archive_rulesets):
+            raise ValueError("row game is absent from the archive ruleset catalog")
+        if archive_rulesets is None and game_id not in VALID_GAME_IDS:
+            raise ValueError("unknown game in a legacy archive")
     if table == "progress":
-        validate_progress(row["game_id"], row["key"], decoded["value_json"])
+        game_id = row["game_id"]
+        ruleset = row.get("ruleset_version")
+        known_in_archive = (
+            isinstance(archive_rulesets, dict) and game_id in archive_rulesets)
+        if game_id not in VALID_GAME_IDS and not known_in_archive:
+            raise ValueError("unknown progress game")
+        if (game_id in VALID_GAME_IDS
+                and ruleset == GAME_BY_ID[game_id].ruleset_version):
+            validate_progress(game_id, row["key"], decoded["value_json"])
+        elif not isinstance(decoded["value_json"], dict):
+            raise ValueError("historical progress must remain an object")
     if table == "save_slots":
-        if row.get("game_id") not in VALID_GAME_IDS:
+        game_id = row.get("game_id")
+        known_in_archive = (
+            isinstance(archive_rulesets, dict) and game_id in archive_rulesets)
+        if game_id not in VALID_GAME_IDS and not known_in_archive:
             raise ValueError("unknown save-slot game")
         state = decoded["state_json"]
         expected_version = (
             state.get("version", 1) if isinstance(state, dict) else 1)
         if expected_version != row.get("state_version"):
             raise ValueError("save state version metadata does not match")
-        validate_save_slot_payload(row["game_id"], state)
+        if (game_id in VALID_GAME_IDS
+                and row.get("ruleset_version")
+                == GAME_BY_ID[game_id].ruleset_version):
+            validate_save_slot_payload(game_id, state)
+        elif not isinstance(state, dict):
+            raise ValueError("historical save state must remain an object")
 
 
 def _insert_columns(table: str, row: dict) -> list[str]:
@@ -1424,6 +1534,8 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
         table: {} for table in IMPORT_TABLES}
     attempt_seen: dict[tuple[str, object], str] = {}
     errors: list[str] = []
+    archive_rulesets = archive.get("manifest", {}).get(
+        "application", {}).get("rulesets")
     with store.connection() as connection:
         for table in IMPORT_TABLES:
             allowed = store._table_columns(connection, table)
@@ -1435,7 +1547,7 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
                     errors.append(f"{table}[{index}] has unknown columns")
                     continue
                 try:
-                    _semantic_row_check(table, row)
+                    _semantic_row_check(table, row, archive_rulesets)
                 except (KeyError, TypeError, ValueError, ProfileIdentityError,
                         ProgressPolicyError, StoreError, json.JSONDecodeError):
                     result[table]["invalid"] += 1
@@ -1549,10 +1661,9 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
                 f"{hashlib.sha256(operation['key'].encode('utf-8')).hexdigest()}"
                 ".json")
             if target.is_file():
-                existing = PersistentStateOutbox._parse(target.read_bytes())
-                if operation["kind"] == existing["kind"] == "progress":
-                    PersistentStateOutbox._merge_progress_operations(
-                        existing, operation)
+                existing = PersistentStateOutbox._parse(
+                    _read_bounded_target(target, MAX_SPOOL_FILE_BYTES))
+                PersistentStateOutbox.resolve_operations(existing, operation)
         except (StoreError, TypeError, ValueError, MutationError,
                 RecursionError, OSError, UnicodeError, json.JSONDecodeError):
             errors.append(f"pending_state[{index}] is invalid")
@@ -1561,8 +1672,10 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
     except StoreError as exc:
         errors.append(f"recovery evidence is invalid: {exc.message}")
     file_operations: list[FileOperation] = []
+    pending_resolution: dict[str, int] = {}
     try:
-        file_operations = _planned_file_operations(database, archive)
+        file_operations = _planned_file_operations(
+            database, archive, pending_resolution)
         with store.connection() as connection:
             _preview_pending_against_target(
                 database, connection, plan, file_operations)
@@ -1586,6 +1699,7 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
         "pending": {
             "scores": len(archive["pending_scores"]),
             "state": len(archive["pending_state"]),
+            "state_resolution": pending_resolution,
         },
         "plan_fingerprint": plan_fingerprint,
         "archive_completeness": {
@@ -1763,7 +1877,10 @@ def _read_bounded_target(path: Path, limit: int) -> bytes:
         ) from exc
 
 
-def _planned_file_operations(database: Path, archive: dict) -> list[FileOperation]:
+def _planned_file_operations(
+        database: Path, archive: dict,
+        state_resolution: dict[str, int] | None = None,
+) -> list[FileOperation]:
     """Build final pending/evidence bytes without changing the target."""
     score_path, state_path = _pending_paths(database)
     score_values: dict[Path, PendingSaveEnvelope] = {}
@@ -1807,12 +1924,14 @@ def _planned_file_operations(database: Path, archive: dict) -> list[FileOperatio
             current = PersistentStateOutbox._parse(
                 _read_bounded_target(target, MAX_SPOOL_FILE_BYTES))
         if current is not None:
-            if operation["kind"] == current["kind"] == "progress":
-                operation = PersistentStateOutbox._merge_progress_operations(
-                    current, operation)
-            elif (PersistentStateOutbox._order(operation)
-                  <= PersistentStateOutbox._order(current)):
-                operation = current
+            operation, resolution = PersistentStateOutbox.resolve_operations(
+                current, operation)
+            if state_resolution is not None:
+                state_resolution[resolution] = (
+                    state_resolution.get(resolution, 0) + 1)
+        elif state_resolution is not None:
+            state_resolution["incoming"] = (
+                state_resolution.get("incoming", 0) + 1)
         state_values[target] = operation
 
     operations = [
@@ -1995,11 +2114,11 @@ def _replacement_plan(database: Path, archive: dict):
                 current = [
                     Path(entry.path) for entry in iterator
                     if (entry.name.endswith(".json")
+                        or entry.name.startswith(".")
+                        and entry.name.endswith((".tmp", ".upgrade", ".restore"))
                         or pending_path.name == "pending-state"
-                        and ((entry.name.startswith(".reject-")
-                              and entry.name.endswith((".txn", ".tmp")))
-                             or (entry.name.startswith(".")
-                                 and entry.name.endswith(".restore"))))]
+                        and entry.name.startswith(".reject-")
+                        and entry.name.endswith(".txn"))]
         except (FileNotFoundError, NotADirectoryError):
             current = []
         for target in current:
@@ -2017,8 +2136,46 @@ def _replacement_plan(database: Path, archive: dict):
     return preview, plan, files, expected_schema
 
 
+def _materialize_replacement_database(
+        path: Path, plan: dict, expected_schema: dict,
+) -> dict[str, int]:
+    """Build and verify a fresh current-schema database without touching target."""
+    store = LocalGameStore(path)
+    inserted = {}
+    with store.connection(timeout_ms=5000) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        for table in IMPORT_TABLES:
+            before = connection.total_changes
+            for row in plan[table]:
+                _insert_row(connection, table, row)
+            inserted[table] = connection.total_changes - before
+        store._seed_state_baselines(connection, missing_only=True)
+        violation = connection.execute("PRAGMA foreign_key_check").fetchone()
+        if violation is not None:
+            raise StoreError(
+                "invalid_archive", "archive violates data relationships")
+        actual_schema = {
+            (row[0], row[1]): (row[2], row[3])
+            for row in connection.execute(
+                "SELECT type,name,tbl_name,sql FROM sqlite_master "
+                "WHERE type IN ('table','index','trigger','view') "
+                "AND name NOT LIKE 'sqlite_%'")
+        }
+        if actual_schema != expected_schema:
+            raise StoreError(
+                "schema_replacement_failed",
+                "fresh replacement database has an unexpected schema")
+        connection.commit()
+    with store.connection() as connection:
+        if connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise StoreError(
+                "schema_replacement_failed",
+                "fresh replacement database failed integrity checking")
+    return inserted
+
+
 def restore_replace_data(database: Path, archive_path: Path) -> dict:
-    """Replace active local data from a complete archive, with rollback."""
+    """Atomically replace active data from a complete archive, with rollback."""
     database = database.expanduser().resolve(strict=False)
     archive = _load_archive(archive_path)
     if (archive.get("archive_version") != ARCHIVE_VERSION
@@ -2030,7 +2187,6 @@ def restore_replace_data(database: Path, archive_path: Path) -> dict:
         with (inactive_application_lock(database, timeout=2.0),
               maintenance_lock(database, exclusive=True, timeout=2.0)):
             recovered = recover_import_transactions(database)
-            store = LocalGameStore(database)
             preview, plan, file_operations, expected_schema = _replacement_plan(
                 database, archive)
             if not preview["ok"]:
@@ -2038,80 +2194,53 @@ def restore_replace_data(database: Path, archive_path: Path) -> dict:
                     "invalid_archive",
                     "archive cannot be restored into an empty current database",
                     details={"preview": preview})
-            backup = store._backup_database(store.schema_version())
-            transaction = ImportTransaction.prepare(database, file_operations)
-            inserted = {}
-            try:
-                with store.connection(timeout_ms=5000) as connection:
-                    connection.execute("BEGIN IMMEDIATE")
-                    known_tables = {
-                        "schema_meta", "attempts", "save_requests",
-                        "invalid_attempts", "profiles", "invalid_local_state",
-                        "settings", "progress", "save_slots", "state_receipts",
-                        "state_merge_receipts", "sqlite_sequence",
-                    }
-                    explicit_objects = list(connection.execute(
-                        "SELECT type,name FROM sqlite_master WHERE "
-                        "type IN ('index','trigger','view') "
-                        "AND name NOT LIKE 'sqlite_%'"))
-                    for object_type, name in explicit_objects:
-                        quoted = name.replace('"', '""')
-                        connection.execute(
-                            f'DROP {object_type.upper()} "{quoted}"')
-                    unknown_tables = [
-                        row[0] for row in connection.execute(
-                            "SELECT name FROM sqlite_master "
-                            "WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-                        if row[0] not in known_tables]
-                    for table in unknown_tables:
-                        quoted = table.replace('"', '""')
-                        connection.execute(f'DROP TABLE "{quoted}"')
-                    for table in (
-                            "state_merge_receipts", "state_receipts",
-                            "save_requests", *reversed(IMPORT_TABLES)):
-                        connection.execute(f"DELETE FROM {table}")
-                    connection.execute("DELETE FROM sqlite_sequence")
-                    connection.execute(
-                        "DELETE FROM schema_meta WHERE key != 'version'")
-                    for table in IMPORT_TABLES:
-                        before = connection.total_changes
-                        for row in plan[table]:
-                            _insert_row(connection, table, row)
-                        inserted[table] = connection.total_changes - before
-                    store._seed_state_baselines(connection, missing_only=True)
-                    for (object_type, _name), (_table, sql) in sorted(
-                            expected_schema.items()):
-                        if object_type != "table" and sql is not None:
-                            connection.execute(sql)
-                    violation = connection.execute(
-                        "PRAGMA foreign_key_check").fetchone()
-                    if violation is not None:
+            with tempfile.TemporaryDirectory(
+                    prefix=f".{database.name}.fresh-replace-",
+                    dir=database.parent) as directory:
+                fresh_database = Path(directory) / database.name
+                inserted = _materialize_replacement_database(
+                    fresh_database, plan, expected_schema)
+                transaction = ImportTransaction.prepare(
+                    database, file_operations,
+                    allow_raw_database_fallback=True)
+                try:
+                    before = transaction.journal["database_before"]
+                    backup_bytes = _read_regular_nofollow(
+                        transaction.root / before["path"],
+                        MAX_TRANSACTION_TOTAL_BYTES)
+                    stamp = f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+                    backup = database.with_name(
+                        f"{database.name}.backup-replace-{stamp}.sqlite")
+                    _publish_output(
+                        database, backup, backup_bytes, force=False)
+                    for suffix in ("-wal", "-shm", "-journal"):
+                        sidecar = Path(f"{database}{suffix}")
+                        if sidecar.exists() or sidecar.is_symlink():
+                            os.replace(
+                                sidecar,
+                                database.with_name(
+                                    f"{database.name}.backup-replace-"
+                                    f"{stamp}{suffix}"))
+                    os.replace(fresh_database, database)
+                    _fsync_directory(database.parent)
+                    transaction.mark("DB_APPLIED")
+                    transaction.publish_files()
+                except Exception as exc:
+                    try:
+                        transaction.rollback()
+                    except Exception as rollback_exc:
                         raise StoreError(
-                            "invalid_archive",
-                            "archive violates data relationships")
-                    actual_schema = {
-                        (row[0], row[1]): (row[2], row[3])
-                        for row in connection.execute(
-                            "SELECT type,name,tbl_name,sql FROM sqlite_master "
-                            "WHERE type IN ('table','index','trigger','view') "
-                            "AND name NOT LIKE 'sqlite_%'")
-                    }
-                    if actual_schema != expected_schema:
-                        raise StoreError(
-                            "schema_replacement_failed",
-                            "replace restore did not produce the current schema")
-                    connection.commit()
-                transaction.mark("DB_APPLIED")
-                transaction.publish_files()
-            except Exception as exc:
-                transaction.rollback()
+                            "restore_recovery_required",
+                            "replace restore failed and its rollback must be "
+                            "completed by transaction recovery",
+                        ) from rollback_exc
+                    transaction.finish()
+                    if isinstance(exc, StoreError):
+                        raise
+                    raise StoreError(
+                        "restore_rolled_back",
+                        "replace restore failed and was rolled back") from exc
                 transaction.finish()
-                if isinstance(exc, StoreError):
-                    raise
-                raise StoreError(
-                    "restore_rolled_back",
-                    "replace restore failed and was rolled back") from exc
-            transaction.finish()
     except MaintenanceBusyError as exc:
         raise StoreError(
             "maintenance_busy", str(exc), 409, retryable=True) from exc
@@ -2143,6 +2272,8 @@ def _parser() -> argparse.ArgumentParser:
         "--allow-legacy-v1", action="store_true",
         help=("after exporting evidence, explicitly permit rollback from an "
               "unauthenticated version-1 transaction"))
+    recover.add_argument("--evidence", type=Path)
+    recover.add_argument("--evidence-sha256")
     transaction_export = commands.add_parser(
         "export-transaction",
         help="preserve one import transaction as no-follow JSON evidence")
@@ -2207,7 +2338,9 @@ def main(argv: list[str] | None = None) -> int:
                       "error": "run again with --apply to recover transactions"}
         elif args.command == "recover-transactions":
             result = recover_transactions_data(
-                database, allow_legacy_v1=args.allow_legacy_v1)
+                database, allow_legacy_v1=args.allow_legacy_v1,
+                evidence=args.evidence,
+                evidence_sha256=args.evidence_sha256)
         elif args.command == "export-transaction":
             result = export_transaction_data(
                 database, args.transaction, args.output, force=args.force)

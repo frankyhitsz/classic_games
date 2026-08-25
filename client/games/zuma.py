@@ -187,9 +187,10 @@ class Zuma(BaseGame):
 
     def __init__(self, backend: Optional[GameDataService] = None,
                  player: str = "anonymous",
-                 profile_id: Optional[str] = None):
+                 profile_id: Optional[str] = None, rng=None):
         super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player,
                          profile_id=profile_id)
+        self.rng = rng or random
         self.unlocked_level = 1
         self.saved_high_score = 0
         self._progress_generation = 0
@@ -301,8 +302,8 @@ class Zuma(BaseGame):
         self.visual_time = 0.0
         self.state = "playing"
         self.extra = None
-        self.current_color = random.randint(0, NUM_COLORS - 1)
-        self.next_color = random.randint(0, NUM_COLORS - 1)
+        self.current_color = self.rng.randint(0, NUM_COLORS - 1)
+        self.next_color = self.rng.randint(0, NUM_COLORS - 1)
         self.aim_angle = -math.pi / 2
         self.shoot_cooldown = 0.0
         self.shot_queue = 0
@@ -451,7 +452,7 @@ class Zuma(BaseGame):
                 and self.spawn_color_history[-1]
                 == self.spawn_color_history[-2]):
             choices.remove(self.spawn_color_history[-1])
-        return random.choice(choices)
+        return self.rng.choice(choices)
 
     @staticmethod
     def _visual_distance(ball: dict) -> float:
@@ -666,15 +667,15 @@ class Zuma(BaseGame):
         return sorted(colors) or list(range(NUM_COLORS))
 
     def _choose_playable_color(self) -> int:
-        return random.choice(self._playable_colors())
+        return self.rng.choice(self._playable_colors())
 
     def _sync_shooter_colors(self) -> None:
         """Remove shooter colors that no longer exist anywhere in play."""
         playable = self._playable_colors()
         if self.current_color not in playable:
-            self.current_color = random.choice(playable)
+            self.current_color = self.rng.choice(playable)
         if self.next_color not in playable:
-            self.next_color = random.choice(playable)
+            self.next_color = self.rng.choice(playable)
 
     # ------------------------------------------------------------------
     def handle_event(self, event):

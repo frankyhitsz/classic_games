@@ -1,47 +1,49 @@
-# 第十四次审查修复记录
+# 第十五次审查修复记录
 
 ## 状态
 
-- [x] 建立 F01–F28 与 P0–P3 共 123 项证据矩阵；
-- [x] 完成 recovery handoff、reject v3 和 2048 owner claim P0 修复；
-- [x] 完成 archive v3、v2 upgrader、ruleset 与 transaction 兼容修复；
-- [x] 完成 secure roots、legacy evidence、完整 schema replace 和 cleanup 加固；
-- [x] 分离 Sokoban campaign/practice，并统一独立启动恢复页；
-- [x] 写入逐条答复、优化矩阵、规格、协议、README 和 CHANGELOG；
-- [x] 第一轮复查：storage、玩法状态机和旧回归语义；
-- [x] 第二轮复查：stress、package/release、资源与跨平台边界；
-- [x] 提交、推送并核验最终远端 CI。
+- [x] 完整读取并核对 F01–F31 与 P0–P3 共 121 项；
+- [x] 关闭 handoff、transaction root、state journal 与 import planner 四项 P0；
+- [x] 完成 reject/temp/path/archive/坏库 replace 等关键恢复加固；
+- [x] 完成 2048 claim revision/hash 与 Sokoban PracticeSession 修复；
+- [x] 增加玩法与工程小项：Snake/Zuma RNG、Tetris hold 预览、固定 CI constraints；
+- [x] 第一轮完整 storage/gameplay 验证与问题修复；
+- [x] 第二轮独立复查、stress、资源和打包验证；
+- [ ] 提交、推送并核验最终 GitHub CI。
 
-## 已完成的验证
+## 第一轮发现
 
-- Ruff 通过；client/game_service/server 完整 compileall 通过；
-- 208 项 storage 通过，本轮新增 27 项；本机仅跳过 Windows junction 专用用例；
-- 第一轮 gameplay 发现旧测试仍假设 N 可跳过未解锁关。产品规则已明确为 practice 也受 unlock 约束，
-  测试改为先解锁再验证 N，而不是删除断言；单项复验通过；
-- 第一轮代码复查发现 campaign/practice 共用 generation 会使交错的 campaign load 被误判过期；已拆成
-  两个 generation，并加入 pending campaign load 与 practice write 交错测试。
-- 第二轮完整 release 检查通过：Ruff、依赖漏洞扫描、SBOM、compileall、wheel/sdist 安装冒烟、
-  发布清单、storage、stress 与 107 项 gameplay 均无失败；资源检查前后文件描述符均为 19。
-- 第二轮差异复查发现 README 漏列 `test_storage_v12.py`，且新增用例统计仍为 26；已同步目录和实际的
-  27 项统计，并重新执行文档差异检查。
-- 首次远端 `core-only` 发现新增的 `server.init_db()` 用例未遵守 Flask 是可选依赖的测试契约；修正为
-  API 依赖缺失时跳过，并分别验证了有 Flask 执行和无 Flask 跳过两条路径。
-- 修复提交 `d11c242` 的 GitHub CI 7 个结果全部成功：release gate、core-only、Python 3.12/3.13，
-  以及 Linux、macOS、Windows 全量矩阵；Windows junction 专用用例随 storage suite 通过。
+- 初版 orphan temp 恢复会扫描其他进程仍在写入的文件，32 进程 score spool 用例出现 31/32。现加入
+  2 秒 grace；未到期 temp 保持原位并由 complete export 报告，陈旧完整 temp 才在 key lock 下提升。
+- practice schema 收紧后，旧 profile collision fixture 仍期待 practice `unlocked_level`。当前规则改为隔离该
+  旧字段，不恢复成活动解锁；测试改为验证其不会进入 progress。
+- 2048 claim fixture 只返回 owner 字段，没有 authoritative value hash。测试 fake 现按真实 Store hash 计算，
+  不通过放宽生产检查规避新不变量。
+- fresh-DB replace 不能直接复用只接受健康 SQLite 的 v2 rollback。ImportTransaction 在坏库灾难恢复时可写
+  authenticated raw rollback v3；正常 import 继续使用 v2 SQLite image。
 
-## 核心不变量
+## 第二轮发现
 
-- recovery 完成到 shared application session 之间没有 unlock/reacquire；
-- previous pending 在 incoming 替换前已经进入可校验 marker；
-- claim 的成功依据是权威 owner token/epoch，而不是 `ok=true`；
-- format-less v2 不会因升级命令而获得无法证明的 replace 权限；
-- historical ruleset 数据保留，但不冒充当前规则成绩；
-- 多 transaction 不猜 rollback 顺序，v1 未认证 bytes 不自动使用；
-- practice 不改变 campaign total/completed/unlock；
-- replace 后 schema object 集合与当前空白数据库一致。
+- fresh replace 在 transaction 发布后、数据库替换前写永久备份；原异常范围没有覆盖备份发布与 sidecar
+  迁移。现在整个发布阶段都受同一 rollback 保护，备份发布故障注入验证目标字节与 transaction root 均恢复。
+- v3 catalog 允许历史子集是正确的，但记录所属游戏也必须在该 archive 的 catalog 中声明。当前 import 对
+  attempts/progress/save slot 统一核对 catalog；export 会把 committed 历史游戏补入 catalog。空记录的旧
+  catalog 仍兼容，夹带未声明记录会在 preview 失败。
+
+## 已完成的本地验证
+
+- Ruff 与 compileall 定向检查通过；
+- 235 项 storage 通过，本机仅跳过 Windows junction 专用用例；本轮新增 27 项测试；
+- 107 项 gameplay 回归通过；
+- POSIX 测试使用 spawn 子进程和真实 advisory lock，不用 mock 代替等待者；
+- 坏库 replace、missing journal、state conflict、planner silent drop、orphan temp、DB symlink、hard link、
+  evidence-bound v1、Archive future/catalog、Sokoban campaign return 均有定向覆盖。
+- release profile 全部通过：dependency audit/SBOM 无已知漏洞，wheel 与 sdist 以 0.8.0 安装冒烟通过；
+- stress 完成 20,000 个确定性步骤、240 次并发写，SQLite integrity check 通过，100 次资源循环 FD 19→19；
+  五款游戏 render p95 均低于 5 ms，locked-submit p99 为 0.027 ms。
 
 ## 尚需外部决定
 
 - GitHub main required checks/branch protection；
-- 三平台 `--require-hashes` lock、native installer、签名和自动 Release；
-- LICENSE、名称/商标和素材权利结论。
+- Linux、macOS、Windows 独立 `--require-hashes` lock 与签名安装包；
+- LICENSE、名称/商标、字体、图形和音效权利结论。

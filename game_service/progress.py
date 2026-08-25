@@ -50,10 +50,10 @@ def validate_progress(game_id: str, key: str, value) -> dict:
     if game_id == "sokoban":
         if key not in {"campaign", "practice"}:
             raise ProgressPolicyError("unknown Sokoban progress key")
-        allowed = {
-            "unlocked_level", "completed_levels", "level_scores",
-            "best_moves", "best_pushes",
-        }
+        allowed = {"completed_levels", "level_scores",
+                   "best_moves", "best_pushes"}
+        if key == "campaign":
+            allowed.add("unlocked_level")
         if not set(value) <= allowed:
             raise ProgressPolicyError("Sokoban progress has unknown fields")
         result = {}

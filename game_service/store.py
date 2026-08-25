@@ -1033,7 +1033,8 @@ class LocalGameStore:
             operation_id = f"baseline-{baseline_hash[:48]}"
             result.update({"state_apply": "baseline", "semantic_key": key,
                            "logical_revision": revision,
-                           "operation_id": operation_id})
+                           "operation_id": operation_id,
+                           "value_hash": value_hash})
             self._insert_state_receipt(
                 conn, semantic_key=key, logical_revision=revision,
                 operation_id=operation_id, payload_hash=baseline_hash,
@@ -1064,7 +1065,8 @@ class LocalGameStore:
         result.update({"state_apply": "baseline",
                        "semantic_key": semantic_key,
                        "logical_revision": revision,
-                       "operation_id": operation_id})
+                       "operation_id": operation_id,
+                       "value_hash": value_hash})
         self._insert_state_receipt(
             conn, semantic_key=semantic_key, logical_revision=revision,
             operation_id=operation_id, payload_hash=payload_hash,
@@ -2269,6 +2271,7 @@ class LocalGameStore:
                 "semantic_key": row["semantic_key"],
                 "logical_revision": int(row["logical_revision"]),
                 "operation_id": row["operation_id"],
+                "value_hash": value_hash,
             }
             action = ("update" if row["value_hash"] != value_hash
                       or result != expected_result else "healthy")
@@ -2422,6 +2425,7 @@ class LocalGameStore:
                             "semantic_key": key,
                             "logical_revision": repaired_revision,
                             "operation_id": repaired_operation_id,
+                            "value_hash": authoritative_hash,
                         }
                         self._insert_state_receipt(
                             conn, semantic_key=key,
@@ -2444,6 +2448,7 @@ class LocalGameStore:
                             "semantic_key": key,
                             "logical_revision": int(prior["logical_revision"]),
                             "operation_id": prior["operation_id"],
+                            "value_hash": authoritative_hash,
                         }
                         conn.execute(
                             "UPDATE state_receipts SET result_json=?,applied_at=? "
@@ -2748,7 +2753,7 @@ class LocalGameStore:
                 "state_apply": (
                     "merged_stale" if merge_stale else "committed"),
                 "semantic_key": key, "logical_revision": revision,
-                "operation_id": operation_id,
+                "operation_id": operation_id, "value_hash": value_hash,
             })
             if merge_stale and prior is not None:
                 result.update({

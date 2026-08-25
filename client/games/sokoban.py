@@ -298,9 +298,10 @@ class Sokoban(BaseGame):
         self._progress_generation = {"campaign": 0, "practice": 0}
         self._progress_future = None
         self._practice_progress_future = None
-        self._progress_write_future = None
-        self._progress_status_key = "campaign"
+        self._progress_write_futures = {"campaign": None, "practice": None}
+        self._progress_save_messages = {"campaign": "", "practice": ""}
         self.progress_save_message = ""
+        self._campaign_snapshot = None
         self._confirmed_total: Optional[int] = None
         self._pending_total: Optional[int] = None
         w, h = level_bounds(LEVELS[0])
@@ -322,30 +323,36 @@ class Sokoban(BaseGame):
                 self._progress_generation["practice"])
 
     def _poll_progress(self) -> None:
-        write = self._progress_write_future
-        if write is not None and write[0].done():
-            self._progress_write_future = None
+        for progress_key, write in list(self._progress_write_futures.items()):
+            if write is None or not write[0].done():
+                continue
+            self._progress_write_futures[progress_key] = None
             try:
                 result = write[0].result()
             except Exception:  # noqa: BLE001
-                self.progress_save_message = "进度暂时未保存"
+                self._progress_save_messages[progress_key] = "进度暂时未保存"
             else:
                 if isinstance(result, dict) and result.get("ok") is False:
-                    self.progress_save_message = (
+                    self._progress_save_messages[progress_key] = (
                         "进度已进入待写入队列" if result.get("durable_pending")
                         else "进度暂时未保存")
                 elif isinstance(result, dict):
                     self._apply_progress(result, write[1], write[2])
-                    self.progress_save_message = ""
-        if self.progress_save_message:
+                    self._progress_save_messages[progress_key] = ""
+        for progress_key, message in self._progress_save_messages.items():
+            if not message:
+                continue
             getter = getattr(self.backend, "get_local_state_status", None)
             if callable(getter):
                 ruleset = GAME_BY_ID[self.game_id].ruleset_version
                 event = getter(
                     f"progress:{self.profile_id}:{self.game_id}:"
-                    f"{ruleset}:{self._progress_status_key}")
+                    f"{ruleset}:{progress_key}")
                 if getattr(event, "state", None) == SaveState.COMMITTED:
-                    self.progress_save_message = ""
+                    self._progress_save_messages[progress_key] = ""
+        self.progress_save_message = "；".join(
+            dict.fromkeys(message for message in self._progress_save_messages.values()
+                          if message))
         for attribute, progress_key in (
                 ("_progress_future", "campaign"),
                 ("_practice_progress_future", "practice")):
@@ -424,6 +431,7 @@ class Sokoban(BaseGame):
             self.practice_mode = False
             self._confirmed_total = None
             self._pending_total = None
+            self._campaign_snapshot = None
         w, h = level_bounds(level)
         # Recreate window to fit
         new_w = max(500, w * CELL + 40)
@@ -434,6 +442,38 @@ class Sokoban(BaseGame):
         self.offset_x = (self.width - w * CELL) // 2
         self.offset_y = 66
 
+    def _capture_campaign_session(self) -> None:
+        if self.practice_mode or self._campaign_snapshot is not None:
+            return
+        self._campaign_snapshot = {
+            "level_idx": self.level_idx,
+            "walls": set(self.walls), "targets": set(self.targets),
+            "boxes": set(self.boxes), "player_pos": self.player_pos,
+            "floors": set(self.floors), "moves": self.moves,
+            "pushes": self.pushes,
+            "history": [(position, set(boxes), moves, pushes)
+                        for position, boxes, moves, pushes in self.history],
+            "score": self.score, "state": self.state,
+        }
+
+    def _return_to_campaign(self) -> bool:
+        snapshot = self._campaign_snapshot
+        if snapshot is None:
+            return False
+        self._campaign_snapshot = None
+        self.practice_mode = False
+        for field in ("level_idx", "walls", "targets", "boxes", "player_pos",
+                      "floors", "moves", "pushes", "history", "score", "state"):
+            setattr(self, field, snapshot[field])
+        self.overlay_buttons = []
+        w, h = level_bounds(LEVELS[self.level_idx])
+        self.width, self.height = max(500, w * CELL + 40), max(380, h * CELL + 132)
+        self.screen = pygame.display.set_mode((self.width, self.height))
+        self.offset_x = (self.width - w * CELL) // 2
+        self.offset_y = 66
+        self.progress_save_message = "已返回原闯关进度"
+        return True
+
     def update(self, dt: float):
         self._poll_progress()
 
@@ -443,7 +483,11 @@ class Sokoban(BaseGame):
                 or not 0 <= index < min(self.unlocked_level, len(LEVELS))):
             return False
         now = pygame.time.get_ticks()
-        if (not self.practice_mode and self.moves > 0
+        campaign_in_progress = (
+            not self.practice_mode
+            and (self.moves > 0 or self.level_idx > 0
+                 or bool(self.completed_levels) or self.total_score > 0))
+        if (campaign_in_progress
                 and not (self._practice_select_target == index
                          and now <= self._practice_select_deadline)):
             self._practice_select_target = index
@@ -453,6 +497,7 @@ class Sokoban(BaseGame):
             return False
         self._practice_select_target = None
         self._practice_select_deadline = 0
+        self._capture_campaign_session()
         self.load_level(index, practice=True, new_campaign=False)
         return True
 
@@ -462,6 +507,10 @@ class Sokoban(BaseGame):
         if super().handle_event(event):
             return
         if event.type != pygame.KEYDOWN:
+            return
+        if event.key == pygame.K_c and self.practice_mode:
+            self.request_destructive_action(
+                "return-campaign", self._return_to_campaign)
             return
         # R (reset current level) works in any state.
         if event.key == pygame.K_r:
@@ -596,11 +645,14 @@ class Sokoban(BaseGame):
                     self.unlocked_level, progress_value["unlocked_level"])
                 self.saved_completed_levels.update(
                     progress_value["completed_levels"])
-            self.score = self.total_score  # display the running total
+            self.score = (counted_score if self.practice_mode
+                          else self.total_score)
             result = {"level": self.level_idx + 1,
                       "level_index": self.level_idx,
                       "level_score": level_score,
                       "counted_level_score": counted_score,
+                      "practice_score": (
+                          counted_score if self.practice_mode else None),
                       "total_score": self.total_score,
                       "moves": self.moves,
                       "pushes": self.pushes,
@@ -613,8 +665,7 @@ class Sokoban(BaseGame):
                 try:
                     self._progress_generation[progress_key] += 1
                     generation = self._progress_generation[progress_key]
-                    self._progress_status_key = progress_key
-                    self._progress_write_future = (save_progress(
+                    self._progress_write_futures[progress_key] = (save_progress(
                         self.profile_id, self.game_id,
                         progress_key, progress_value), generation, progress_key)
                 except Exception:  # noqa: BLE001 - progress is non-critical
@@ -667,13 +718,16 @@ class Sokoban(BaseGame):
                   (header.x + 12, header.y + 7), size=20,
                   color=COLORS["accent2"], bold=True)
         # Right-align step/push stats by their measured width.
-        stats_line = f"步数 {self.moves}  推动 {self.pushes}  累计 {getattr(self, 'total_score', 0)}"
+        score_label = (f"练习 {self.score}" if self.practice_mode
+                       else f"累计 {getattr(self, 'total_score', 0)}")
+        stats_line = f"步数 {self.moves}  推动 {self.pushes}  {score_label}"
         sw = _font(15, bold=True).size(stats_line)[0]
         draw_text(self.screen, stats_line,
                   (header.right - sw - 12, header.y + 9), size=15,
                   color=COLORS["text"], bold=True)
+        return_hint = " · C 返回闯关" if self.practice_mode else ""
         hint = (f"已解锁 {self.unlocked_level}/{len(LEVELS)} · "
-                "[/] 选关 · 1–9 直达 · K 最高关 · Esc 返回")
+                f"[/] 选关 · 1–9 直达 · K 最高关{return_hint} · Esc 返回")
         if self.progress_save_message:
             hint = f"{self.progress_save_message} · {hint}"
         hw = _font(11).size(hint)[0]
@@ -710,8 +764,12 @@ class Sokoban(BaseGame):
         self._draw_player(*self.player_pos)
 
         # Footer
-        draw_text(self.screen,
-                  "方向键/WASD 移动 · U/退格 撤销 · R 重置 · [/] 已解锁选关 · Esc 退出",
+        footer = ("方向键/WASD 移动 · U/退格 撤销 · R 重置 · "
+                  "[/] 已解锁选关")
+        if self.practice_mode:
+            footer += " · C 返回闯关"
+        footer += " · Esc 退出"
+        draw_text(self.screen, footer,
                   (self.width // 2, self.height - 18),
                   size=12, color=COLORS["text_dim"], center=True)
 
@@ -730,6 +788,11 @@ class Sokoban(BaseGame):
                 Button(pygame.Rect(0, 0, 140, 36), "返回菜单 (Esc)",
                        self.request_exit),
             ]
+            if self.practice_mode and self._campaign_snapshot is not None:
+                btns.insert(
+                    1, Button(pygame.Rect(0, 0, 140, 36), "返回闯关 (C)",
+                              lambda: self.request_destructive_action(
+                                  "return-campaign", self._return_to_campaign)))
             completed_all = bool(self.extra
                                  and self.extra.get("completed_all"))
             if completed_all:
@@ -738,9 +801,12 @@ class Sokoban(BaseGame):
                 msg = f"练习完成 · 关卡 {self.level_idx + 1}"
             else:
                 msg = f"通过 关卡 {self.level_idx + 1}"
+            score_detail = (
+                f"练习成绩 {self.score}" if self.practice_mode
+                else f"累计 {self.total_score}")
             detail = (f"本关 +{max(0, 1000 - self.moves)}  ·  "
-                      f"累计 {self.total_score}  ·  "
-                      f"步数 {self.moves}  ·  推动 {self.pushes}")
+                      f"{score_detail}  ·  步数 {self.moves}  ·  "
+                      f"推动 {self.pushes}")
             # Overlay now auto-sizes panel & positions buttons; we no
             # longer hand-position them here.
             self.draw_gameover_overlay(msg, buttons=btns, detail=detail)

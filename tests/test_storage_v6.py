@@ -342,9 +342,11 @@ class ProfileAndMigrationV6Tests(unittest.TestCase):
             self.assertEqual(
                 store.get_progress(profile_id, "sokoban", "campaign")
                 ["unlocked_level"], 8)
-            self.assertEqual(
-                store.get_progress(profile_id, "sokoban", "practice")
-                ["unlocked_level"], 3)
+            # Practice progress never carries campaign unlock authority.
+            # Legacy rows that only contain this field are preserved as
+            # invalid-local-state evidence instead of being activated.
+            self.assertIsNone(
+                store.get_progress(profile_id, "sokoban", "practice"))
             self.assertEqual(
                 store.load_slot(profile_id, "2048", "autosave")
                 ["state"]["slot_revision"], 9)

@@ -48,6 +48,7 @@ REPLAY_BATCH_SIZE = 128
 REQUEST_LOCK_TIMEOUT_SECONDS = 1.0
 APPLICATION_MAINTENANCE_TIMEOUT_SECONDS = 5.0
 STATUS_REFRESH_SECONDS = 0.5
+ORPHAN_TEMP_GRACE_SECONDS = 2.0
 LOGGER = logging.getLogger(__name__)
 SPOOL_FIELDS = frozenset({
     "schema_version", "request_id", "payload_hash", "attempt_uuid",
@@ -114,6 +115,8 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
             return raw
         finally:
             os.close(descriptor)
+    except FileNotFoundError:
+        raise
     except OSError as exc:
         raise StoreError(
             "unsafe_pending_file", "pending file is unsafe or unreadable"
@@ -375,6 +378,7 @@ class PersistentSaveOutbox:
         self.migrated_spool_count = 0
         self.recovery_notice: Optional[str] = None
         if maintain:
+            self._recover_orphan_temps()
             self._migrate_legacy_file()
         self._update_notice()
 
@@ -508,17 +512,81 @@ class PersistentSaveOutbox:
         self.quarantined_count += 1
         return True
 
+    def quarantine_corrupt_request(self, request_id: str) -> bool:
+        """Preserve a corrupt canonical request so a valid retry can publish."""
+        target = self._target(request_id)
+        with self._lock, self._request_lock(request_id):
+            if not target.exists() and not target.is_symlink():
+                return True
+            try:
+                self._read_file(target)
+            except StoreError:
+                return self._quarantine(target, "corrupt-existing")
+            return False
+
+    def _recover_orphan_temps(self) -> None:
+        """Promote complete score temporaries under the request-ID lock."""
+        try:
+            candidates = sorted(
+                (*self.path.glob(".*.tmp"), *self.path.glob(".*.upgrade")))
+        except OSError:
+            return
+        for temporary in candidates[:MAX_SPOOL_FILES]:
+            try:
+                if (time.time() - os.lstat(temporary).st_mtime
+                        < ORPHAN_TEMP_GRACE_SECONDS):
+                    continue
+                raw = _read_regular_nofollow(
+                    temporary, MAX_SPOOL_FILE_BYTES)
+                value = json.loads(
+                    raw.decode("utf-8"), parse_constant=_reject_json_constant)
+                _validate_json_shape(value)
+                envelope, _mutation = PendingSaveEnvelope.parse(value)
+                target = self._target(envelope.request_id)
+                with self._request_lock(envelope.request_id):
+                    if target.is_file():
+                        existing, _existing_mutation = self._read_file(target)
+                        if existing.payload_hash != envelope.payload_hash:
+                            if not self._quarantine(
+                                    temporary, "orphan-request-conflict"):
+                                return
+                            continue
+                        if envelope.attempt_count > existing.attempt_count:
+                            os.replace(temporary, target)
+                            self._fsync_directory(self.path)
+                            continue
+                        temporary.unlink()
+                    else:
+                        os.replace(temporary, target)
+                        self._fsync_directory(self.path)
+            except (OSError, StoreError, TypeError, ValueError,
+                    RecursionError, UnicodeError):
+                self._quarantine(temporary, "invalid-orphan-temp")
+
     def _migrate_legacy_file(self) -> None:
         legacy = self.legacy_path
-        if legacy is None or not legacy.is_file():
+        if legacy is None:
             return
         try:
-            if legacy.stat().st_size > MAX_LEGACY_SPOOL_BYTES:
+            metadata = os.lstat(legacy)
+        except FileNotFoundError:
+            return
+        except OSError:
+            self._update_notice(["旧版待保存文件暂时无法检查"])
+            return
+        if (not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1):
+            self._quarantine(legacy, "unsafe-legacy-file")
+            self._update_notice()
+            return
+        try:
+            raw = _read_regular_nofollow(legacy, MAX_LEGACY_SPOOL_BYTES)
+            if len(raw) > MAX_LEGACY_SPOOL_BYTES:
                 self._quarantine(legacy, "too-large")
                 self._update_notice()
                 return
             value = json.loads(
-                legacy.read_text(encoding="utf-8"),
+                raw.decode("utf-8"),
                 parse_constant=_reject_json_constant)
             _validate_json_shape(value)
         except MemoryError:
@@ -624,18 +692,17 @@ class PersistentSaveOutbox:
                 f".{mutation.request_id}.{uuid.uuid4().hex}.tmp")
             self._write_bytes(temp, encoded)
             try:
-                try:
-                    os.link(temp, target)
-                except FileExistsError:
-                    existing, _ = self._read_file(target)
-                    if existing.payload_hash != envelope.payload_hash:
-                        raise self._conflict(existing, envelope)
-                    return existing
-                except OSError:
-                    # Hard links are unavailable on some filesystems. Publish
-                    # the already-fsynced temp file under a cross-process
-                    # request lock so readers never observe a partial target.
-                    with self._request_lock(mutation.request_id):
+                with self._request_lock(mutation.request_id):
+                    try:
+                        os.link(temp, target)
+                    except FileExistsError:
+                        existing, _ = self._read_file(target)
+                        if existing.payload_hash != envelope.payload_hash:
+                            raise self._conflict(existing, envelope)
+                        return existing
+                    except OSError:
+                        # Hard links are unavailable on some filesystems.
+                        # The request lock retains no-clobber semantics.
                         if target.exists():
                             existing, _ = self._read_file(target)
                             if existing.payload_hash != envelope.payload_hash:
@@ -644,8 +711,8 @@ class PersistentSaveOutbox:
                         os.replace(temp, target)
                         self._fsync_directory(self.path)
                         return envelope
-                else:
-                    self._fsync_directory(self.path)
+                    else:
+                        self._fsync_directory(self.path)
             finally:
                 try:
                     temp.unlink()
@@ -907,6 +974,7 @@ class PersistentStateOutbox:
         self.recovery_notice: Optional[str] = None
         self._count = 0
         if recover:
+            self._recover_orphan_temps()
             self._recover_reject_transactions()
         self.refresh_count()
         self._update_notice()
@@ -1207,6 +1275,28 @@ class PersistentStateOutbox:
             updated_at=max(existing["updated_at"], incoming["updated_at"]))
         return merged
 
+    @classmethod
+    def resolve_operations(cls, existing: dict,
+                           incoming: dict) -> tuple[dict, str]:
+        """Resolve two journals with the same canonical key."""
+        if (existing.get("key") != incoming.get("key")
+                or existing.get("kind") != incoming.get("kind")):
+            raise StoreError(
+                "state_key_conflict", "state journal key has conflicting data", 409)
+        existing_order = cls._order(existing)
+        incoming_order = cls._order(incoming)
+        if incoming_order == existing_order:
+            if incoming["payload_hash"] != existing["payload_hash"]:
+                raise StoreError(
+                    "state_operation_conflict",
+                    "state operation ID was reused with different data", 409)
+            return existing, "duplicate"
+        if incoming["kind"] == "progress":
+            return cls._merge_progress_operations(existing, incoming), "merged"
+        if incoming_order < existing_order:
+            return existing, "superseded"
+        return incoming, "incoming"
+
     def put(self, key: str, method: str, args: tuple, *,
             logical_revision: Optional[int] = None,
             operation_id: Optional[str] = None,
@@ -1231,21 +1321,9 @@ class PersistentStateOutbox:
                     existed = False
                 else:
                     previous_operation = existing
-                    if incoming["kind"] == existing["kind"] == "progress":
-                        incoming = self._merge_progress_operations(
-                            existing, incoming)
-                    elif self._order(incoming) == self._order(existing):
-                        if incoming["payload_hash"] != existing["payload_hash"]:
-                            raise StoreError(
-                                "state_operation_conflict",
-                                "state operation ID was reused with different data",
-                                409,
-                            )
-                        incoming = existing
-                        published = False
-                    elif self._order(incoming) < self._order(existing):
-                        incoming = existing
-                        published = False
+                    incoming, resolution = self.resolve_operations(
+                        existing, incoming)
+                    published = resolution not in {"duplicate", "superseded"}
             try:
                 encoded = canonical_json(incoming).encode("utf-8")
             except (MutationError, RecursionError, MemoryError) as exc:
@@ -1782,9 +1860,73 @@ class PersistentStateOutbox:
         self.quarantined_count += 1
         self._update_notice()
 
+    def _recover_orphan_temps(self) -> None:
+        """Recover complete state/clock temporaries left before atomic publish."""
+        try:
+            candidates = sorted(self.path.glob(".*.tmp"))[:MAX_SPOOL_FILES]
+        except OSError:
+            return
+        for temporary in candidates:
+            if temporary.name.startswith(".reject-"):
+                continue
+            try:
+                if (time.time() - os.lstat(temporary).st_mtime
+                        < ORPHAN_TEMP_GRACE_SECONDS):
+                    continue
+            except OSError:
+                continue
+            if temporary.name.startswith(".state-clock."):
+                try:
+                    raw = _read_regular_nofollow(
+                        temporary, MAX_SPOOL_FILE_BYTES)
+                    revision = int(raw.decode("ascii"))
+                    if not 0 <= revision <= (1 << 63) - 1:
+                        raise ValueError
+                    clock_path = self.path / ".state-clock"
+                    with self._digest_lock("clock"):
+                        try:
+                            current_raw = _read_regular_nofollow(
+                                clock_path, MAX_SPOOL_FILE_BYTES)
+                            current = int(current_raw.decode("ascii"))
+                        except FileNotFoundError:
+                            current = -1
+                        if revision > current:
+                            os.replace(temporary, clock_path)
+                        else:
+                            temporary.unlink()
+                        PersistentSaveOutbox._fsync_directory(self.path)
+                except (OSError, StoreError, UnicodeError, ValueError):
+                    self._quarantine_transaction(
+                        temporary, "invalid-state-clock-temp")
+                continue
+            try:
+                operation = self._parse(_read_regular_nofollow(
+                    temporary, MAX_SPOOL_FILE_BYTES))
+                target = self._target(operation["key"])
+                if not temporary.name.startswith(f".{target.name}."):
+                    raise StoreError(
+                        "state_journal_bad_name", "orphan temp has another key")
+                with self._key_lock(operation["key"]):
+                    if target.is_file():
+                        current = self._parse(_read_regular_nofollow(
+                            target, MAX_SPOOL_FILE_BYTES))
+                        winner, resolution = self.resolve_operations(
+                            current, operation)
+                        if resolution in {"incoming", "merged"}:
+                            self._rewrite_locked(target, winner)
+                        temporary.unlink()
+                        PersistentSaveOutbox._fsync_directory(self.path)
+                    else:
+                        os.replace(temporary, target)
+                        PersistentSaveOutbox._fsync_directory(self.path)
+            except (OSError, StoreError, TypeError, ValueError,
+                    RecursionError, UnicodeError):
+                self._quarantine_transaction(
+                    temporary, "invalid-state-orphan-temp")
+
     def _recover_prepared_reject(self, marker: Path,
                                  transaction: dict) -> None:
-        """Keep an incoming winner replayable; clean markers with no winner."""
+        """Keep the incoming replayable or restore the last journal evidence."""
         target = self._target(transaction["key"])
         try:
             current = self._parse(_read_regular_nofollow(
@@ -1792,12 +1934,25 @@ class PersistentStateOutbox:
         except FileNotFoundError:
             current = None
         except (OSError, StoreError, TypeError, ValueError, RecursionError):
-            return
+            if not self._quarantine_locked(target, "ambiguous-prepared-target"):
+                return
+            current = None
         previous = transaction["previous_operation"]
         previous_hash = (
             previous["payload_hash"] if previous is not None else None)
-        if (current is None
-                or current["payload_hash"] == previous_hash):
+        incoming_hash = transaction["rejected_payload_hash"]
+        if current is not None and current["payload_hash"] == incoming_hash:
+            return
+        if current is not None and current["payload_hash"] != previous_hash:
+            return
+        if current is None and previous is not None:
+            try:
+                self._rewrite_locked(target, previous)
+                self._count += 1
+                current = previous
+            except OSError:
+                return
+        if current is None or current["payload_hash"] == previous_hash:
             try:
                 marker.unlink()
                 PersistentSaveOutbox._fsync_directory(self.path)
@@ -2043,6 +2198,7 @@ class LocalBackendClient:
         selected = (Path(db_path) if db_path is not None
                     else (store.db_path if store is not None
                           else default_database_path()))
+        selected = selected.expanduser().resolve(strict=False)
         if (store is None and legacy_db_path is None and db_path is None
                 and not os.environ.get("GAMES_DB")):
             legacy_db_path = (Path(__file__).resolve().parents[1]
@@ -2095,13 +2251,18 @@ class LocalBackendClient:
             else:
                 spool_path = supplied
                 legacy_outbox = None
-        self.outbox = PersistentSaveOutbox(
-            spool_path, legacy_path=legacy_outbox)
-        # Startup only needs to know whether work exists. Parsing, upgrading,
-        # quarantining and fsyncing every envelope belongs on the worker.
-        had_pending_scores = self.outbox.has_entries()
-        self.state_outbox = PersistentStateOutbox(
-            spool_path.with_name(f"{spool_path.name}-state"))
+        try:
+            self.outbox = PersistentSaveOutbox(
+                spool_path, legacy_path=legacy_outbox)
+            # Startup only needs to know whether work exists. Parsing,
+            # quarantining and fsyncing every envelope belongs on the worker.
+            had_pending_scores = self.outbox.has_entries()
+            self.state_outbox = PersistentStateOutbox(
+                spool_path.with_name(f"{spool_path.name}-state"))
+        except Exception:
+            self._application_session.close()
+            self._application_session = None
+            raise
         notices = [self.recovery_notice,
                    getattr(store, "migration_notice", None),
                    self.outbox.recovery_notice,
@@ -2474,6 +2635,18 @@ class LocalBackendClient:
         payload_hash = None
         previous_operation = None
         operation, receipt, journal_error = self._publish_state_journal(operation)
+        if isinstance(journal_error, StoreError) and not journal_error.retryable:
+            with self._lock:
+                self._unpublished_state.discard(operation["operation_id"])
+                self._non_durable_state.pop(key, None)
+            result = {
+                **journal_error.result(),
+                "journal_unchanged": True,
+                "database_unchanged": True,
+            }
+            self._emit_local_state_event(
+                operation, SaveState.PERMANENT_FAILURE, result)
+            return result
         journal_failure = (
             classify_os_error(journal_error)
             if isinstance(journal_error, OSError) else journal_error)
@@ -3048,11 +3221,33 @@ class LocalBackendClient:
                 self._outbox_writable = True
             except (OSError, StoreError) as exc:
                 if isinstance(exc, StoreError):
-                    # The request ID is already bound to another payload.
-                    # Reject before touching SQLite and retain the original.
-                    return exc.result()
-                spool_error = exc
-                self._outbox_writable = False
+                    if exc.code == "request_id_conflict":
+                        # The request ID is already bound to another payload.
+                        # Reject before touching SQLite and retain the winner.
+                        return exc.result()
+                    if exc.code == "corrupt_spool_file":
+                        try:
+                            repaired = self.outbox.quarantine_corrupt_request(
+                                mutation.request_id)
+                            if repaired:
+                                envelope = self.outbox.add_mutation(
+                                    mutation, created_at=occurred_at)
+                                self._mark_spooled(envelope, mutation)
+                                self._outbox_writable = True
+                                exc = None
+                        except (OSError, StoreError) as repair_exc:
+                            exc = repair_exc
+                    if exc is None:
+                        pass
+                    elif isinstance(exc, StoreError) and not exc.retryable:
+                        return exc.result()
+                    elif isinstance(exc, StoreError):
+                        spool_error = exc
+                        self._outbox_writable = False
+                        exc = None
+                if isinstance(exc, OSError):
+                    spool_error = exc
+                    self._outbox_writable = False
         storage_failure: Optional[StorageFailure] = None
         try:
             if self.store is None and not self._try_reopen_store():
@@ -3256,6 +3451,22 @@ class LocalBackendClient:
                             entry, SaveState.PERMANENT_FAILURE,
                             {**exc.result(),
                              "rejected_journal_preserved": True})
+                    else:
+                        winner = self.state_outbox.read_key(entry["key"])
+                        if (winner is not None
+                                and winner["payload_hash"]
+                                != entry["payload_hash"]):
+                            self._emit_local_state_event(
+                                entry, SaveState.SUPERSEDED,
+                                {**exc.result(), "winner_changed": True})
+                            continue
+                        blocked = True
+                        self._emit_local_state_event(
+                            entry, SaveState.RECOVERY_REQUIRED,
+                            {**exc.result(),
+                             "rejected_journal_preserved": False,
+                             "recovery_required": True})
+                        break
                 else:
                     blocked = True
                     repair_blocked = exc.code == "schema_repair_required"
