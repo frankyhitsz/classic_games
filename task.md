@@ -9,7 +9,7 @@
 - [x] 增加玩法与工程小项：Snake/Zuma RNG、Tetris hold 预览、固定 CI constraints；
 - [x] 第一轮完整 storage/gameplay 验证与问题修复；
 - [x] 第二轮独立复查、stress、资源和打包验证；
-- [ ] 提交、推送并核验最终 GitHub CI。
+- [x] 提交、推送并核验最终 GitHub CI。
 
 ## 第一轮发现
 
@@ -41,6 +41,8 @@
 - release profile 全部通过：dependency audit/SBOM 无已知漏洞，wheel 与 sdist 以 0.8.0 安装冒烟通过；
 - stress 完成 20,000 个确定性步骤、240 次并发写，SQLite integrity check 通过，100 次资源循环 FD 19→19；
   五款游戏 render p95 均低于 5 ms，locked-submit p99 为 0.027 ms。
+- 功能提交 `8338ea3` 的 GitHub CI #41 在 4 分 5 秒内成功：release gate、core-only、Python
+  3.12/3.13，以及 Linux、macOS、Windows 三平台矩阵共 7 个任务全部通过。
 
 ## 尚需外部决定
 
