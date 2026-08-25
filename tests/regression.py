@@ -471,13 +471,18 @@ for mod_name, cls_name in [("tetris","Tetris"), ("snake","Snake"),
 print("\n=== 15. Launcher: hovering a card switches leaderboard title ===")
 run("launcher-hover-switches-leaderboard", """
     import os; os.environ['SDL_VIDEODRIVER']='dummy'; os.environ['GAMES_USE_HTTP']='1'
-    import threading, time, pygame
+    import threading, pygame
     from client.common.network import BackendClient
     import client.launcher as L
     captured = []
+    first_draw = threading.Event()
+    snake_draw = threading.Event()
     orig = L.draw_leaderboard
     def spy(surf, rect, entries, title='排行榜', **kw):
         captured.append(title)
+        first_draw.set()
+        if '贪吃蛇' in title:
+            snake_draw.set()
         return orig(surf, rect, entries, title=title, **kw)
     L.draw_leaderboard = spy
     BackendClient.health = lambda self: False
@@ -491,12 +496,11 @@ run("launcher-hover-switches-leaderboard", """
     card1_cx = 42 + (168 + 14) + 84
     card1_cy = 110 + 110
     def driver():
-        time.sleep(0.3)
-        pygame.mouse.set_pos(card1_cx, card1_cy)
+        first_draw.wait(10)
         pygame.event.post(pygame.event.Event(pygame.MOUSEMOTION,
                                              {'pos':(card1_cx, card1_cy),
                                               'rel':(0,0),'buttons':(0,0,0)}))
-        time.sleep(0.5)
+        snake_draw.wait(10)
         pygame.event.post(pygame.event.Event(pygame.QUIT))
     threading.Thread(target=driver, daemon=True).start()
     L.main()

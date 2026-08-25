@@ -9,7 +9,7 @@
 - [x] 增加玩法与工程小项：Snake/Zuma RNG、Tetris hold 预览、固定 CI constraints；
 - [x] 第一轮完整 storage/gameplay 验证与问题修复；
 - [x] 第二轮独立复查、stress、资源和打包验证；
-- [x] 提交、推送并核验最终 GitHub CI。
+- [ ] 提交、推送并核验最终 GitHub CI。
 
 ## 第一轮发现
 
@@ -43,6 +43,8 @@
   五款游戏 render p95 均低于 5 ms，locked-submit p99 为 0.027 ms。
 - 功能提交 `8338ea3` 的 GitHub CI #41 在 4 分 5 秒内成功：release gate、core-only、Python
   3.12/3.13，以及 Linux、macOS、Windows 三平台矩阵共 7 个任务全部通过。
+- 纯文档提交触发的 CI #42 在 Windows 暴露启动器悬停用例的休眠竞态：慢机器会在 driver 发完移动与退出
+  事件后才进入首帧。用例改为等待首个 leaderboard draw，再等待目标标题 draw 后退出，不再依赖固定休眠。
 
 ## 尚需外部决定
 
