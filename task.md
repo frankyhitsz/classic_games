@@ -8,7 +8,7 @@
 - [x] 完成 2048 RNG/slot resolution 与 Sokoban single-flight/durable campaign 修复；
 - [x] 增加第十六次定向回归并完成第一轮 storage 验证；
 - [x] 第二轮独立复查、gameplay、stress、release 与打包验证；
-- [ ] 提交、推送并核验 GitHub CI。
+- [x] 提交、推送并核验 GitHub CI。
 
 ## 第一轮发现与修复
 
@@ -62,6 +62,9 @@
   `integrity_check=ok`，五款游戏 render p95 均低于 5 ms；
 - release profile 在 Python 3.13 隔离环境通过：依赖审计与 SBOM 均为零已知漏洞，wheel/sdist 使用
   setuptools 83.0.0 构建并从只读工作目录完成用户数据冒烟，随后重复通过 storage/stress/gameplay。
+- 功能提交 `f02d3e5` 的 GitHub CI #45 首次暴露 core-only 可选依赖问题；修正提交 `ac4c531` 的 CI #46
+  在 4 分 54 秒内成功，release gate、core-only、Python 3.12/3.13 和 Linux/macOS/Windows 三平台共
+  7 个任务全部通过。
 
 ## 尚需外部决定
 
