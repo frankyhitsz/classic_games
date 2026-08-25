@@ -922,7 +922,8 @@ class LocalGameStore:
                 return ({"ok": True, "value": value},
                         cls._state_value_hash(value), float(row["updated_at"]))
             row = conn.execute(
-                "SELECT state_json,updated_at FROM save_slots WHERE "
+                "SELECT state_json,state_version,ruleset_version,updated_at "
+                "FROM save_slots WHERE "
                 "profile_id=? AND game_id=? AND slot_id=?",
                 (profile_id, state_ref["game_id"],
                  state_ref["item_key"])).fetchone()
@@ -930,8 +931,16 @@ class LocalGameStore:
                 return None
             value = json.loads(
                 row["state_json"], parse_constant=_reject_json_constant)
+            # A slot's compatibility metadata is part of the authoritative
+            # value.  Hashing state_json alone let an operation receipt look
+            # current after ruleset/state-version metadata changed.
+            slot_value = {
+                "state": value,
+                "state_version": int(row["state_version"]),
+                "ruleset_version": row["ruleset_version"],
+            }
             return ({"ok": True, "value": value},
-                    cls._state_value_hash(value), float(row["updated_at"]))
+                    cls._state_value_hash(slot_value), float(row["updated_at"]))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError,
                 ProgressPolicyError):
             return None
@@ -959,7 +968,9 @@ class LocalGameStore:
              method, canonical_json(state_ref), value_hash, receipt_kind,
              canonical_json(result), occurred_at, applied_at))
 
-    def _seed_state_baselines(self, conn: sqlite3.Connection) -> int:
+    def _seed_state_baselines(self, conn: sqlite3.Connection, *,
+                              missing_only: bool = False,
+                              revision_floor: int = 0) -> int:
         now = time.time()
         candidates: list[tuple[str, str, dict, float]] = []
         for row in conn.execute(
@@ -995,12 +1006,20 @@ class LocalGameStore:
                 float(row["updated_at"])))
         seeded = 0
         for key, method, state_ref, occurred_at in candidates:
+            prior = conn.execute(
+                "SELECT logical_revision FROM state_receipts "
+                "WHERE semantic_key=?", (key,)).fetchone()
+            if missing_only and prior is not None:
+                continue
             authoritative = self._authoritative_state(conn, method, state_ref)
             if authoritative is None:
                 continue
             result, value_hash, authoritative_at = authoritative
             revision = min((1 << 63) - 1,
-                           max(0, int(authoritative_at * 1_000_000_000)))
+                           max(0, revision_floor,
+                               int(authoritative_at * 1_000_000_000),
+                               (int(prior["logical_revision"]) + 1
+                                if prior is not None else 0)))
             baseline_hash = self._state_value_hash(
                 {"baseline": key, "value_hash": value_hash})
             operation_id = f"baseline-{baseline_hash[:48]}"
@@ -1024,8 +1043,13 @@ class LocalGameStore:
             self._invalidate_state_receipts(conn, semantic_key)
             return
         result, value_hash, occurred_at = authoritative
+        prior = conn.execute(
+            "SELECT logical_revision FROM state_receipts WHERE semantic_key=?",
+            (semantic_key,)).fetchone()
         revision = min((1 << 63) - 1,
-                       max(0, int(occurred_at * 1_000_000_000)))
+                       max(0, int(occurred_at * 1_000_000_000),
+                           (int(prior["logical_revision"]) + 1
+                            if prior is not None else 0)))
         payload_hash = self._state_value_hash(
             {"baseline": semantic_key, "value_hash": value_hash})
         operation_id = f"baseline-{payload_hash[:48]}"
@@ -1045,6 +1069,7 @@ class LocalGameStore:
         current = self._state_receipt_tables_are_current(conn)
         rebuild = source_version < SCHEMA_VERSION or not current
         legacy_merge = None
+        legacy_revision_floor = 0
         if rebuild:
             stamp = time.time_ns()
             conn.execute(
@@ -1055,6 +1080,17 @@ class LocalGameStore:
                     (table,)).fetchone()
                 if exists is None:
                     continue
+                if (table == "state_receipts"
+                        and "logical_revision" in self._table_columns(
+                            conn, table)):
+                    row = conn.execute(
+                        "SELECT COALESCE(MAX(logical_revision),0) AS revision "
+                        "FROM state_receipts").fetchone()
+                    try:
+                        legacy_revision_floor = max(
+                            legacy_revision_floor, int(row["revision"]))
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        pass
                 legacy = f"legacy_{table}_v{source_version}_{stamp}"
                 conn.execute(f"ALTER TABLE {table} RENAME TO {legacy}")
                 if table == "state_merge_receipts":
@@ -1071,7 +1107,8 @@ class LocalGameStore:
                         f"SELECT operation_id,semantic_key,payload_hash,applied_at "
                         f"FROM {legacy_merge} WHERE length(operation_id) "
                         "BETWEEN 1 AND 128 AND length(payload_hash)=64")
-            seeded = self._seed_state_baselines(conn)
+            seeded = self._seed_state_baselines(
+                conn, revision_floor=legacy_revision_floor)
             self._migration_messages.append(
                 f"已为 {seeded} 条本机状态建立恢复基线")
         else:
@@ -2105,6 +2142,80 @@ class LocalGameStore:
         return (method, args, key, revision, operation_id, payload_hash,
                 float(occurred_at), components)
 
+    @classmethod
+    def validate_state_operation(cls, operation: dict) -> dict:
+        """Validate state mutation semantics without reading or writing SQLite."""
+        method, args, _key, _revision, _operation_id, _payload_hash, \
+            _occurred_at, _components = cls._validate_state_operation(operation)
+        if method == "ensure_profile":
+            try:
+                ProfileIdentity.normalize_display_name(args[0])
+            except ProfileIdentityError as exc:
+                raise StoreError("invalid_display_name", str(exc)) from exc
+            cls._profile_uuid(args[1])
+            return operation
+        cls._profile_uuid(args[0])
+        if method == "set_setting":
+            cls._query_identifier(args[1], "setting_key", 64)
+            cls._encoded_value(args[2])
+            return operation
+        game_id = args[1]
+        if game_id not in VALID_GAME_IDS:
+            raise StoreError("unknown_game", f"unknown game_id: {game_id}", 404)
+        item_key = cls._query_identifier(
+            args[2], "progress_key" if method != "save_slot" else "slot_id", 64)
+        cls._query_identifier(args[4], "ruleset_version", 32)
+        if method in {"set_progress", "merge_progress"}:
+            try:
+                value = validate_progress(game_id, item_key, args[3])
+            except ProgressPolicyError as exc:
+                raise StoreError("invalid_progress", str(exc)) from exc
+            cls._encoded_value(value)
+            return operation
+        state = args[3]
+        cls._encoded_value(state)
+        state_version = (
+            state.get("version", 1) if isinstance(state, dict) else 1)
+        if (type(state_version) is not int
+                or not 1 <= state_version <= 2147483647):
+            raise StoreError("invalid_state_version", "invalid save state version")
+        if (game_id == "2048" and isinstance(state, dict)
+                and state_version in (4, 5)):
+            owner_token = state.get("owner_token")
+            owner_status = state.get("owner_status")
+            owner_epoch = state.get("owner_epoch", 0)
+            slot_revision = state.get("slot_revision", 0)
+            if (not isinstance(owner_token, str)
+                    or not 16 <= len(owner_token) <= 64
+                    or owner_status not in {"active", "released"}
+                    or type(owner_epoch) is not int
+                    or not 0 <= owner_epoch <= (1 << 63) - 1
+                    or type(slot_revision) is not int
+                    or not 0 <= slot_revision <= (1 << 63) - 1):
+                raise StoreError("invalid_slot_owner", "invalid autosave owner")
+            if state_version == 5:
+                expected_owner = state.get("expected_owner_token")
+                expected_epoch = state.get("expected_owner_epoch")
+                expected_revision = state.get("expected_slot_revision")
+                expected_hash = state.get("expected_value_hash")
+                if ((expected_owner is not None
+                     and (not isinstance(expected_owner, str)
+                          or not 16 <= len(expected_owner) <= 64))
+                        or (expected_epoch is not None
+                            and (type(expected_epoch) is not int
+                                 or not 0 <= expected_epoch <= (1 << 63) - 1))
+                        or (expected_revision is not None
+                            and (type(expected_revision) is not int
+                                 or not 0 <= expected_revision <= (1 << 63) - 1))
+                        or (expected_hash is not None
+                            and (not isinstance(expected_hash, str)
+                                 or len(expected_hash) != 64
+                                 or any(char not in "0123456789abcdef"
+                                        for char in expected_hash)))):
+                    raise StoreError(
+                        "invalid_slot_owner", "invalid autosave expectation")
+        return operation
+
     @staticmethod
     def _decode_state_result(raw: str) -> dict:
         try:
@@ -2120,14 +2231,13 @@ class LocalGameStore:
     def get_state_receipt(self, semantic_key: str) -> Optional[dict]:
         if not isinstance(semantic_key, str) or not semantic_key:
             raise StoreError("invalid_state_key", "local state key is invalid")
-        with self.connection() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+
+        def inspect_receipt(conn: sqlite3.Connection):
             row = conn.execute(
                 "SELECT * FROM state_receipts WHERE semantic_key=?",
                 (semantic_key,)).fetchone()
             if row is None:
-                conn.commit()
-                return None
+                return None, "none", None, None
             try:
                 state_ref = json.loads(
                     row["state_ref_json"], parse_constant=_reject_json_constant)
@@ -2138,14 +2248,7 @@ class LocalGameStore:
             except (TypeError, ValueError, json.JSONDecodeError):
                 authoritative = None
             if authoritative is None:
-                conn.execute(
-                    "DELETE FROM state_receipts WHERE semantic_key=?",
-                    (semantic_key,))
-                conn.execute(
-                    "DELETE FROM state_merge_receipts WHERE semantic_key=?",
-                    (semantic_key,))
-                conn.commit()
-                return None
+                return None, "delete", row, None
             authoritative_result, value_hash, _updated_at = authoritative
             try:
                 result = self._decode_state_result(row["result_json"])
@@ -2159,17 +2262,10 @@ class LocalGameStore:
                 "logical_revision": int(row["logical_revision"]),
                 "operation_id": row["operation_id"],
             }
-            if (row["value_hash"] != value_hash
-                    or result != expected_result):
-                result = expected_result
-                conn.execute(
-                    "UPDATE state_receipts SET value_hash=?,result_json=?,"
-                    "applied_at=? WHERE semantic_key=?",
-                    (value_hash, canonical_json(result), time.time(),
-                     semantic_key))
-            conn.commit()
-            return {
-                **result,
+            action = ("update" if row["value_hash"] != value_hash
+                      or result != expected_result else "healthy")
+            receipt = {
+                **expected_result,
                 "semantic_key": row["semantic_key"],
                 "logical_revision": int(row["logical_revision"]),
                 "operation_id": row["operation_id"],
@@ -2178,6 +2274,41 @@ class LocalGameStore:
                 "occurred_at": row["occurred_at"],
                 "applied_at": row["applied_at"],
             }
+            return receipt, action, row, value_hash
+
+        # Healthy status reads stay read-only and do not reserve SQLite's
+        # single writer slot. Only an observed repair re-enters under an
+        # immediate transaction and rechecks the current row.
+        with self.connection() as conn:
+            receipt, action, _row, _value_hash = inspect_receipt(conn)
+        if action in {"none", "healthy"}:
+            return receipt
+
+        with self.connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            receipt, action, _row, value_hash = inspect_receipt(conn)
+            if action == "delete":
+                conn.execute(
+                    "DELETE FROM state_receipts WHERE semantic_key=?",
+                    (semantic_key,))
+                conn.execute(
+                    "DELETE FROM state_merge_receipts WHERE semantic_key=?",
+                    (semantic_key,))
+                conn.commit()
+                return None
+            if action == "update":
+                repaired_at = time.time()
+                conn.execute(
+                    "UPDATE state_receipts SET value_hash=?,result_json=?,"
+                    "applied_at=? WHERE semantic_key=?",
+                    (value_hash, canonical_json({
+                        key: value for key, value in receipt.items()
+                        if key not in {"payload_hash", "method", "occurred_at",
+                                       "applied_at"}
+                    }), repaired_at, semantic_key))
+                receipt["applied_at"] = repaired_at
+            conn.commit()
+            return receipt
 
     def apply_state_operation(self, operation: dict) -> dict:
         """Apply a journaled state mutation and its ordering receipt atomically."""
@@ -2345,8 +2476,12 @@ class LocalGameStore:
                         })
                         conn.commit()
                         return result
-                if (prior is not None and incoming_order < prior_order
-                        and not incoming_after_baseline):
+                baseline_wins_by_time = (
+                    prior["receipt_kind"] == "baseline"
+                    and not incoming_after_baseline)
+                if (prior is not None
+                        and (baseline_wins_by_time
+                             or incoming_order < prior_order)):
                     if method == "merge_progress":
                         merge_stale = True
                     else:
@@ -2482,22 +2617,26 @@ class LocalGameStore:
                         "invalid_state_version", "invalid save state version")
                 self._require_profile(conn, profile_id)
                 if game_id == "2048" and isinstance(state, dict) \
-                        and state.get("version") == 4:
+                        and state.get("version") in (4, 5):
                     owner_token = state.get("owner_token")
                     owner_status = state.get("owner_status")
-                    takeover_from = state.get("takeover_from")
+                    owner_epoch = (state.get("owner_epoch", 0)
+                                   if state.get("version") == 5 else 0)
+                    slot_revision = state.get("slot_revision", 0)
                     if (not isinstance(owner_token, str)
                             or not 16 <= len(owner_token) <= 64
                             or owner_status not in {"active", "released"}
-                            or (takeover_from is not None
-                                and (not isinstance(takeover_from, str)
-                                     or not 16 <= len(takeover_from) <= 64))):
+                            or type(owner_epoch) is not int
+                            or not 0 <= owner_epoch <= (1 << 63) - 1
+                            or type(slot_revision) is not int
+                            or not 0 <= slot_revision <= (1 << 63) - 1):
                         conn.rollback()
                         raise StoreError(
                             "invalid_slot_owner", "invalid autosave owner")
                     current_slot = conn.execute(
-                        "SELECT state_json FROM save_slots WHERE profile_id=? "
-                        "AND game_id=? AND slot_id=?",
+                        "SELECT state_json,state_version,ruleset_version,"
+                        "updated_at FROM save_slots WHERE profile_id=? AND "
+                        "game_id=? AND slot_id=?",
                         (profile_id, game_id, slot_id)).fetchone()
                     if current_slot is not None:
                         try:
@@ -2506,17 +2645,80 @@ class LocalGameStore:
                                 parse_constant=_reject_json_constant)
                         except (TypeError, ValueError, json.JSONDecodeError):
                             current_state = None
-                        if (isinstance(current_state, dict)
-                                and current_state.get("version") == 4
-                                and current_state.get("owner_status") == "active"):
-                            current_owner = current_state.get("owner_token")
-                            if (current_owner != owner_token
-                                    and takeover_from != current_owner):
-                                conn.rollback()
-                                raise StoreError(
-                                    "slot_in_use",
-                                    "autosave is active in another game window",
-                                    409)
+                        current_version = (
+                            current_state.get("version")
+                            if isinstance(current_state, dict) else None)
+                        current_owner = (
+                            current_state.get("owner_token")
+                            if current_version in (4, 5) else None)
+                        current_status = (
+                            current_state.get("owner_status")
+                            if current_version in (4, 5) else "released")
+                        current_epoch = (
+                            current_state.get("owner_epoch", 0)
+                            if current_version in (4, 5) else 0)
+                        current_revision = (
+                            current_state.get("slot_revision", 0)
+                            if isinstance(current_state, dict) else 0)
+                        if (type(current_epoch) is not int
+                                or not 0 <= current_epoch <= (1 << 63) - 1):
+                            current_epoch = -1
+                        if (type(current_revision) is not int
+                                or not 0 <= current_revision <= (1 << 63) - 1):
+                            current_revision = -1
+                        current_value_hash = self._state_value_hash({
+                            "state": current_state,
+                            "state_version": int(current_slot["state_version"]),
+                            "ruleset_version": current_slot["ruleset_version"],
+                        })
+                        same_live_owner = (
+                            current_status == "active"
+                            and current_owner == owner_token
+                            and current_epoch == owner_epoch
+                            and (state.get("version") == 5
+                                 or current_version == 4))
+                        if same_live_owner:
+                            owner_match = slot_revision > current_revision
+                        elif state.get("version") == 5:
+                            expected_owner = state.get("expected_owner_token")
+                            expected_epoch = state.get("expected_owner_epoch")
+                            expected_revision = state.get(
+                                "expected_slot_revision")
+                            expected_hash = state.get("expected_value_hash")
+                            owner_match = (
+                                expected_owner == current_owner
+                                and expected_epoch == current_epoch
+                                and expected_revision == current_revision
+                                and expected_hash == current_value_hash
+                                and owner_epoch == current_epoch + 1
+                                and slot_revision > current_revision)
+                        else:
+                            # Version 4 remains readable, but its token-only
+                            # takeover cannot provide compare-and-swap safety.
+                            owner_match = False
+                        if not owner_match:
+                            conn.rollback()
+                            raise StoreError(
+                                "slot_in_use",
+                                "autosave changed in another game window",
+                                409,
+                                details={
+                                    "current_owner_token": current_owner,
+                                    "current_owner_epoch": current_epoch,
+                                    "current_slot_revision": current_revision,
+                                    "current_value_hash": current_value_hash,
+                                })
+                    elif state.get("version") == 5:
+                        if (owner_epoch != 0
+                                or state.get("expected_owner_token") is not None
+                                or state.get("expected_owner_epoch") is not None
+                                or state.get("expected_slot_revision") is not None
+                                or state.get("expected_value_hash") is not None):
+                            conn.rollback()
+                            raise StoreError(
+                                "slot_in_use",
+                                "autosave was removed before it could be claimed",
+                                409)
                 conn.execute(
                     "INSERT INTO save_slots(profile_id,game_id,slot_id,"
                     "state_json,state_version,ruleset_version,updated_at) "
@@ -2910,10 +3112,16 @@ class LocalGameStore:
                         conn, f"slot:{profile_id}:{game_id}:{slot_id}")
                 conn.commit()
             return None
+        value_hash = self._state_value_hash({
+            "state": state,
+            "state_version": int(row["state_version"]),
+            "ruleset_version": row["ruleset_version"],
+        })
         return {"state": state,
                 "state_version": row["state_version"],
                 "ruleset_version": row["ruleset_version"],
-                "updated_at": row["updated_at"]}
+                "updated_at": row["updated_at"],
+                "value_hash": value_hash}
 
     def quarantine_slot(self, profile_id: str, game_id: str,
                         slot_id: str, reason: str) -> bool:

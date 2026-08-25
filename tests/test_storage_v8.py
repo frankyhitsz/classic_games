@@ -513,9 +513,17 @@ class DataArchiveTests(unittest.TestCase):
 
 class AutosaveOwnershipTests(unittest.TestCase):
     @staticmethod
-    def _state(owner: str, status: str = "active", takeover=None) -> dict:
-        return {"version": 4, "owner_token": owner, "owner_status": status,
-                "takeover_from": takeover, "marker": owner}
+    def _state(owner: str, status: str = "active", *, epoch: int = 0,
+               slot_revision: int = 1, expected=None) -> dict:
+        expected = expected or (None, None, None, None)
+        return {
+            "version": 5, "owner_token": owner, "owner_status": status,
+            "owner_epoch": epoch, "slot_revision": slot_revision,
+            "expected_owner_token": expected[0],
+            "expected_owner_epoch": expected[1],
+            "expected_slot_revision": expected[2],
+            "expected_value_hash": expected[3], "marker": owner,
+        }
 
     def test_owner_takeover_blocks_delayed_old_instance(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -541,15 +549,23 @@ class AutosaveOwnershipTests(unittest.TestCase):
             with self.assertRaisesRegex(StoreError, "another game window"):
                 store.apply_state_operation(
                     operation(3, "b-no-takeover", self._state(owner_b)))
+            current = store.load_slot(profile_id, "2048", "autosave")
             store.apply_state_operation(operation(
-                4, "b-takeover", self._state(owner_b, takeover=owner_a)))
+                4, "b-takeover", self._state(
+                    owner_b, epoch=1, slot_revision=2,
+                    expected=(owner_a, 0, 1, current["value_hash"]))))
             with self.assertRaisesRegex(StoreError, "another game window"):
                 store.apply_state_operation(
-                    operation(5, "a-late", self._state(owner_a)))
+                    operation(5, "a-late", self._state(
+                        owner_a, slot_revision=2)))
             store.apply_state_operation(
-                operation(6, "b-release", self._state(owner_b, "released")))
+                operation(6, "b-release", self._state(
+                    owner_b, "released", epoch=1, slot_revision=3)))
+            released = store.load_slot(profile_id, "2048", "autosave")
             store.apply_state_operation(
-                operation(7, "c-claim", self._state(owner_c)))
+                operation(7, "c-claim", self._state(
+                    owner_c, epoch=2, slot_revision=4,
+                    expected=(owner_b, 1, 3, released["value_hash"]))))
             self.assertEqual(
                 store.load_slot(profile_id, "2048", "autosave")["state"]
                 ["owner_token"], owner_c)

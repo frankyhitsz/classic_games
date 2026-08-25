@@ -947,6 +947,26 @@ class Zuma(BaseGame):
                             tuple(max(0, c - 45) for c in base),
                             pygame.Rect(ix - 7, iy - 4, 14, 12),
                             0.15, math.pi - 0.15, 1)
+            # Shape markers keep ball identity readable when hues are hard to
+            # distinguish. They are deliberately small enough not to turn the
+            # smooth lacquered balls back into pixel-art sprites.
+            symbol = (28, 35, 45)
+            marker = color_idx % NUM_COLORS
+            if marker == 0:
+                pygame.draw.circle(self.screen, symbol, (ix, iy + 2), 2)
+            elif marker == 1:
+                pygame.draw.line(
+                    self.screen, symbol, (ix - 5, iy + 2), (ix + 5, iy + 2), 2)
+            elif marker == 2:
+                pygame.draw.line(
+                    self.screen, symbol, (ix, iy - 3), (ix, iy + 7), 2)
+            elif marker == 3:
+                pygame.draw.line(
+                    self.screen, symbol, (ix - 4, iy - 2), (ix + 4, iy + 6), 2)
+                pygame.draw.line(
+                    self.screen, symbol, (ix + 4, iy - 2), (ix - 4, iy + 6), 2)
+            else:
+                pygame.draw.circle(self.screen, symbol, (ix, iy + 2), 4, 2)
             if highlight:
                 pygame.draw.circle(self.screen, COLORS["accent2"],
                                    (ix, iy), BALL_R + 3, 2)

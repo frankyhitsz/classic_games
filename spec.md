@@ -1,54 +1,66 @@
-# 第十次审查修复规格
+# 第十一次审查修复规格
 
 ## 目标
 
-逐条核对第十次审查的 23 条发现和 118 项建议。优先保证崩溃残留 journal、业务行损坏隔离和
-旧数据库升级都不会丢失或回退本机状态；同时关闭已能在当前产品内完成的身份、进度 HUD、2048
-存档冲突、数据恢复和发行门禁问题。
+核对第十一次审查的 31 条发现和 129 项建议，优先关闭可能覆盖数据库、遗漏待保存记录、
+静默漏导成绩、回退状态 winner 或让 2048 旧窗口覆写新棋盘的问题。审查中的长期产品建议
+保留逐项结论，但不能混入现有 ruleset，也不能写成已经交付。
 
 ## 范围
 
-- state journal schema 3 为每个单调 progress 贡献保存 component ID/hash，聚合使用独立 ID；
-- SQLite schema 7 把 state receipt 与业务引用、权威值 hash 绑定，并为旧 profile、setting、
-  progress、slot 建立 synthetic baseline；
-- duplicate 前验证业务行，损坏 receipt 从权威行修复，缺失或隔离业务行同步失效所有相关回执；
-- state clock 从数据库 high-water 恢复，损坏或超大时钟保留原件；merge receipt 建索引并按
-  365 天有界清理，仍在 journal 中的 component 不清理；
-- 延迟或重复 score 重放不刷新档案 `last_used`，有效写入使用真实 `occurred_at`；
-- HTTP 调试启动器不再携带本机 default profile ID；Sokoban/Zuma 解包 state result 的 `value`；
-- 2048 恢复终局棋盘，autosave schema 4 使用 owner token、released 状态和显式接管；
-- 提供数据状态检查、JSON 导出、导入预览和带备份的原子导入命令；
-- 增加 release 测试入口、JUnit/JSON 结果、只读 Actions 权限和顶层发行约束。
+- 数据归档升级为 schema 2：保护数据库和 journal 路径，普通文件默认不覆盖，数据库使用一致
+  读快照，并纳入可恢复的 score/state active pending；
+- archive 带 manifest 与内容 hash，限制总大小、深度、节点、字符串、恢复文件数量和总量，拒绝
+  NaN/Infinity；恢复证据只写入隔离目录；
+- preview 与 apply 共用导入计划，区分新行、完全重复、语义冲突和非法行；attempt 自增 ID 不导入，
+  同时检查 attempt UUID、request ID 和 source key；
+- state baseline 不降低既有 revision，旧 journal 与 direct baseline 按发生时间裁决；slot receipt
+  绑定 state、state version 和 ruleset；
+- 新 state operation 写入前执行纯语义校验；永久拒绝时隔离新 journal 并恢复旧 pending，启动时
+  在后台扫描 pending high-water；
+- 2048 slot schema 5 使用 owner epoch、slot revision 和完整 value hash 做 CAS；接管前重新读取，
+  终局未确认成绩自动补交，v4 `won_announced` 按原值恢复；
+- 2048 普通移动自动存档合并 150 ms 内的连续写，关闭、终局、owner claim/release 仍立即落入
+  durable state 流程；
+- release runner 为每个阶段设置 timeout，构建 wheel 后在隔离 venv 安装并检查入口，生成 SBOM；
+  Actions 固定到 commit SHA，发行约束覆盖完整依赖闭包；
+- 修复俄罗斯方块同一逻辑动作的同义键重复边沿。
 
 ## 约束
 
-- 保持默认本地运行，不增加账号、云同步、遥测、广告或联网对战；
-- 不改变五款游戏当前计分和 ruleset；需改变玩法的建议进入逐项矩阵，不能冒充本轮已完成；
-- 文件锁、SQLite 和 fsync 不进入 pygame 帧线程；跨进程 revision 仍在写线程持久分配；
-- 数据导入默认只预览，必须显式 `--apply`，执行前创建数据库备份，现有冲突行优先；
-- LICENSE 必须由权利人选择。本轮提供权利、素材、商标和版本清单，但不伪造授权结论；
-- branch protection 和 required checks 是仓库设置，未经单独授权不修改。
+- 默认仍为本地单机，不增加账号、云同步、遥测、广告或联网对战；
+- 不把 7-bag、撤销、多地图编辑器、双人模式等新玩法塞入当前 ruleset；需要改变计分、随机分布
+  或完成条件时，必须先定义新 mode/ruleset 和迁移策略；
+- import 必须显式 `--apply`，执行前创建数据库备份；冲突不再静默跳过，而是拒绝整次导入；
+- export/import 取得维护锁；正常桌面写使用共享应用锁，文件解析和 fsync 不进入渲染线程；
+- `LICENSE` 只能由代码与素材权利人选择。仓库提供权利、商标和素材清单，不代替授权决定；
+- branch protection 是额外的 GitHub 仓库设置，本次“提交并推送”授权不包含修改保护规则。
 
 ## 关键决策
 
-1. progress component 是幂等最小单元，aggregate 只是可重建的传输封装。相同 component ID/hash
-   可重复，相同 ID 不同 hash 为冲突。
-2. receipt 不是业务事实本身。任何 duplicate、状态重建或状态查询都以当前业务行为权威来源；
-   回执缓存损坏时修回执，业务行缺失时删回执并保留 journal 的重建机会。
-3. baseline 的 revision 来自业务 `updated_at`，新本机操作同时比较发生时间和顺序。比基线更旧的
-   latest-value journal 被淘汰；单调 merge 仍可贡献尚未应用的 component。
-4. 2048 terminal slot 是可查看的完成记录，不自动替换。active autosave 需要同 owner 或显式声明
-   takeover，正常退出尽力写 released。
-5. 测试仍保留 unittest、gameplay runner 和 stress 三层；`tests.release` 只负责编排与机器结果，
-   不把现有测试强行改写成另一框架。
+1. committed 表与 active pending 是两类不同事实，archive manifest 分别计数；quarantine/backup
+   属于证据，不直接恢复到活动 journal 路径。
+2. 导入不是“尽量 INSERT”。任一身份冲突、关系错误或语义错误都会在 dry-run 中出现，并阻止
+   apply；完全相同的行可以幂等跳过。
+3. latest-value baseline 的业务发生时间可以淘汰更早 journal，即使旧 journal 的逻辑 revision
+   因历史时钟故障更高；单调 merge 仍按 component 幂等合并。
+4. state journal 替换不是提交。数据库永久拒绝新 winner 时，新文件转入 quarantine，替换前的
+   pending 原子恢复；这样既保留故障证据，也不丢用户唯一副本。
+5. 2048 所有权是带 epoch 的租约状态。接管或 released claim 必须引用刚读到的 owner、epoch、
+   slot revision 和完整 value hash；失败后重新读取并停止接收棋盘输入。
+6. 单槽是当前 UI 策略，不再声称支持多窗口共享。CAS 保证不会静默覆盖；多槽需要独立的信息
+   架构、选择界面和删除/导出语义，列入后续 ruleset-neutral 功能。
 
 ## 验收标准
 
-- F01–F23 和 P0–P3 共 118 项均有成立性、处理状态和证据；
-- commit-before-unlink 后晚到 progress 贡献不丢，重复 component 不增加版本；
-- setting/progress/slot 被删或隔离后，有效 journal 可重建，坏 receipt JSON 不删除业务状态；
-- v6 既有新值升级后拒绝更旧 profile、setting 和 slot journal，新 revision 高于基线；
-- 晚到 merge 后 winner duplicate 返回当前合并值，未应用 stale merge 状态仍为 pending；
-- HTTP 身份、score 时间、Sokoban/Zuma HUD、2048 terminal/ownership 均有定向测试；
-- 完成两轮独立复查，完整 storage、gameplay、stress、Ruff、compile、wheel 和数据导入演练通过；
-- 提交推送后 release-gate、三平台和 Python 兼容 CI 通过。
+- F01–F31 和 P0–P3 共 129 项均有成立性、处理状态及代码/测试/决策证据；
+- 导出不能指向 DB/WAL/SHM/journal、active pending 或恢复目录；普通现有文件只有 `--force`
+  才能替换；
+- committed 表来自同一 SQLite 快照，score/state pending 可往返恢复，manifest 损坏可检测；
+- 非空目标库导入不受 surrogate ID 碰撞影响，alternate unique 冲突明确拒绝，preview 与 apply
+  使用同一计划；
+- import、direct write、receipt rebuild 和 journal replay 均不能降低或绕过当前 state winner；
+- 2048 stale takeover、released owner 复活、v4 milestone 和 terminal score 均有确定性测试；
+- 完成两轮独立复查，Ruff、compile、storage、gameplay、stress、release、wheel 安装和数据恢复
+  演练通过；
+- 推送后核验远端提交与 GitHub Actions 当前 run。

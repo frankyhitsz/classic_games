@@ -24,7 +24,6 @@ from __future__ import annotations
 import random
 import uuid
 from collections import deque
-from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -52,6 +51,7 @@ ANIM_DURATION = 0.13   # slide
 SPAWN_DURATION = 0.18  # scale-up for newly spawned tile
 MERGE_DURATION = 0.22  # pop after a merge
 SLOT_LOAD_TIMEOUT_SECONDS = 8.0
+AUTOSAVE_DEBOUNCE_MS = 150
 
 
 def tile_color(value: int):
@@ -120,12 +120,19 @@ class Game2048(BaseGame):
         self._slot_save_pending = False
         self._slot_revision = 0
         self._slot_owner_token = uuid.uuid4().hex
+        self._slot_owner_epoch = 0
+        self._slot_expected_owner_token: Optional[str] = None
+        self._slot_expected_owner_epoch: Optional[int] = None
+        self._slot_expected_revision: Optional[int] = None
+        self._slot_expected_value_hash: Optional[str] = None
         self._slot_conflict_saved = None
         self._slot_conflict_owner: Optional[str] = None
+        self._takeover_reload_expected = None
         self._allow_slot_takeover = False
-        self._takeover_from: Optional[str] = None
         self._new_game_confirm_deadline = 0
         self._slot_load_started_at = 0.0
+        self._autosave_queued = False
+        self._autosave_due_at = 0
         self._initializing_board = True
         self.reset()
         self._initializing_board = False
@@ -347,12 +354,14 @@ class Game2048(BaseGame):
         self._poll_slot_load()
         self._poll_slot_save()
         self._poll_slot_quarantine()
+        self._flush_autosave_if_due()
         self._tick_animations(dt)
 
     def update_overlay(self, dt: float) -> None:
         self._poll_slot_load()
         self._poll_slot_save()
         self._poll_slot_quarantine()
+        self._flush_autosave_if_due()
         # A real pause must freeze the in-flight move. Previously the slide
         # finalized behind the pause overlay while tile spawning was skipped
         # because state != "playing", effectively granting a free move.
@@ -377,7 +386,7 @@ class Game2048(BaseGame):
             # Only spawn after a real move while still playing.
             if self.state == "playing":
                 self._spawn_tile()
-                self._save_autosave_slot()
+                self._queue_autosave_slot()
 
             # Now that the board has settled (post-merge, post-spawn),
             # decide whether this move should trigger a state change.
@@ -418,6 +427,7 @@ class Game2048(BaseGame):
                 t.merge_pop = max(0.0, t.merge_pop - dt / MERGE_DURATION)
 
     def _save_autosave_slot(self, owner_status: str = "active") -> None:
+        self._autosave_queued = False
         if self.slot_load_state != "ready":
             return
         save_slot = getattr(self.backend, "save_slot_async", None)
@@ -425,7 +435,7 @@ class Game2048(BaseGame):
             return
         self._slot_revision += 1
         state = {
-            "version": 4,
+            "version": 5,
             "game_state": self.state,
             "score": self.score,
             "won": self.won,
@@ -436,7 +446,11 @@ class Game2048(BaseGame):
             "confirmed_score": self.submitted_score,
             "owner_token": self._slot_owner_token,
             "owner_status": owner_status,
-            "takeover_from": self._takeover_from,
+            "owner_epoch": self._slot_owner_epoch,
+            "expected_owner_token": self._slot_expected_owner_token,
+            "expected_owner_epoch": self._slot_expected_owner_epoch,
+            "expected_slot_revision": self._slot_expected_revision,
+            "expected_value_hash": self._slot_expected_value_hash,
             "grid": [[self.grid[row][col].value
                       if self.grid[row][col] is not None else 0
                       for col in range(GRID)] for row in range(GRID)],
@@ -448,6 +462,17 @@ class Game2048(BaseGame):
         except Exception:  # noqa: BLE001 - score play remains available
             self._slot_save_future = None
             self.slot_save_error = "自动存档暂时未保存"
+
+    def _queue_autosave_slot(self) -> None:
+        """Coalesce rapid settled moves into one durable latest-value write."""
+        self._autosave_queued = True
+        self._autosave_due_at = (
+            pygame.time.get_ticks() + AUTOSAVE_DEBOUNCE_MS)
+
+    def _flush_autosave_if_due(self) -> None:
+        if (self._autosave_queued
+                and pygame.time.get_ticks() >= self._autosave_due_at):
+            self._save_autosave_slot()
 
     def _poll_slot_save(self) -> None:
         self._poll_slot_save_status()
@@ -464,6 +489,18 @@ class Game2048(BaseGame):
                 if result.get("durable_pending"):
                     self._slot_save_pending = True
                     self.slot_save_error = "自动存档已进入待写入队列"
+                elif result.get("code") == "slot_in_use":
+                    # The slot changed between the fresh load and CAS write.
+                    # Stop accepting moves and reload the current owner/value
+                    # before offering takeover again.
+                    self._slot_save_pending = False
+                    self._allow_slot_takeover = False
+                    self._slot_expected_owner_token = None
+                    self._slot_expected_owner_epoch = None
+                    self._slot_expected_revision = None
+                    self._slot_expected_value_hash = None
+                    self._begin_slot_load()
+                    self.slot_save_error = "自动存档已变化，正在重新读取"
                 else:
                     self._slot_save_pending = False
                     self.slot_save_error = str(
@@ -471,7 +508,10 @@ class Game2048(BaseGame):
             else:
                 self._slot_save_pending = False
                 self.slot_save_error = None
-                self._takeover_from = None
+                self._slot_expected_owner_token = None
+                self._slot_expected_owner_epoch = None
+                self._slot_expected_revision = None
+                self._slot_expected_value_hash = None
         self._poll_slot_save_status()
 
     def _poll_slot_save_status(self) -> None:
@@ -540,23 +580,47 @@ class Game2048(BaseGame):
                        if isinstance(state, dict) else None)
         owner_status = (state.get("owner_status")
                         if isinstance(state, dict) else None)
-        if version == 4:
+        if version in (4, 5):
+            owner_epoch = state.get("owner_epoch", 0)
             valid_owner = (
                 isinstance(owner_token, str)
                 and 16 <= len(owner_token) <= 64
-                and owner_status in {"active", "released"})
+                and owner_status in {"active", "released"}
+                and type(owner_epoch) is int
+                and 0 <= owner_epoch <= (1 << 63) - 1)
             if not valid_owner:
                 self._quarantine_bad_slot("invalid_2048_slot_owner")
                 return
-            if (owner_status == "active"
-                    and owner_token != self._slot_owner_token
-                    and not self._allow_slot_takeover):
-                self._slot_conflict_saved = saved
-                self._slot_conflict_owner = owner_token
-                self.slot_load_state = "conflict"
-                self.slot_load_error = (
-                    "该自动存档仍由另一个游戏窗口使用；可接管或返回菜单")
+            value_hash = saved.get("value_hash")
+            if (version == 5
+                    and (not isinstance(value_hash, str)
+                         or len(value_hash) != 64
+                         or any(char not in "0123456789abcdef"
+                                for char in value_hash))):
+                self._quarantine_bad_slot("invalid_2048_slot_identity")
                 return
+            if (owner_status == "active"
+                    and owner_token != self._slot_owner_token):
+                identity = (
+                    owner_token, owner_epoch,
+                    state.get("slot_revision", 0), value_hash)
+                if self._takeover_reload_expected is not None:
+                    if identity != self._takeover_reload_expected:
+                        self._slot_conflict_saved = saved
+                        self._slot_conflict_owner = owner_token
+                        self._takeover_reload_expected = None
+                        self.slot_load_state = "conflict"
+                        self.slot_load_error = (
+                            "自动存档在确认期间已变化；请检查后再次按 K 接管")
+                        return
+                    self._allow_slot_takeover = True
+                elif not self._allow_slot_takeover:
+                    self._slot_conflict_saved = saved
+                    self._slot_conflict_owner = owner_token
+                    self.slot_load_state = "conflict"
+                    self.slot_load_error = (
+                        "该自动存档仍由另一个游戏窗口使用；可接管或返回菜单")
+                    return
         flat = ([value for row in grid for value in row]
                 if isinstance(grid, list)
                 and all(isinstance(row, list) for row in grid) else [])
@@ -566,7 +630,7 @@ class Game2048(BaseGame):
                 "自动存档来自不兼容的规则版本；可返回菜单或确认新开，"
                 "原存档不会被当作损坏数据删除")
             return
-        if (not isinstance(state, dict) or version not in (1, 2, 3, 4)
+        if (not isinstance(state, dict) or version not in (1, 2, 3, 4, 5)
                 or type(score) is not int or not 0 <= score <= MAX_SCORE
                 or not isinstance(grid, list) or len(grid) != GRID
                 or any(not isinstance(row, list) or len(row) != GRID
@@ -595,7 +659,9 @@ class Game2048(BaseGame):
                     for row in range(GRID - 1) for col in range(GRID))
             if not movable:
                 game_state = "gameover"
-        if version in (2, 3, 4):
+        confirmed_score = None
+        slot_revision = 0
+        if version in (2, 3, 4, 5):
             attempt_uuid = state.get("attempt_uuid")
             revision = state.get(
                 "attempt_revision", state.get("revision"))
@@ -631,8 +697,15 @@ class Game2048(BaseGame):
         self.won = bool(state.get("won"))
         self.state = game_state
         self._won_announced = (
-            bool(state.get("won_announced")) if version in (2, 3) else self.won)
-        if version in (2, 3, 4):
+            bool(state.get("won_announced"))
+            if version in (2, 3, 4, 5) else self.won)
+        if self.state == "playing" and self.won and not self._won_announced:
+            # A crash can happen after the 2048 tile is committed but before
+            # the overlay/score acknowledgement. Restore that milestone as a
+            # terminal UI state instead of silently marking it announced.
+            self.state = "won"
+            self._won_announced = True
+        if version in (2, 3, 4, 5):
             self.attempt_context.attempt_uuid = attempt_uuid
             self.attempt_context.revision = revision
             self._score_attempt_uuid = attempt_uuid
@@ -644,25 +717,56 @@ class Game2048(BaseGame):
             self.submitted_score = confirmed_score
             self.score_submitted = confirmed_score is not None
             self._slot_revision = slot_revision
+        current_epoch = (
+            state.get("owner_epoch", 0) if version in (4, 5) else 0)
+        self._slot_owner_epoch = current_epoch
         self.anim_t = 1.0
         self.slot_load_state = "ready"
         self.slot_load_error = None
         needs_owner_claim = (
             version in (1, 2, 3)
-            or (version == 4 and owner_status == "released"))
+            or (version in (4, 5) and owner_status == "released")
+            or (version in (4, 5)
+                and owner_token != self._slot_owner_token))
+        if needs_owner_claim:
+            self._slot_expected_owner_token = (
+                owner_token if version in (4, 5) else None)
+            self._slot_expected_owner_epoch = current_epoch
+            self._slot_expected_revision = slot_revision
+            self._slot_expected_value_hash = saved.get("value_hash")
+            self._slot_owner_epoch = current_epoch + 1
         self._allow_slot_takeover = False
+        self._takeover_reload_expected = None
         self._slot_conflict_saved = None
-        if needs_owner_claim or self._takeover_from is not None:
+        if needs_owner_claim:
             self._save_autosave_slot()
+        if (self.state in {"won", "gameover"}
+                and (confirmed_score is None or confirmed_score < self.score)):
+            restored_extra = {
+                "max_tile": self._max_tile(), "won": self.won}
+            self.extra = restored_extra
+            self._submit_score(extra=restored_extra)
 
     def _take_over_conflicting_slot(self) -> None:
         if self._slot_conflict_saved is None:
             return
-        self._allow_slot_takeover = True
-        self._takeover_from = self._slot_conflict_owner
-        future = Future()
-        future.set_result(self._slot_conflict_saved)
-        self._slot_load_future = future
+        state = self._slot_conflict_saved.get("state", {})
+        self._takeover_reload_expected = (
+            state.get("owner_token"), state.get("owner_epoch", 0),
+            state.get("slot_revision", 0),
+            self._slot_conflict_saved.get("value_hash"))
+        load_slot = getattr(self.backend, "load_slot_async", None)
+        if not callable(load_slot):
+            self.slot_load_error = "无法重新读取自动存档，未执行接管"
+            return
+        try:
+            self._slot_load_future = load_slot(
+                self.profile_id, self.game_id, "autosave")
+        except Exception as exc:  # noqa: BLE001
+            self._slot_load_future = None
+            self._takeover_reload_expected = None
+            self.slot_load_error = f"接管前重新读取失败：{exc}"
+            return
         self.slot_load_state = "loading"
         self.slot_load_error = None
         self._slot_load_started_at = pygame.time.get_ticks() / 1000.0

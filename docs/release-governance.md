@@ -27,5 +27,6 @@
 - 改变计分、关卡完成条件或辅助规则时增加对应游戏 `ruleset_version`，历史成绩保留原版本；
 - 发布标签前运行 `python -m tests.release release`，并确认 release-gate、三平台测试和兼容矩阵通过。
 
-`constraints-release.txt` 固定正式验证使用的顶层依赖版本；`pyproject.toml` 的范围用于普通安装和
-兼容性 CI。升级约束时应同时跑依赖审计、完整测试和 wheel smoke，并在变更记录写明原因。
+`constraints-release.txt` 固定正式验证使用的完整解析依赖闭包；`pyproject.toml` 的范围用于普通
+安装和兼容性 CI。升级约束时应重新解析三平台依赖，运行依赖审计、完整测试和隔离 venv wheel
+smoke，并检查 release profile 输出的 CycloneDX `release-sbom.json`。

@@ -9,6 +9,9 @@ storage-tests.log
 stress-tests.log
 gameplay-tests.log
 coverage.xml
+release-results.xml
+release-results.json
+release-sbom.json
 htmlcov/
 build/
 dist/

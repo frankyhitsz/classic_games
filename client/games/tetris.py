@@ -447,27 +447,30 @@ class Tetris(BaseGame):
         if event.type == pygame.KEYDOWN and self.state == "playing":
             if event.key in (pygame.K_LEFT, pygame.K_a):
                 is_new = event.key not in self.pressed_keys
+                prior_action = self.horizontal_hold
                 self.pressed_keys.add(event.key)
                 if is_new:
                     self._horizontal_press_order.append(event.key)
-                    self._move(-1)
                 self._refresh_held_actions()
-                if is_new:
+                if is_new and prior_action != -1:
+                    self._move(-1)
                     self.horizontal_repeat_timer = HORIZONTAL_DAS
             elif event.key in (pygame.K_RIGHT, pygame.K_d):
                 is_new = event.key not in self.pressed_keys
+                prior_action = self.horizontal_hold
                 self.pressed_keys.add(event.key)
                 if is_new:
                     self._horizontal_press_order.append(event.key)
-                    self._move(1)
                 self._refresh_held_actions()
-                if is_new:
+                if is_new and prior_action != 1:
+                    self._move(1)
                     self.horizontal_repeat_timer = HORIZONTAL_DAS
             elif event.key in (pygame.K_DOWN, pygame.K_s):
                 is_new = event.key not in self.pressed_keys
+                prior_action = self.soft_drop_held
                 self.pressed_keys.add(event.key)
                 self._refresh_held_actions()
-                if is_new:
+                if is_new and not prior_action:
                     self._soft_drop()
                     self.soft_drop_repeat_timer = SOFT_DROP_DAS
             elif event.key in (pygame.K_UP, pygame.K_x):

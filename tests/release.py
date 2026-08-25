@@ -12,6 +12,17 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+STAGE_TIMEOUTS = {
+    "ruff": 120,
+    "dependency-audit": 300,
+    "dependency-sbom": 300,
+    "compile": 120,
+    "wheel-smoke": 300,
+    "storage": 600,
+    "stress": 600,
+    "gameplay": 900,
+}
+
 
 def _commands(profile: str) -> list[tuple[str, list[str]]]:
     storage = [
@@ -31,8 +42,16 @@ def _commands(profile: str) -> list[tuple[str, list[str]]]:
                                   "--cache-dir", str(Path(tempfile.gettempdir())
                                                      / "classic-games-pip-audit"),
                                   "-r", "constraints-release.txt"]),
+            ("dependency-sbom", [
+                sys.executable, "-m", "pip_audit",
+                "--cache-dir", str(Path(tempfile.gettempdir())
+                                    / "classic-games-pip-audit"),
+                "--format", "cyclonedx-json", "--output",
+                "release-sbom.json", "-r", "constraints-release.txt",
+            ]),
             ("compile", [sys.executable, "-m", "compileall", "-q",
                          "client", "game_service", "server", "tests"]),
+            ("wheel-smoke", [sys.executable, "-m", "tests.wheel_smoke"]),
         ]
     return commands
 
@@ -57,6 +76,31 @@ def _write_junit(path: Path, results: list[dict]) -> None:
     ET.ElementTree(suite).write(path, encoding="utf-8", xml_declaration=True)
 
 
+def _run_stage(name: str, command: list[str], *, cwd: Path,
+               environment: dict, timeout: int | None = None) -> dict:
+    timeout = STAGE_TIMEOUTS[name] if timeout is None else timeout
+    started = time.perf_counter()
+    try:
+        completed = subprocess.run(
+            command, cwd=cwd, env=environment, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            check=False, timeout=timeout)
+        returncode = completed.returncode
+        output = completed.stdout
+    except subprocess.TimeoutExpired as exc:
+        returncode = 124
+        partial = exc.stdout or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", errors="replace")
+        output = f"{partial}\n[{name}] exceeded its {timeout}s timeout\n"
+    duration = time.perf_counter() - started
+    return {
+        "name": name, "command": command, "returncode": returncode,
+        "duration_seconds": round(duration, 3), "output": output,
+        "timeout_seconds": timeout,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run Classic Games test profiles")
     parser.add_argument("profile", choices=("fast", "full", "release"),
@@ -73,20 +117,14 @@ def main(argv: list[str] | None = None) -> int:
             "PYTHONUTF8": "1",
         })
         for name, command in _commands(args.profile):
-            started = time.perf_counter()
-            completed = subprocess.run(
-                command, cwd=Path(__file__).resolve().parents[1],
-                env=environment, text=True, stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT, check=False)
-            duration = time.perf_counter() - started
-            result = {"name": name, "command": command,
-                      "returncode": completed.returncode,
-                      "duration_seconds": round(duration, 3),
-                      "output": completed.stdout}
+            result = _run_stage(
+                name, command, cwd=Path(__file__).resolve().parents[1],
+                environment=environment)
             results.append(result)
-            print(completed.stdout, end="")
-            print(f"[{name}] exit={completed.returncode} time={duration:.2f}s")
-            if completed.returncode:
+            print(result["output"], end="")
+            print(f"[{name}] exit={result['returncode']} "
+                  f"time={result['duration_seconds']:.2f}s")
+            if result["returncode"]:
                 break
     summary = {"ok": all(result["returncode"] == 0 for result in results),
                "profile": args.profile, "results": results}

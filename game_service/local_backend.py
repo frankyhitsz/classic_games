@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .catalog import GAME_BY_ID, public_games
+from .maintenance import maintenance_lock
 from .mutation import (MutationError, ScoreMutation, canonical_json,
                        normalize_score_mutation)
 from .profile import ProfileIdentity, ProfileIdentityError
@@ -675,6 +676,15 @@ class PersistentSaveOutbox:
         return [mutation.transport_payload()
                 for _envelope, mutation in self.list_envelopes()]
 
+    def has_entries(self) -> bool:
+        """Cheap startup hint that never parses or rewrites spool files."""
+        try:
+            with os.scandir(self.path) as entries:
+                return any(entry.is_file() and entry.name.endswith(".json")
+                           for entry in entries)
+        except (FileNotFoundError, NotADirectoryError, OSError):
+            return False
+
     def remove(self, request_id: str) -> None:
         try:
             self._target(request_id).unlink()
@@ -998,6 +1008,7 @@ class PersistentStateOutbox:
             time.time_ns() if logical_revision is None else logical_revision,
             operation_id, components=components, updated_at=updated_at)
         published = True
+        previous_operation = None
         with self._lock, self._key_lock(key):
             target = self._target(key)
             existed = target.is_file()
@@ -1009,6 +1020,7 @@ class PersistentStateOutbox:
                     self._quarantine_locked(target, "invalid-current")
                     existed = False
                 else:
+                    previous_operation = existing
                     if incoming["kind"] == existing["kind"] == "progress":
                         incoming = self._merge_progress_operations(
                             existing, incoming)
@@ -1042,6 +1054,7 @@ class PersistentStateOutbox:
             "payload_hash": incoming["payload_hash"],
             "published": published,
             "operation": incoming,
+            "previous_operation": previous_operation,
         }
 
     @classmethod
@@ -1307,6 +1320,72 @@ class PersistentStateOutbox:
                     RecursionError):
                 return False
 
+    def reject_and_restore_if_current(
+            self, key: str, payload_hash: str,
+            previous_operation: Optional[dict], reason: str) -> bool:
+        """Quarantine a rejected winner and restore the prior valid journal.
+
+        The replacement is prepared and fsynced before the rejected file is
+        moved, so a process crash never destroys the only durable copy of the
+        previous pending operation.
+        """
+        safe_reason = "".join(
+            char if char.isalnum() or char in "-_" else "-"
+            for char in str(reason))[:80] or "rejected"
+        with self._lock, self._key_lock(key):
+            target = self._target(key)
+            try:
+                current = self._parse(target.read_bytes())
+            except (FileNotFoundError, OSError, StoreError, TypeError,
+                    ValueError, RecursionError):
+                return False
+            if current["payload_hash"] != payload_hash:
+                return False
+            temp = None
+            if previous_operation is not None:
+                try:
+                    previous = self._parse(
+                        canonical_json(previous_operation).encode("utf-8"))
+                    if previous["key"] != key:
+                        return False
+                    temp = self.path / (
+                        f".{target.name}.{uuid.uuid4().hex}.restore")
+                    PersistentSaveOutbox._write_bytes(
+                        temp, canonical_json(previous).encode("utf-8"))
+                except (MutationError, OSError, StoreError, TypeError,
+                        ValueError, RecursionError, MemoryError):
+                    if temp is not None:
+                        try:
+                            temp.unlink()
+                        except FileNotFoundError:
+                            pass
+                    return False
+            if not self._quarantine_locked(target, safe_reason):
+                if temp is not None:
+                    try:
+                        temp.unlink()
+                    except FileNotFoundError:
+                        pass
+                return False
+            if temp is not None:
+                try:
+                    os.replace(temp, target)
+                    PersistentSaveOutbox._fsync_directory(self.path)
+                    self._count += 1
+                finally:
+                    try:
+                        temp.unlink()
+                    except FileNotFoundError:
+                        pass
+            return True
+
+    def high_water(self) -> int:
+        """Highest revision in active pending state journals."""
+        return max(
+            (entry["logical_revision"]
+             for entry in self.list_entries(MAX_SPOOL_FILES)),
+            default=0)
+
     def count(self) -> int:
         with self._lock:
             return self._count
@@ -1499,7 +1578,9 @@ class LocalBackendClient:
                 legacy_outbox = None
         self.outbox = PersistentSaveOutbox(
             spool_path, legacy_path=legacy_outbox)
-        had_pending_scores = bool(self.outbox.list())
+        # Startup only needs to know whether work exists. Parsing, upgrading,
+        # quarantining and fsyncing every envelope belongs on the worker.
+        had_pending_scores = self.outbox.has_entries()
         self.state_outbox = PersistentStateOutbox(
             spool_path.with_name(f"{spool_path.name}-state"))
         notices = [self.recovery_notice,
@@ -1548,6 +1629,7 @@ class LocalBackendClient:
         self._next_auto_retry_at = 0.0
         if self.store is None and defer_initialization:
             self._read_worker.submit(self._try_reopen_store)
+        self._read_worker.submit(self._refresh_state_high_water)
         if had_pending_scores or self._pending_state_count:
             self.retry_failed_saves()
         elif self.store is not None:
@@ -1782,6 +1864,16 @@ class LocalBackendClient:
         return self.state_outbox._operation(
             key, method, args, revision, uuid.uuid4().hex)
 
+    def _refresh_state_high_water(self) -> int:
+        try:
+            high_water = self.state_outbox.high_water()
+        except (OSError, StoreError):
+            return 0
+        with self._lock:
+            self._last_state_revision = max(
+                self._last_state_revision, high_water)
+        return high_water
+
     def _emit_local_state_event(self, operation: dict, state: SaveState,
                                 result: dict) -> LocalStateEvent:
         event = LocalStateEvent(
@@ -1803,13 +1895,33 @@ class LocalBackendClient:
         return event
 
     def _durable_state_write(self, operation: dict):
+        with maintenance_lock(
+                self._selected_db_path, exclusive=False, timeout=300.0):
+            return self._durable_state_write_locked(operation)
+
+    def _durable_state_write_locked(self, operation: dict):
+        key = operation["key"]
+        try:
+            LocalGameStore.validate_state_operation(operation)
+        except StoreError as exc:
+            with self._lock:
+                self._unpublished_state.discard(operation["operation_id"])
+                self._non_durable_state.pop(key, None)
+            result = {**exc.result(), "journal_unchanged": True}
+            self._emit_local_state_event(
+                operation, SaveState.PERMANENT_FAILURE, result)
+            return result
         with self._lock:
             allocate_revision = (
                 operation["operation_id"] in self._unpublished_state)
         if allocate_revision:
+            existing = self.state_outbox.read_key(key)
+            observed = operation["logical_revision"]
+            if existing is not None:
+                observed = max(observed, existing["logical_revision"])
             try:
                 revision = self.state_outbox.next_revision(
-                    operation["logical_revision"])
+                    observed)
             except (OSError, StoreError):
                 pass
             else:
@@ -1818,9 +1930,9 @@ class LocalBackendClient:
                 with self._lock:
                     self._last_state_revision = max(
                         self._last_state_revision, revision)
-        key = operation["key"]
         journal_operation = operation
         payload_hash = None
+        previous_operation = None
         try:
             receipt = self.state_outbox.put(
                 key, operation["method"], tuple(operation["args"]),
@@ -1834,8 +1946,12 @@ class LocalBackendClient:
         else:
             payload_hash = receipt["payload_hash"]
             journal_operation = receipt["operation"]
+            previous_operation = receipt["previous_operation"]
             with self._lock:
                 self._unpublished_state.discard(operation["operation_id"])
+                self._last_state_revision = max(
+                    self._last_state_revision,
+                    journal_operation["logical_revision"])
             if not receipt["published"]:
                 result = {
                     "ok": True, "superseded": True,
@@ -1868,14 +1984,23 @@ class LocalBackendClient:
                     f"profile:{journal_operation['args'][0]}"))
             if not exc.retryable and not waiting_for_profile and exc.code not in {
                     "database_unavailable", "schema_repair_required"}:
+                rejected_preserved = False
                 if payload_hash is not None:
-                    self.state_outbox.remove_if_current(key, payload_hash)
+                    rejected_preserved = (
+                        self.state_outbox.reject_and_restore_if_current(
+                            key, payload_hash, previous_operation, exc.code))
                 with self._lock:
                     self._pending_state_count = self.state_outbox.count()
                     self._non_durable_state.pop(key, None)
                     self._unpublished_state.discard(
                         operation["operation_id"])
-                result = exc.result()
+                result = {
+                    **exc.result(),
+                    "rejected_journal_preserved": rejected_preserved,
+                    "previous_pending_restored": (
+                        rejected_preserved
+                        and previous_operation is not None),
+                }
                 self._emit_local_state_event(
                     operation, SaveState.PERMANENT_FAILURE, result)
                 return result
@@ -2310,6 +2435,14 @@ class LocalBackendClient:
     def _save_mutation(self, mutation: ScoreMutation,
                        already_spooled: bool = False,
                        occurred_at: Optional[float] = None) -> dict:
+        with maintenance_lock(
+                self._selected_db_path, exclusive=False, timeout=300.0):
+            return self._save_mutation_locked(
+                mutation, already_spooled, occurred_at)
+
+    def _save_mutation_locked(self, mutation: ScoreMutation,
+                              already_spooled: bool = False,
+                              occurred_at: Optional[float] = None) -> dict:
         occurred_at = time.time() if occurred_at is None else occurred_at
         spool_error: Optional[Exception] = None
         if not already_spooled:
@@ -2458,6 +2591,11 @@ class LocalBackendClient:
                     + len(self._unpublished_state))
 
     def _replay_state_entries(self) -> tuple[int, bool, bool]:
+        with maintenance_lock(
+                self._selected_db_path, exclusive=False, timeout=300.0):
+            return self._replay_state_entries_locked()
+
+    def _replay_state_entries_locked(self) -> tuple[int, bool, bool]:
         completed = 0
         blocked = False
         repair_blocked = False
@@ -2475,10 +2613,13 @@ class LocalBackendClient:
             except StoreError as exc:
                 if not exc.retryable and exc.code not in {
                         "database_unavailable", "schema_repair_required"}:
-                    if self.state_outbox.remove_if_current(
-                            entry["key"], entry["payload_hash"]):
+                    if self.state_outbox.reject_and_restore_if_current(
+                            entry["key"], entry["payload_hash"], None,
+                            exc.code):
                         self._emit_local_state_event(
-                            entry, SaveState.PERMANENT_FAILURE, exc.result())
+                            entry, SaveState.PERMANENT_FAILURE,
+                            {**exc.result(),
+                             "rejected_journal_preserved": True})
                 else:
                     blocked = True
                     repair_blocked = exc.code == "schema_repair_required"
