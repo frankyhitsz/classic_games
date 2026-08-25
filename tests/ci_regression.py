@@ -113,6 +113,9 @@ def main() -> int:
             server.shutdown()
             server.server_close()
             server_thread.join(timeout=5)
+            finalizer = app.extensions.get("application_session_finalizer")
+            if finalizer is not None:
+                finalizer()
 
 
 if __name__ == "__main__":

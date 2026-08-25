@@ -1446,15 +1446,18 @@ run("2048-session-score-update", """
     from client.common.network import BackendClient
     player = f'update_{os.getpid()}'
     be = BackendClient()
-    first = be.submit_score('2048', player, 8_888_001, replace=True)
+    first = be.submit_score_reliable_async(
+        '2048', player, 8_888_001, replace=True).result(timeout=5)
     assert first and first.get('id'), first
-    second = be.submit_score('2048', player, 8_888_250,
-                             submission_id=first['id'])
+    second = be.submit_score_reliable_async(
+        '2048', player, 8_888_250, replace=True,
+        submission_id=first['id']).result(timeout=5)
     assert second and second.get('updated') is True, second
     assert second['id'] == first['id']
     rows = [e for e in be.leaderboard('2048', limit=50)
             if e.get('player') == player]
     assert len(rows) == 1 and rows[0]['score'] == 8_888_250, rows
+    be.close()
     pygame.quit()
 """)
 
