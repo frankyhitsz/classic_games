@@ -9,7 +9,7 @@
 - [x] 写入逐条审查答复和 108 项矩阵；
 - [x] 第一轮独立复查：故障注入、配额、并发与恢复；
 - [x] 第二轮独立复查：兼容性、性能和完整 release 验证；
-- [ ] 提交、推送并核验远端 CI。
+- [x] 提交、推送并核验远端 CI。
 
 ## 当前发现
 
@@ -72,4 +72,12 @@
 
 ## 远端验证
 
-尚未执行。
+- 功能提交 `10363ca` 推送后触发
+  [CI #30](https://github.com/frankyhitsz/classic_games/actions/runs/32807435102)。六个 job 通过，
+  Windows storage 在回滚镜像 `rb` descriptor 上调用 `fsync` 返回 `EBADF`；Windows 自身的
+  wheel+sdist smoke 已先通过，故障与 archive 内容无关；
+- 修复提交 `05a0b54` 将镜像以不改内容的 `rb+` descriptor 同步。对应
+  [CI #31](https://github.com/frankyhitsz/classic_games/actions/runs/32807665713) 完整成功：
+  release-gate、core-only、Python 3.12/3.13、Ubuntu、macOS、Windows 共 7 个 job 全部通过；
+- 远端 `main` 已核对为 `05a0b5457aa87b3c0fc169486f6bae66413682f2`。当前环境没有 `gh`，
+  GitHub 匿名 API 又达到 rate limit，不能把 branch protection 写成已配置；P1-35 保持“需仓库权限”。
