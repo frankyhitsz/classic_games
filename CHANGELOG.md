@@ -2,6 +2,16 @@
 
 ## 未发布
 
+- 普通客户端与 Flask 在打开数据库前恢复中断导入；import transaction v2 为 rollback image、
+  staged 和 before 内容加 hash，并限制目标 namespace、符号链接和发布竞态。
+- archive manifest format 2 校验应用、规则、计数和 completeness；recovery 扫描 no-follow，
+  replace restore 清理未知表和完整 active journal namespace。
+- 2048 在 owner claim ACK 前保持输入门禁，关闭时同步发布 durable release intent；旧的 in-flight
+  保存不能再覆盖较新的退出状态。
+- 俄罗斯方块采用 7-bag，并增加落点影子和每块一次的保留交换；规则版本升为
+  `tetris-assist-3`。推箱子可用 `[/]`、PageUp/PageDown 或数字键选择已解锁练习关。
+- 数据工具增加事务查看、证据导出、显式恢复和带完整 archive 证明的 recovery 清理；release gate
+  对照安装清单/SBOM，并拒绝未登记的运行时素材。
 - 数据库升级为 schema v7，state receipt 绑定业务值 hash；旧库为已有档案、设置、进度和存档
   建立基线，损坏回执可从业务行修复，业务行隔离时同步失效回执。
 - state journal 升级为 schema 3，单调进度按 component 幂等；聚合使用独立 ID，不再因

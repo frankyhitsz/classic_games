@@ -400,6 +400,14 @@ class Sokoban(BaseGame):
     def update(self, dt: float):
         self._poll_progress()
 
+    def _select_practice_level(self, index: int) -> bool:
+        """Open an unlocked level without changing the ranked campaign run."""
+        if not 0 <= index < min(self.unlocked_level, len(LEVELS)):
+            return False
+        self.load_level(index)
+        self.practice_mode = True
+        return True
+
     def handle_event(self, event):
         # Let BaseGame handle QUIT, ESC (return to launcher), P (pause),
         # and overlay-button clicks first.
@@ -426,8 +434,18 @@ class Sokoban(BaseGame):
                 self.practice_mode = True
             return
         if event.key == pygame.K_k and self.unlocked_level > 1:
-            self.load_level(self.unlocked_level - 1)
-            self.practice_mode = True
+            self._select_practice_level(self.unlocked_level - 1)
+            return
+        if event.key in (pygame.K_LEFTBRACKET, pygame.K_PAGEUP):
+            count = min(self.unlocked_level, len(LEVELS))
+            self._select_practice_level((self.level_idx - 1) % count)
+            return
+        if event.key in (pygame.K_RIGHTBRACKET, pygame.K_PAGEDOWN):
+            count = min(self.unlocked_level, len(LEVELS))
+            self._select_practice_level((self.level_idx + 1) % count)
+            return
+        if pygame.K_1 <= event.key <= pygame.K_9:
+            self._select_practice_level(event.key - pygame.K_1)
             return
         if event.key in (pygame.K_u, pygame.K_BACKSPACE):
             if self.state == "playing":
@@ -571,7 +589,7 @@ class Sokoban(BaseGame):
                   (header.right - sw - 12, header.y + 9), size=15,
                   color=COLORS["text"], bold=True)
         hint = (f"已解锁 {self.unlocked_level}/{len(LEVELS)} · "
-                "K 前往最高关 · N 练习跳关 · Esc 返回")
+                "[/] 选关 · 1–9 直达 · K 最高关 · Esc 返回")
         if self.progress_save_message:
             hint = f"{self.progress_save_message} · {hint}"
         hw = _font(11).size(hint)[0]
@@ -609,7 +627,7 @@ class Sokoban(BaseGame):
 
         # Footer
         draw_text(self.screen,
-                  "方向键/WASD 移动 · U/退格 撤销 · R 重置 · N 跳关(练习) · Esc 退出",
+                  "方向键/WASD 移动 · U/退格 撤销 · R 重置 · [/] 已解锁选关 · Esc 退出",
                   (self.width // 2, self.height - 18),
                   size=12, color=COLORS["text_dim"], center=True)
 

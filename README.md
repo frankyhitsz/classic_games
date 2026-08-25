@@ -163,7 +163,8 @@ classic_games/
 │   ├── test_storage_v7.py
 │   ├── test_storage_v8.py
 │   ├── test_storage_v9.py
-│   └── test_storage_v10.py
+│   ├── test_storage_v10.py
+│   └── test_storage_v11.py
 ├── docs/               # 审查记录、设计决策和维护文档
 ├── pyproject.toml
 ├── environment.yml
@@ -200,6 +201,7 @@ score/state pending，并用 manifest hash 检测损坏：
 python -m game_service.data_cli status
 python -m game_service.data_cli export classic-games-backup.json --include-recovery
 python -m game_service.data_cli preview-import classic-games-backup.json
+python -m game_service.data_cli transactions
 ```
 
 导出默认不覆盖任何现有文件，也不能写到数据库、SQLite sidecar、pending 或 recovery 路径。确认
@@ -226,7 +228,18 @@ python -m game_service.data_cli restore-replace classic-games-backup.json --appl
 ```
 
 导入先写 staging 和阶段 journal，再提交数据库并原子发布文件。任一阶段失败会自动恢复导入前的
-数据库和 journal；进程在中途退出时，下一次 export、preview 或 import 会先完成回滚。
+数据库和 journal；进程在中途退出时，下一次普通客户端、HTTP 服务或维护命令会在打开数据库前
+先完成回滚。损坏事务不会被猜测性恢复，可先查看和导出证据，再显式重试：
+
+```bash
+python -m game_service.data_cli transactions
+python -m game_service.data_cli export-transaction .games.db.import-... import-txn.json
+python -m game_service.data_cli recover-transactions --apply
+```
+
+事务 v2 对 SQLite rollback image、staged 和 before 文件校验 size/sha256；发布时还会确认目标自
+prepare 后未变化。同一目标的相同内容会去重，不同内容会拒绝整次计划。完整协议说明见
+[`docs/storage-protocol.md`](docs/storage-protocol.md)。
 
 `--include-recovery` 中的 quarantine/backup 是证据，不是 active journal。导入时只恢复到
 `imported-recovery/<archive-id>/`，不会覆盖正在使用的 `pending/` 或 `pending-state/`。
@@ -236,7 +249,7 @@ python -m game_service.data_cli restore-replace classic-games-backup.json --appl
 “最近游戏”和“本机最佳”只统计已结算的 classic 记录；中途重开或返回目前不计
 作一次结算。
 
-当前规则版本为：俄罗斯方块 `tetris-assist-2`、贪吃蛇 `snake-classic-1`、2048
+当前规则版本为：俄罗斯方块 `tetris-assist-3`、贪吃蛇 `snake-classic-1`、2048
 `2048-classic-2`、推箱子 `sokoban-campaign-2`、祖玛 `zuma-classic-2`。从旧库
 导入的记录标为 `legacy-v1`，保留在历史中，但不参与当前规则的默认最佳成绩。
 本机档案使用独立 UUID，显示名只负责界面展示；旧显示名身份在 schema v5 迁移时

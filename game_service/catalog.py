@@ -30,7 +30,7 @@ class GameDescriptor:
 GAMES = (
     GameDescriptor("tetris", "俄罗斯方块", "经典下落方块消除游戏",
                    "client.games.tetris", "旋转与消行", "game_tetris",
-                   "tetris-assist-2", ScorePolicy.FINAL_ONLY),
+                   "tetris-assist-3", ScorePolicy.FINAL_ONLY),
     GameDescriptor("snake", "贪吃蛇", "控制蛇吃食物变长",
                    "client.games.snake", "追逐与成长", "game_snake",
                    "snake-classic-1", ScorePolicy.FINAL_ONLY),

@@ -18,6 +18,7 @@ STAGE_TIMEOUTS = {
     "dependency-sbom": 300,
     "compile": 120,
     "wheel-smoke": 600,
+    "release-manifest": 120,
     "storage": 600,
     "stress": 600,
     "gameplay": 900,
@@ -52,6 +53,8 @@ def _commands(profile: str) -> list[tuple[str, list[str]]]:
             ("compile", [sys.executable, "-m", "compileall", "-q",
                          "client", "game_service", "server", "tests"]),
             ("wheel-smoke", [sys.executable, "-m", "tests.wheel_smoke"]),
+            ("release-manifest", [
+                sys.executable, "-m", "tests.release_manifest"]),
         ]
     return commands
 

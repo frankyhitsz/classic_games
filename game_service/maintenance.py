@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import stat
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -10,6 +11,35 @@ from pathlib import Path
 
 class MaintenanceBusyError(OSError):
     """Raised when an application/maintenance lock cannot be acquired."""
+
+
+def _open_control_file(path: Path) -> int:
+    """Open a lock without following a user-controlled final symlink."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise MaintenanceBusyError(
+            f"unsafe or unavailable data lock: {path.name}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise MaintenanceBusyError(
+                f"data lock is not an ordinary file: {path.name}")
+        if os.name == "posix":
+            if metadata.st_uid != os.getuid():
+                raise MaintenanceBusyError(
+                    f"data lock has another owner: {path.name}")
+            if metadata.st_mode & 0o022:
+                raise MaintenanceBusyError(
+                    f"data lock is writable by another account: {path.name}")
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
 
 
 def lock_path(database: Path | str) -> Path:
@@ -66,8 +96,7 @@ class ApplicationSession:
     @classmethod
     def acquire(cls, database: Path | str, timeout: float = 2.0):
         path = application_lock_path(database)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        descriptor = _open_control_file(path)
         deadline = time.monotonic() + max(0.0, timeout)
         try:
             if os.fstat(descriptor).st_size < 256:
@@ -125,8 +154,7 @@ class ApplicationSession:
 def inactive_application_lock(database: Path | str, timeout: float = 2.0):
     """Hold an exclusive lease after every cooperating backend has closed."""
     path = application_lock_path(database)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    descriptor = _open_control_file(path)
     try:
         if os.fstat(descriptor).st_size < 256:
             os.ftruncate(descriptor, 256)
@@ -170,8 +198,7 @@ def maintenance_lock(database: Path | str, *, exclusive: bool,
                      timeout: float = 2.0):
     """Acquire the shared application or exclusive maintenance gate."""
     path = lock_path(database)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    descriptor = _open_control_file(path)
     try:
         if os.fstat(descriptor).st_size == 0:
             os.write(descriptor, b"\0")
@@ -188,3 +215,19 @@ def maintenance_lock(database: Path | str, *, exclusive: bool,
             _unlock(descriptor)
     finally:
         os.close(descriptor)
+
+
+def recovered_application_session(database: Path | str,
+                                  timeout: float = 2.0) -> ApplicationSession:
+    """Recover interrupted imports before granting an application lease."""
+    database = Path(database).expanduser().resolve(strict=False)
+    with (inactive_application_lock(database, timeout=timeout),
+          maintenance_lock(database, exclusive=True, timeout=timeout)):
+        # Imported lazily so the recovery module can keep using StoreError
+        # without creating an import cycle at module load time.
+        from .import_transaction import recover_import_transactions
+
+        recover_import_transactions(database)
+    # If maintenance starts in the small hand-off window it wins the
+    # exclusive application lock; this shared acquisition then waits for it.
+    return ApplicationSession.acquire(database, timeout=timeout)

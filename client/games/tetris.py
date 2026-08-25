@@ -15,6 +15,7 @@ Controls:
   Z       rotate counter-clockwise
   ↓       soft drop
   SPACE   hard drop
+  C       hold / swap piece
   P       pause
   R       restart after game over
   Esc     quit back to launcher
@@ -163,9 +164,11 @@ class Tetris(BaseGame):
 
     def __init__(self, backend: Optional[GameDataService] = None,
                  player: str = "anonymous",
-                 profile_id: Optional[str] = None):
+                 profile_id: Optional[str] = None,
+                 rng: Optional[random.Random] = None):
         super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player,
                          profile_id=profile_id)
+        self.rng = rng or random
         self.reset()
 
     # ------------------------------------------------------------------
@@ -174,7 +177,10 @@ class Tetris(BaseGame):
         self.board: List[List[Optional[str]]] = [
             [None] * COLS for _ in range(ROWS)]
         self.piece: Optional[Piece] = None
-        self.next_kind = random.choice(SHAPE_KEYS)
+        self._piece_bag: List[str] = []
+        self.next_kind = self._draw_bag_kind()
+        self.held_kind: Optional[str] = None
+        self._hold_used = False
         self.score = 0
         self.lines = 0
         self.level = 1
@@ -198,15 +204,52 @@ class Tetris(BaseGame):
         self.piece_generation = 0
         self._spawn()
 
+    def _draw_bag_kind(self) -> str:
+        """Draw from a shuffled seven-piece bag."""
+        if not self._piece_bag:
+            self._piece_bag = list(SHAPE_KEYS)
+            self.rng.shuffle(self._piece_bag)
+        return self._piece_bag.pop()
+
     def _spawn(self):
         self.piece_generation += 1
         self._rotation_lift_debt = 0
         self.piece = Piece(self.next_kind)
-        self.next_kind = random.choice(SHAPE_KEYS)
+        self.next_kind = self._draw_bag_kind()
+        self._hold_used = False
         if self._collides(self.piece.cells()):
             self.state = "gameover"
             self.on_game_over(self.score, extra={"lines": self.lines,
                                                   "level": self.level})
+
+    def _hold_piece(self) -> None:
+        if self._hold_used or self.piece is None:
+            return
+        current = self.piece.kind
+        if self.held_kind is None:
+            self.held_kind = current
+            replacement = self.next_kind
+            self.next_kind = self._draw_bag_kind()
+        else:
+            replacement, self.held_kind = self.held_kind, current
+        self.piece_generation += 1
+        self.piece = Piece(replacement)
+        self._rotation_lift_debt = 0
+        self.drop_timer = 0.0
+        self._hold_used = True
+        if self._collides(self.piece.cells()):
+            self.on_game_over(
+                self.score,
+                extra={"lines": self.lines, "level": self.level,
+                       "top_out": True})
+
+    def _ghost_cells(self) -> List[Tuple[int, int]]:
+        if self.piece is None:
+            return []
+        distance = 0
+        while not self._collides(self.piece.cells(dy=distance + 1)):
+            distance += 1
+        return self.piece.cells(dy=distance)
 
     def _collides(self, cells, board=None) -> bool:
         if board is None:
@@ -479,6 +522,8 @@ class Tetris(BaseGame):
                 self._rotate(-1)
             elif event.key == pygame.K_SPACE:
                 self._hard_drop()
+            elif event.key == pygame.K_c:
+                self._hold_piece()
         elif event.type == pygame.KEYDOWN and self.state == "gameover":
             if event.key == pygame.K_r:
                 self.request_reset()
@@ -509,6 +554,15 @@ class Tetris(BaseGame):
 
         # Active piece
         if self.piece and self.state == "playing":
+            active_cells = set(self.piece.cells())
+            for x, y in self._ghost_cells():
+                if y >= 0 and (x, y) not in active_cells:
+                    rect = pygame.Rect(
+                        BOARD_X + x * CELL + 4, BOARD_Y + y * CELL + 4,
+                        CELL - 8, CELL - 8)
+                    pygame.draw.rect(
+                        self.screen, COLORS["text_dim"], rect, 2,
+                        border_radius=3)
             for x, y in self.piece.cells():
                 if y >= 0:
                     self._draw_cell(BOARD_X + x * CELL, BOARD_Y + y * CELL,
@@ -587,11 +641,15 @@ class Tetris(BaseGame):
                       (rect2.x + 16, rect2.y + 132), size=11,
                       color=COLORS["accent"])
         # Controls
-        draw_text(self.screen, "←→移动 ↑旋 ↓软降",
+        hold_text = self.held_kind or "—"
+        draw_text(self.screen, f"保留: {hold_text} · C 交换",
                   (rect2.x + 16, rect2.y + 150), size=12,
+                  color=COLORS["accent"])
+        draw_text(self.screen, "←→移动 ↑旋 ↓软降",
+                  (rect2.x + 16, rect2.y + 168), size=12,
                   color=COLORS["text_dim"])
         draw_text(self.screen, "空格硬降 P暂停 Esc退出",
-                  (rect2.x + 16, rect2.y + 168), size=12,
+                  (rect2.x + 16, rect2.y + 186), size=12,
                   color=COLORS["text_dim"])
 
 

@@ -5,12 +5,14 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+import weakref
 from pathlib import Path
 
 from flask import Flask, g, jsonify, request
 from werkzeug.exceptions import BadRequest, HTTPException, RequestEntityTooLarge
 
 from game_service.catalog import VALID_GAME_IDS, public_games
+from game_service.maintenance import recovered_application_session
 from game_service.store import LocalGameStore, StoreError, default_database_path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -32,16 +34,33 @@ def create_app(config: dict | None = None) -> Flask:
         DB_PATH=str(DB_PATH),
         INITIALIZE_DB=True,
         LEGACY_DB_PATH=None,
+        APPLICATION_LEASE=None,
     )
     if config:
         app.config.update(config)
 
-    store = LocalGameStore(
-        app.config["DB_PATH"],
-        legacy_db_path=app.config.get("LEGACY_DB_PATH"),
-        initialize=bool(app.config.get("INITIALIZE_DB", True)),
-    )
+    lease_enabled = app.config.get("APPLICATION_LEASE")
+    if lease_enabled is None:
+        lease_enabled = not bool(app.config.get("TESTING"))
+    session = None
+    try:
+        if lease_enabled:
+            session = recovered_application_session(
+                app.config["DB_PATH"], timeout=2.0)
+        store = LocalGameStore(
+            app.config["DB_PATH"],
+            legacy_db_path=app.config.get("LEGACY_DB_PATH"),
+            initialize=bool(app.config.get("INITIALIZE_DB", True)),
+        )
+    except Exception:
+        if session is not None:
+            session.close()
+        raise
     app.extensions["game_store"] = store
+    if session is not None:
+        app.extensions["application_session"] = session
+        app.extensions["application_session_finalizer"] = weakref.finalize(
+            app, session.close)
 
     def api_error(code: str, message: str, status: int = 400,
                   retryable: bool = False, details: dict | None = None):
@@ -230,7 +249,12 @@ def main() -> None:
     port = int(os.environ.get("GAMES_PORT", "5000"))
     app = create_app()
     print(f"[server] http://{host}:{port}  (db={app.config['DB_PATH']})")
-    app.run(host=host, port=port, debug=False)
+    try:
+        app.run(host=host, port=port, debug=False)
+    finally:
+        session = app.extensions.get("application_session")
+        if session is not None:
+            session.close()
 
 
 if __name__ == "__main__":

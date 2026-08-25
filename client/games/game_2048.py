@@ -431,8 +431,23 @@ class Game2048(BaseGame):
             if t.merge_pop > 0:
                 t.merge_pop = max(0.0, t.merge_pop - dt / MERGE_DURATION)
 
-    def _save_autosave_slot(self, owner_status: str = "active") -> None:
-        if self.slot_load_state != "ready":
+    def _save_autosave_slot(self, owner_status: str = "active",
+                            *, allow_claim: bool = False) -> None:
+        if (self.slot_load_state == "claiming" and not allow_claim
+                and self._slot_save_future is not None
+                and self._slot_save_future.done()):
+            had_queued_save = self._autosave_queued
+            self._poll_slot_save()
+            if had_queued_save or self.slot_load_state != "ready":
+                return
+        elif self.slot_load_state == "claiming" and not allow_claim:
+            self._autosave_queued = True
+            self._autosave_release_queued |= owner_status == "released"
+            if not self._autosave_dirty_since:
+                self._autosave_dirty_since = pygame.time.get_ticks()
+            return
+        if (self.slot_load_state != "ready"
+                and not (allow_claim and self.slot_load_state == "claiming")):
             return
         save_slot = getattr(self.backend, "save_slot_async", None)
         if not callable(save_slot):
@@ -453,8 +468,21 @@ class Game2048(BaseGame):
         self._autosave_queued = False
         self._autosave_dirty_since = 0
         self._autosave_release_queued = False
+        state = self._build_autosave_state(owner_status)
+        try:
+            self._slot_save_future = save_slot(
+                self.profile_id, self.game_id, "autosave", state,
+                self.attempt_context.ruleset_version)
+        except Exception:  # noqa: BLE001 - score play remains available
+            self._slot_save_future = None
+            self.slot_save_error = "自动存档暂时未保存"
+            if self.slot_load_state == "claiming":
+                self.slot_load_state = "failed"
+                self.slot_load_error = "自动存档占用权确认失败，请重试"
+
+    def _build_autosave_state(self, owner_status: str) -> dict:
         self._slot_revision += 1
-        state = {
+        return {
             "version": 5,
             "game_state": self.state,
             "score": self.score,
@@ -475,13 +503,6 @@ class Game2048(BaseGame):
                       if self.grid[row][col] is not None else 0
                       for col in range(GRID)] for row in range(GRID)],
         }
-        try:
-            self._slot_save_future = save_slot(
-                self.profile_id, self.game_id, "autosave", state,
-                self.attempt_context.ruleset_version)
-        except Exception:  # noqa: BLE001 - score play remains available
-            self._slot_save_future = None
-            self.slot_save_error = "自动存档暂时未保存"
 
     def _queue_autosave_slot(self) -> None:
         """Coalesce rapid settled moves into one durable latest-value write."""
@@ -531,6 +552,9 @@ class Game2048(BaseGame):
                     self._slot_save_pending = False
                     self.slot_save_error = str(
                         result.get("error") or "自动存档暂时未保存")
+                    if self.slot_load_state == "claiming":
+                        self.slot_load_state = "failed"
+                        self.slot_load_error = "自动存档占用权确认失败，请重试"
             else:
                 self._slot_save_pending = False
                 self.slot_save_error = None
@@ -538,6 +562,8 @@ class Game2048(BaseGame):
                 self._slot_expected_owner_epoch = None
                 self._slot_expected_revision = None
                 self._slot_expected_value_hash = None
+                if self.slot_load_state == "claiming":
+                    self.slot_load_state = "ready"
         self._poll_slot_save_status()
         if self._autosave_queued and self.slot_load_state == "ready":
             owner_status = (
@@ -556,11 +582,16 @@ class Game2048(BaseGame):
         if state == SaveState.COMMITTED:
             self._slot_save_pending = False
             self.slot_save_error = None
+            if self.slot_load_state == "claiming":
+                self.slot_load_state = "ready"
         elif state in (SaveState.PERMANENT_FAILURE, SaveState.QUARANTINED):
             self._slot_save_pending = False
             result = getattr(event, "result", {})
             self.slot_save_error = str(
                 result.get("error") or "自动存档无法恢复")
+            if self.slot_load_state == "claiming":
+                self.slot_load_state = "failed"
+                self.slot_load_error = "自动存档占用权确认失败，请重试"
 
     def _poll_slot_load(self) -> None:
         future = self._slot_load_future
@@ -586,9 +617,9 @@ class Game2048(BaseGame):
             if saved.status == SlotLoadStatus.LOADED:
                 saved = saved.slot
             elif saved.status == SlotLoadStatus.NO_SLOT:
-                self.slot_load_state = "ready"
+                self.slot_load_state = "claiming"
                 self.slot_load_error = None
-                self._save_autosave_slot()
+                self._save_autosave_slot(allow_claim=True)
                 return
             else:
                 self.slot_load_state = "failed"
@@ -596,9 +627,9 @@ class Game2048(BaseGame):
                     saved.error or "自动存档暂时无法读取，请重试")
                 return
         if not isinstance(saved, dict):
-            self.slot_load_state = "ready"
+            self.slot_load_state = "claiming"
             self.slot_load_error = None
-            self._save_autosave_slot()
+            self._save_autosave_slot(allow_claim=True)
             return
         state = saved.get("state")
         grid = state.get("grid") if isinstance(state, dict) else None
@@ -764,6 +795,7 @@ class Game2048(BaseGame):
             or (version in (4, 5)
                 and owner_token != self._slot_owner_token))
         if needs_owner_claim:
+            self.slot_load_state = "claiming"
             self._slot_expected_owner_token = (
                 owner_token if version in (4, 5) else None)
             self._slot_expected_owner_epoch = current_epoch
@@ -774,7 +806,7 @@ class Game2048(BaseGame):
         self._takeover_reload_expected = None
         self._slot_conflict_saved = None
         if needs_owner_claim:
-            self._save_autosave_slot()
+            self._save_autosave_slot(allow_claim=True)
         if (self.state in {"won", "gameover"}
                 and (confirmed_score is None or confirmed_score < self.score)):
             restored_extra = {
@@ -1044,11 +1076,14 @@ class Game2048(BaseGame):
                   (self.width // 2, self.height - 18),
                   size=12, color=COLORS["text_dim"], center=True)
 
-        if self.slot_load_state == "loading":
+        if self.slot_load_state in {"loading", "claiming"}:
             veil = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
             veil.fill((245, 248, 255, 190))
             self.screen.blit(veil, (0, 0))
-            draw_text(self.screen, "正在恢复自动存档…",
+            message = ("正在确认自动存档占用权…"
+                       if self.slot_load_state == "claiming"
+                       else "正在恢复自动存档…")
+            draw_text(self.screen, message,
                       (self.width // 2, self.height // 2), size=18,
                       color=COLORS["accent"], bold=True, center=True)
         elif self.slot_load_state == "failed":
@@ -1102,8 +1137,27 @@ class Game2048(BaseGame):
             self.draw_gameover_overlay("游戏结束", buttons=btns)
 
     def before_close(self) -> None:
+        if self.slot_load_state == "claiming":
+            future = self._slot_save_future
+            if future is not None:
+                try:
+                    future.result(timeout=1.0)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._poll_slot_save()
         if self.slot_load_state != "ready":
             return
+        publish_intent = getattr(self.backend, "publish_slot_intent", None)
+        if callable(publish_intent):
+            try:
+                publish_intent(
+                    self.profile_id, self.game_id, "autosave",
+                    self._build_autosave_state("released"),
+                    self.attempt_context.ruleset_version)
+                self._slot_save_pending = True
+                return
+            except Exception:  # noqa: BLE001 - fall back to async pipeline
+                self.slot_save_error = "退出状态正在等待后台保存"
         self._save_autosave_slot(owner_status="released")
         future = self._slot_save_future
         if future is not None:

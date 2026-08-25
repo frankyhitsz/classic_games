@@ -587,7 +587,7 @@ class RecoveryAndBoundaryTests(unittest.TestCase):
     def test_current_ruleset_versions_are_explicit(self):
         self.assertEqual(
             {game.id: game.ruleset_version for game in GAMES},
-            {"tetris": "tetris-assist-2", "snake": "snake-classic-1",
+            {"tetris": "tetris-assist-3", "snake": "snake-classic-1",
              "2048": "2048-classic-2",
              "sokoban": "sokoban-campaign-2",
              "zuma": "zuma-classic-2"})
