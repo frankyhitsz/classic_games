@@ -10,7 +10,7 @@
 - [x] 写入逐条审查答复和 122 项矩阵；
 - [x] 第一轮复查：恢复、并发、配额和跨平台路径；
 - [x] 第二轮复查：玩法、性能、打包和发行；
-- [ ] 提交、推送并核验远端 CI。
+- [x] 提交、推送并核验远端 CI。
 
 ## 核心修复
 
@@ -50,6 +50,16 @@
   （4.83×），据此保留 bounded v2 并冻结流式 v3 设计边界；
 - Python 3.13 一次性 release 环境完成 Ruff、依赖审计、CycloneDX SBOM、compile、wheel+sdist、
   installed manifest 对照、181 项 storage、stress 和 107 项 gameplay；pip-audit 未发现已知漏洞。
+
+## 三平台验证
+
+- CI #33 暴露 Windows 的 `st_nlink == 0` 元数据差异及 cleanup 测试时间边界；改为只拒绝确认的
+  多硬链接，并固定测试文件时间后重新验证；
+- CI #34 暴露 Windows 下首次 HTTP 提交的短超时，以及测试 Flask 应用锁未显式释放；可靠提交路径改用
+  5 秒完成期限，测试服务退出时调用应用 finalizer；
+- CI #35 暴露 `publish_slot_intent()` 与旧写任务嵌套取得 Windows 独占 byte-range lock；最终意图改为
+  复用后端生命周期 application lease，回归测试会主动禁止该路径重新取得 maintenance lock；
+- 提交 `1b3a67d` 的 CI #36 全部通过，矩阵覆盖 Ubuntu、macOS、Windows 及 Python 3.11–3.13。
 
 ## 未伪装完成的外部事项
 
