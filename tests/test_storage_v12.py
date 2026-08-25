@@ -509,7 +509,10 @@ class FilesystemAndGameTests(unittest.TestCase):
             self.assertIn("legacy_score_migration", sources)
 
     def test_server_init_helper_holds_application_lease(self):
-        from server.app import init_db
+        try:
+            from server.app import init_db
+        except ImportError:
+            self.skipTest("optional Flask dependency is unavailable")
 
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "games.db"
