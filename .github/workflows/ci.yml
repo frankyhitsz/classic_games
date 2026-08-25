@@ -32,6 +32,7 @@ jobs:
             release-results.xml
             release-results.json
             release-sbom.json
+            release-installed-packages.json
           if-no-files-found: error
 
   core-only:
@@ -71,6 +72,8 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
+      - name: Run wheel and sdist user-data smoke
+        run: python -m tests.wheel_smoke
       - run: python -m ruff check client game_service server tests
       - name: Run storage tests
         shell: bash

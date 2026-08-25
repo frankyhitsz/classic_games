@@ -12,6 +12,7 @@ coverage.xml
 release-results.xml
 release-results.json
 release-sbom.json
+release-installed-packages.json
 htmlcov/
 build/
 dist/

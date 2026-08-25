@@ -17,7 +17,7 @@ STAGE_TIMEOUTS = {
     "dependency-audit": 300,
     "dependency-sbom": 300,
     "compile": 120,
-    "wheel-smoke": 300,
+    "wheel-smoke": 600,
     "storage": 600,
     "stress": 600,
     "gameplay": 900,

@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .catalog import GAME_BY_ID, public_games
-from .maintenance import maintenance_lock
+from .maintenance import ApplicationSession, maintenance_lock
 from .mutation import (MutationError, ScoreMutation, canonical_json,
                        normalize_score_mutation)
 from .profile import ProfileIdentity, ProfileIdentityError
@@ -32,6 +32,8 @@ from .service import (DataResult, SaveEvent, SaveState, StorageErrorKind,
 from .store import LocalGameStore, StoreError, default_database_path
 
 SPOOL_SCHEMA_VERSION = 2
+MAX_PENDING_ATTEMPTS = 10_000
+MAX_STATE_TIMESTAMP = 1e20
 MAX_SPOOL_FILE_BYTES = 64 * 1024
 MAX_SPOOL_FILES = 10_000
 MAX_SPOOL_TOTAL_BYTES = 64 * 1024 * 1024
@@ -42,12 +44,28 @@ MAX_JSON_NODES = 100_000
 MAX_JSON_STRING = 64 * 1024
 REPLAY_BATCH_SIZE = 128
 REQUEST_LOCK_TIMEOUT_SECONDS = 1.0
+APPLICATION_MAINTENANCE_TIMEOUT_SECONDS = 5.0
 STATUS_REFRESH_SECONDS = 0.5
 LOGGER = logging.getLogger(__name__)
 SPOOL_FIELDS = frozenset({
     "schema_version", "request_id", "payload_hash", "attempt_uuid",
     "revision", "created_at", "attempt_count", "payload",
 })
+
+
+@dataclass(frozen=True)
+class PendingSnapshot:
+    """Read-only journal scan with a machine-readable completeness result."""
+
+    entries: list
+    source_count: int
+    included_count: int
+    omitted_count: int
+    omitted_reasons: dict[str, int]
+
+    @property
+    def complete(self) -> bool:
+        return self.omitted_count == 0
 
 
 def _reject_json_constant(value: str):
@@ -206,8 +224,9 @@ class PendingSaveEnvelope:
                              "pending save uses an unsupported version")
         if (type(value.get("created_at")) not in (int, float)
                 or not math.isfinite(float(value["created_at"]))
+                or not 0 <= float(value["created_at"]) <= MAX_STATE_TIMESTAMP
                 or type(value.get("attempt_count")) is not int
-                or value["attempt_count"] < 0
+                or not 0 <= value["attempt_count"] <= MAX_PENDING_ATTEMPTS
                 or not isinstance(value.get("payload"), dict)):
             raise StoreError("invalid_spool_envelope",
                              "pending save envelope has invalid field types")
@@ -267,7 +286,8 @@ class PersistentSaveOutbox:
     """Cross-process-safe spool with one immutable file per request."""
 
     def __init__(self, path: Path | str,
-                 legacy_path: Optional[Path | str] = None):
+                 legacy_path: Optional[Path | str] = None, *,
+                 maintain: bool = True):
         selected = Path(path)
         if selected.suffix.lower() == ".json":
             self.path = selected.with_suffix("")
@@ -286,7 +306,8 @@ class PersistentSaveOutbox:
         self.quarantined_count = 0
         self.migrated_spool_count = 0
         self.recovery_notice: Optional[str] = None
-        self._migrate_legacy_file()
+        if maintain:
+            self._migrate_legacy_file()
         self._update_notice()
 
     def _target(self, request_id: str) -> Path:
@@ -572,7 +593,36 @@ class PersistentSaveOutbox:
                 return
             with self._request_lock(request_id):
                 envelope, _mutation = self._read_file(target)
-                updated = replace(envelope, attempt_count=envelope.attempt_count + 1)
+                updated = replace(
+                    envelope,
+                    attempt_count=min(
+                        MAX_PENDING_ATTEMPTS, envelope.attempt_count + 1))
+                encoded = canonical_json(updated.to_dict()).encode("utf-8")
+                temp = self.path / f".{request_id}.{uuid.uuid4().hex}.tmp"
+                self._write_bytes(temp, encoded)
+                try:
+                    os.replace(temp, target)
+                    self._fsync_directory(self.path)
+                finally:
+                    try:
+                        temp.unlink()
+                    except FileNotFoundError:
+                        pass
+
+    def set_attempt_count_max(self, request_id: str, value: int) -> None:
+        """Raise a retry count with one atomic rewrite instead of N fsyncs."""
+        if type(value) is not int or not 0 <= value <= MAX_PENDING_ATTEMPTS:
+            raise StoreError(
+                "invalid_spool_envelope", "pending retry count is out of range")
+        target = self._target(request_id)
+        with self._lock:
+            if not target.is_file():
+                return
+            with self._request_lock(request_id):
+                envelope, _mutation = self._read_file(target)
+                if value <= envelope.attempt_count:
+                    return
+                updated = replace(envelope, attempt_count=value)
                 encoded = canonical_json(updated.to_dict()).encode("utf-8")
                 temp = self.path / f".{request_id}.{uuid.uuid4().hex}.tmp"
                 self._write_bytes(temp, encoded)
@@ -672,6 +722,50 @@ class PersistentSaveOutbox:
             self._update_notice(notices)
             return result
 
+    def snapshot_envelopes(self) -> PendingSnapshot:
+        """Parse active score journals without upgrading or quarantining them."""
+        entries = []
+        reasons: dict[str, int] = {}
+        try:
+            with os.scandir(self.path) as iterator:
+                paths = sorted(
+                    (Path(entry.path) for entry in iterator
+                     if entry.is_file() and entry.name.endswith(".json")),
+                    key=lambda path: path.name)
+        except (FileNotFoundError, NotADirectoryError):
+            paths = []
+        except OSError:
+            return PendingSnapshot([], 0, 0, 1, {"directory_unreadable": 1})
+        source_count = len(paths)
+        total_bytes = 0
+        for index, path in enumerate(paths):
+            if index >= MAX_SPOOL_FILES:
+                reasons["file_count_limit"] = len(paths) - index
+                break
+            try:
+                size = path.stat().st_size
+                if size > MAX_SPOOL_FILE_BYTES:
+                    raise StoreError("spool_file_too_large", "too large")
+                if total_bytes + size > MAX_SPOOL_TOTAL_BYTES:
+                    reasons["total_size_limit"] = len(paths) - index
+                    break
+                total_bytes += size
+                raw = path.read_bytes()
+                value = json.loads(
+                    raw.decode("utf-8"), parse_constant=_reject_json_constant)
+                _validate_json_shape(value)
+                envelope, mutation = PendingSaveEnvelope.parse(value)
+                if path.name != f"{envelope.request_id}.json":
+                    raise StoreError("non_canonical_name", "wrong filename")
+                entries.append((envelope, mutation))
+            except (OSError, StoreError, TypeError, ValueError,
+                    RecursionError, UnicodeError):
+                reasons["invalid_or_unreadable"] = (
+                    reasons.get("invalid_or_unreadable", 0) + 1)
+        omitted = sum(reasons.values())
+        return PendingSnapshot(
+            entries, source_count, len(entries), omitted, reasons)
+
     def list(self) -> list[dict]:
         return [mutation.transport_payload()
                 for _envelope, mutation in self.list_envelopes()]
@@ -735,7 +829,7 @@ class PersistentStateOutbox:
         "zuma": "zuma-classic-2",
     }
 
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, *, recover: bool = True):
         self.path = Path(path)
         self.quarantine_path = self.path.with_name(
             f"{self.path.name}-quarantine")
@@ -745,6 +839,8 @@ class PersistentStateOutbox:
         self.quarantined_count = self._bounded_quarantine_count()
         self.recovery_notice: Optional[str] = None
         self._count = 0
+        if recover:
+            self._recover_reject_transactions()
         self.refresh_count()
         self._update_notice()
 
@@ -906,6 +1002,10 @@ class PersistentStateOutbox:
                 arguments[4] = ruleset_version
         operation_id = operation_id or uuid.uuid4().hex
         timestamp = time.time() if updated_at is None else float(updated_at)
+        if (not math.isfinite(timestamp)
+                or not 0 <= timestamp <= MAX_STATE_TIMESTAMP):
+            raise StoreError(
+                "invalid_state_timestamp", "invalid local state timestamp")
         operation = {
             "schema_version": cls.SCHEMA_VERSION,
             "operation_id": operation_id,
@@ -1073,7 +1173,8 @@ class PersistentStateOutbox:
                     or value.get("method") not in cls.ALLOWED_METHODS
                     or not isinstance(value.get("args"), list)
                     or type(value.get("updated_at")) not in (int, float)
-                    or not math.isfinite(float(value["updated_at"]))):
+                    or not math.isfinite(float(value["updated_at"]))
+                    or not 0 <= float(value["updated_at"]) <= MAX_STATE_TIMESTAMP):
                 raise StoreError(
                     "invalid_state_journal", "invalid pending local state")
             legacy_hash = value.get("payload_hash")
@@ -1105,12 +1206,11 @@ class PersistentStateOutbox:
                     f"slot:{legacy_args[0]}:{legacy_args[1]}:{legacy_args[2]}")
             upgraded = cls._operation(
                 canonical_key, method, tuple(legacy_args),
-                max(0, int(float(value["updated_at"]) * 1_000_000_000)),
-                f"legacy-{legacy_hash[:24]}")
-            upgraded["updated_at"] = float(value["updated_at"])
-            unhashed = {key: child for key, child in upgraded.items()
-                        if key != "payload_hash"}
-            upgraded["payload_hash"] = cls._digest(unhashed)
+                min((1 << 63) - 1,
+                    max(0, int(float(value["updated_at"]) * 1_000_000_000))),
+                f"legacy-{legacy_hash[:24]}",
+                updated_at=float(value["updated_at"]))
+            LocalGameStore.validate_state_operation(upgraded)
             return upgraded
         if value.get("schema_version") == 2:
             expected_v2 = cls.FIELDS - {"components"}
@@ -1128,6 +1228,7 @@ class PersistentStateOutbox:
                 value["key"], value["method"], tuple(value["args"]),
                 value["logical_revision"], value["operation_id"],
                 updated_at=value["updated_at"])
+            LocalGameStore.validate_state_operation(upgraded)
             return upgraded
         try:
             derived_ruleset = cls._ruleset(
@@ -1145,9 +1246,10 @@ class PersistentStateOutbox:
                 or not 1 <= len(value["operation_id"]) <= 128
                 or value.get("ruleset_version") != derived_ruleset
                 or type(value.get("logical_revision")) is not int
-                or value["logical_revision"] < 0
+                or not 0 <= value["logical_revision"] <= (1 << 63) - 1
                 or type(value.get("updated_at")) not in (int, float)
                 or not math.isfinite(float(value["updated_at"]))
+                or not 0 <= float(value["updated_at"]) <= MAX_STATE_TIMESTAMP
                 or not isinstance(value.get("components"), list)):
             raise StoreError(
                 "invalid_state_journal", "invalid pending local state")
@@ -1182,6 +1284,7 @@ class PersistentStateOutbox:
         if payload_hash != valid:
             raise StoreError(
                 "state_journal_hash_mismatch", "pending local state was modified")
+        LocalGameStore.validate_state_operation(value)
         return value
 
     def _update_notice(self) -> None:
@@ -1232,11 +1335,14 @@ class PersistentStateOutbox:
                                 "state_journal_bad_name", "wrong key")
                         with self._digest_lock(digest):
                             size = path.stat().st_size
-                            total_bytes += size
-                            if (size > MAX_SPOOL_FILE_BYTES
-                                    or total_bytes > MAX_SPOOL_TOTAL_BYTES):
+                            if size > MAX_SPOOL_FILE_BYTES:
                                 raise StoreError(
                                     "state_journal_too_large", "too large")
+                            if total_bytes + size > MAX_SPOOL_TOTAL_BYTES:
+                                self.recovery_notice = (
+                                    "待保存状态超过扫描总量，本次保留未扫描文件")
+                                break
+                            total_bytes += size
                             raw = path.read_bytes()
                             raw_value = json.loads(
                                 raw.decode("utf-8"),
@@ -1262,6 +1368,50 @@ class PersistentStateOutbox:
                         except (OSError, StoreError):
                             pass
             return entries
+
+    def snapshot_entries(self) -> PendingSnapshot:
+        """Parse state journals without upgrade, quarantine, rename, or notice IO."""
+        entries = []
+        reasons: dict[str, int] = {}
+        try:
+            with os.scandir(self.path) as iterator:
+                paths = sorted(
+                    (Path(entry.path) for entry in iterator
+                     if entry.is_file() and entry.name.endswith(".json")),
+                    key=lambda path: path.name)
+        except (FileNotFoundError, NotADirectoryError):
+            paths = []
+        except OSError:
+            return PendingSnapshot([], 0, 0, 1, {"directory_unreadable": 1})
+        source_count = len(paths)
+        total_bytes = 0
+        for index, path in enumerate(paths):
+            if index >= MAX_SPOOL_FILES:
+                reasons["file_count_limit"] = len(paths) - index
+                break
+            try:
+                size = path.stat().st_size
+                if size > MAX_SPOOL_FILE_BYTES:
+                    raise StoreError("state_journal_too_large", "too large")
+                if total_bytes + size > MAX_SPOOL_TOTAL_BYTES:
+                    reasons["total_size_limit"] = len(paths) - index
+                    break
+                total_bytes += size
+                raw = path.read_bytes()
+                raw_value = json.loads(
+                    raw.decode("utf-8"), parse_constant=_reject_json_constant)
+                value = self._parse(raw)
+                if (raw_value.get("schema_version") != 1
+                        and path != self._target(value["key"])):
+                    raise StoreError("state_journal_bad_name", "wrong key")
+                entries.append(value)
+            except (OSError, StoreError, TypeError, ValueError,
+                    RecursionError, UnicodeError):
+                reasons["invalid_or_unreadable"] = (
+                    reasons.get("invalid_or_unreadable", 0) + 1)
+        omitted = sum(reasons.values())
+        return PendingSnapshot(
+            entries, source_count, len(entries), omitted, reasons)
 
     def _upgrade_v1_locked(self, source: Path, raw: bytes,
                            operation: dict) -> dict:
@@ -1323,12 +1473,7 @@ class PersistentStateOutbox:
     def reject_and_restore_if_current(
             self, key: str, payload_hash: str,
             previous_operation: Optional[dict], reason: str) -> bool:
-        """Quarantine a rejected winner and restore the prior valid journal.
-
-        The replacement is prepared and fsynced before the rejected file is
-        moved, so a process crash never destroys the only durable copy of the
-        previous pending operation.
-        """
+        """Quarantine a rejected winner through a startup-recoverable marker."""
         safe_reason = "".join(
             char if char.isalnum() or char in "-_" else "-"
             for char in str(reason))[:80] or "rejected"
@@ -1341,43 +1486,110 @@ class PersistentStateOutbox:
                 return False
             if current["payload_hash"] != payload_hash:
                 return False
-            temp = None
+            previous = None
             if previous_operation is not None:
                 try:
                     previous = self._parse(
                         canonical_json(previous_operation).encode("utf-8"))
-                    if previous["key"] != key:
-                        return False
-                    temp = self.path / (
-                        f".{target.name}.{uuid.uuid4().hex}.restore")
-                    PersistentSaveOutbox._write_bytes(
-                        temp, canonical_json(previous).encode("utf-8"))
-                except (MutationError, OSError, StoreError, TypeError,
-                        ValueError, RecursionError, MemoryError):
-                    if temp is not None:
-                        try:
-                            temp.unlink()
-                        except FileNotFoundError:
-                            pass
+                except (MutationError, StoreError, TypeError, ValueError,
+                        RecursionError, MemoryError):
                     return False
-            if not self._quarantine_locked(target, safe_reason):
-                if temp is not None:
-                    try:
-                        temp.unlink()
-                    except FileNotFoundError:
-                        pass
+                if previous["key"] != key:
+                    return False
+            marker = self.path / (
+                f".reject-{target.stem}-{uuid.uuid4().hex}.txn")
+            transaction = {
+                "version": 1, "key": key,
+                "rejected_payload_hash": payload_hash,
+                "previous_operation": previous,
+                "reason": safe_reason,
+            }
+            try:
+                PersistentSaveOutbox._write_bytes(
+                    marker, canonical_json(transaction).encode("utf-8"))
+                PersistentSaveOutbox._fsync_directory(self.path)
+            except (MutationError, OSError):
                 return False
-            if temp is not None:
-                try:
-                    os.replace(temp, target)
-                    PersistentSaveOutbox._fsync_directory(self.path)
-                    self._count += 1
-                finally:
-                    try:
-                        temp.unlink()
-                    except FileNotFoundError:
-                        pass
+            if not self._complete_reject_transaction(marker, transaction):
+                return False
             return True
+
+    def _complete_reject_transaction(self, marker: Path,
+                                     transaction: dict) -> bool:
+        key = transaction.get("key")
+        previous = transaction.get("previous_operation")
+        rejected_hash = transaction.get("rejected_payload_hash")
+        reason = str(transaction.get("reason") or "rejected")
+        if not isinstance(key, str) or not isinstance(rejected_hash, str):
+            return False
+        target = self._target(key)
+        try:
+            current = self._parse(target.read_bytes())
+        except FileNotFoundError:
+            current = None
+        except (OSError, StoreError, TypeError, ValueError, RecursionError):
+            return False
+        if current is not None and current["payload_hash"] == rejected_hash:
+            if not self._quarantine_locked(target, reason):
+                return False
+            current = None
+        if previous is not None and current is None:
+            try:
+                previous = self._parse(canonical_json(previous).encode("utf-8"))
+                if previous["key"] != key:
+                    return False
+                self._rewrite_locked(target, previous)
+                self._count += 1
+            except (MutationError, OSError, StoreError, TypeError,
+                    ValueError, RecursionError, MemoryError):
+                return False
+        try:
+            marker.unlink()
+            PersistentSaveOutbox._fsync_directory(self.path)
+        except OSError:
+            return False
+        return True
+
+    def _recover_reject_transactions(self) -> None:
+        """Finish reject markers and legacy restore files after a crash."""
+        if not self.path.is_dir():
+            return
+        for marker in sorted(self.path.glob(".reject-*.txn"))[:MAX_SPOOL_FILES]:
+            try:
+                transaction = json.loads(
+                    marker.read_text(encoding="utf-8"),
+                    parse_constant=_reject_json_constant)
+                if not isinstance(transaction, dict):
+                    continue
+                key = transaction.get("key")
+                if not isinstance(key, str):
+                    continue
+                with self._key_lock(key):
+                    self._complete_reject_transaction(marker, transaction)
+            except (OSError, StoreError, TypeError, ValueError,
+                    RecursionError, UnicodeError):
+                continue
+        for restore in sorted(self.path.glob(".*.restore"))[:MAX_SPOOL_FILES]:
+            try:
+                previous = self._parse(restore.read_bytes())
+                target = self._target(previous["key"])
+                with self._key_lock(previous["key"]):
+                    if not target.exists():
+                        os.replace(restore, target)
+                        PersistentSaveOutbox._fsync_directory(self.path)
+                    else:
+                        current = self._parse(target.read_bytes())
+                        if current["payload_hash"] == previous["payload_hash"]:
+                            restore.unlink()
+            except (OSError, StoreError, TypeError, ValueError,
+                    RecursionError):
+                continue
+
+    def recover_transactions(self) -> None:
+        """Retry crash markers after a transient filesystem failure clears."""
+        with self._lock:
+            self._recover_reject_transactions()
+            self.refresh_count()
 
     def high_water(self) -> int:
         """Highest revision in active pending state journals."""
@@ -1530,6 +1742,8 @@ class LocalBackendClient:
                 and not os.environ.get("GAMES_DB")):
             legacy_db_path = (Path(__file__).resolve().parents[1]
                               / "data" / "scores.db")
+        self._application_session = ApplicationSession.acquire(
+            selected, timeout=2.0)
         if store is None and not defer_initialization:
             try:
                 store = LocalGameStore(selected, legacy_db_path=legacy_db_path)
@@ -1896,7 +2110,8 @@ class LocalBackendClient:
 
     def _durable_state_write(self, operation: dict):
         with maintenance_lock(
-                self._selected_db_path, exclusive=False, timeout=300.0):
+                self._selected_db_path, exclusive=False,
+                timeout=APPLICATION_MAINTENANCE_TIMEOUT_SECONDS):
             return self._durable_state_write_locked(operation)
 
     def _durable_state_write_locked(self, operation: dict):
@@ -1991,7 +2206,10 @@ class LocalBackendClient:
                             key, payload_hash, previous_operation, exc.code))
                 with self._lock:
                     self._pending_state_count = self.state_outbox.count()
-                    self._non_durable_state.pop(key, None)
+                    if previous_operation is not None and not rejected_preserved:
+                        self._non_durable_state[key] = previous_operation
+                    else:
+                        self._non_durable_state.pop(key, None)
                     self._unpublished_state.discard(
                         operation["operation_id"])
                 result = {
@@ -2436,7 +2654,8 @@ class LocalBackendClient:
                        already_spooled: bool = False,
                        occurred_at: Optional[float] = None) -> dict:
         with maintenance_lock(
-                self._selected_db_path, exclusive=False, timeout=300.0):
+                self._selected_db_path, exclusive=False,
+                timeout=APPLICATION_MAINTENANCE_TIMEOUT_SECONDS):
             return self._save_mutation_locked(
                 mutation, already_spooled, occurred_at)
 
@@ -2578,8 +2797,48 @@ class LocalBackendClient:
         if isinstance(normalized, dict):
             return completed_future(normalized)
         occurred_at = time.time()
-        return self._worker.submit(
+        future = self._worker.submit(
             self._save_mutation, normalized, False, occurred_at)
+        future.add_done_callback(
+            lambda completed: self._recover_unexpected_score_failure(
+                normalized, occurred_at, completed))
+        return future
+
+    def _recover_unexpected_score_failure(
+            self, mutation: ScoreMutation, occurred_at: float,
+            future: Future) -> None:
+        if not future.cancelled():
+            try:
+                failure = future.exception()
+            except Exception as exc:  # noqa: BLE001
+                failure = exc
+            if failure is None:
+                return
+        durable = False
+        try:
+            envelope, current = self.outbox._read_file(
+                self.outbox._target(mutation.request_id))
+            durable = current.payload_hash == mutation.payload_hash
+        except (OSError, StoreError, TypeError, ValueError, RecursionError):
+            envelope = None
+        with self._lock:
+            if durable and envelope is not None:
+                self._pending_envelopes[mutation.request_id] = (
+                    envelope, mutation)
+            else:
+                self._non_durable[mutation.request_id] = (
+                    mutation, occurred_at)
+        result = {
+            "ok": False, "code": "score_worker_failure",
+            "error": "本机成绩写入任务异常，已保留待重试",
+            "retryable": True, "pending_preserved": True,
+            "durable_pending": durable,
+        }
+        self._emit_save_event(
+            mutation,
+            SaveState.DURABLE_PENDING if durable
+            else SaveState.NON_DURABLE_PENDING,
+            result)
 
     submit_score_reliable_async = submit_score_async
 
@@ -2592,7 +2851,8 @@ class LocalBackendClient:
 
     def _replay_state_entries(self) -> tuple[int, bool, bool]:
         with maintenance_lock(
-                self._selected_db_path, exclusive=False, timeout=300.0):
+                self._selected_db_path, exclusive=False,
+                timeout=APPLICATION_MAINTENANCE_TIMEOUT_SECONDS):
             return self._replay_state_entries_locked()
 
     def _replay_state_entries_locked(self) -> tuple[int, bool, bool]:
@@ -2646,6 +2906,7 @@ class LocalBackendClient:
         return completed, blocked, repair_blocked
 
     def _retry_all(self) -> int:
+        self.state_outbox.recover_transactions()
         with self._lock:
             pending = list(self._pending_envelopes.values())[:REPLAY_BATCH_SIZE]
             non_durable = list(self._non_durable.values())
@@ -2777,3 +3038,4 @@ class LocalBackendClient:
         # while the writer is alive, then drain the resulting required write.
         self._read_worker.close(cancel_pending=True, timeout=2.0)
         self._worker.close(timeout=10.0)
+        self._application_session.close()

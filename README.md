@@ -140,8 +140,8 @@ SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy python -m tests.stress
 python -m tests.release release --junit release-results.xml --json release-results.json
 ```
 
-release profile 还会为每个阶段设置超时，在隔离 venv 中安装 wheel，并生成
-`release-sbom.json`（CycloneDX）。
+release profile 还会为每个阶段设置超时，在隔离 venv 中分别安装 wheel 和 sdist，从只读工作
+目录创建临时用户数据库，并生成 `release-sbom.json` 与实际安装包清单。
 
 ## 目录结构
 
@@ -162,7 +162,8 @@ classic_games/
 │   ├── test_storage_v6.py
 │   ├── test_storage_v7.py
 │   ├── test_storage_v8.py
-│   └── test_storage_v9.py
+│   ├── test_storage_v9.py
+│   └── test_storage_v10.py
 ├── docs/               # 审查记录、设计决策和维护文档
 ├── pyproject.toml
 ├── environment.yml
@@ -191,9 +192,9 @@ classic_games/
 补写，成功后仅在 hash 仍匹配时删除对应日志。损坏的状态文件移入
 `pending-state-quarantine/`；v1 升级原件保存在 `pending-state-migration-backup/`。
 
-查看和迁移本机数据时，可以先使用下列命令。export/import 会取得维护锁；若游戏仍在写入，命令
-会要求关闭游戏后重试。archive v2 同时包含已提交表和 active score/state pending，并用 manifest
-hash 检测损坏：
+查看和迁移本机数据时，可以先使用下列命令。数据维护要求先关闭启动器和游戏；后端的进程级
+lease 会阻止导出遗漏尚在 worker 队列中的动作。archive v2 同时包含已提交表和 active
+score/state pending，并用 manifest hash 检测损坏：
 
 ```bash
 python -m game_service.data_cli status
@@ -202,10 +203,12 @@ python -m game_service.data_cli preview-import classic-games-backup.json
 ```
 
 导出默认不覆盖任何现有文件，也不能写到数据库、SQLite sidecar、pending 或 recovery 路径。确认
-要替换普通 archive 时才使用 `--force`：
+要替换普通 archive 时才使用 `--force`。如果任何 active journal 因损坏或配额无法读取，完整导出
+会失败；仅用于取证时可加 `--allow-partial`，manifest 会记录遗漏：
 
 ```bash
 python -m game_service.data_cli export classic-games-backup.json --force
+python -m game_service.data_cli export readable-evidence.json --allow-partial
 ```
 
 导入会区分完全重复、语义冲突和 alternate identity 冲突；任一冲突都会拒绝整次 apply，而不是
@@ -214,6 +217,16 @@ python -m game_service.data_cli export classic-games-backup.json --force
 ```bash
 python -m game_service.data_cli import classic-games-backup.json --apply
 ```
+
+普通 `import` 是严格合并。要把数据库和 active pending 恢复到一个完整 archive 的状态，可使用
+替换模式；它会先保存当前数据库及 journal 回滚镜像，缺少完整性标记的旧 archive 不允许替换：
+
+```bash
+python -m game_service.data_cli restore-replace classic-games-backup.json --apply
+```
+
+导入先写 staging 和阶段 journal，再提交数据库并原子发布文件。任一阶段失败会自动恢复导入前的
+数据库和 journal；进程在中途退出时，下一次 export、preview 或 import 会先完成回滚。
 
 `--include-recovery` 中的 quarantine/backup 是证据，不是 active journal。导入时只恢复到
 `imported-recovery/<archive-id>/`，不会覆盖正在使用的 `pending/` 或 `pending-state/`。

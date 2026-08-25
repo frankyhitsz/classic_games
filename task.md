@@ -1,73 +1,75 @@
-# 第十一次审查修复记录
+# 第十二次审查修复记录
 
 ## 状态
 
-- [x] 读取任务书并逐条核对 F01–F31；
-- [x] 建立 P0–P3 共 129 项处理矩阵；
-- [x] 完成 archive v2、路径保护、active pending、manifest、配额和一致快照；
-- [x] 完成严格导入 planner、attempt ID 重映射、alternate unique 冲突和 missing-only baseline；
-- [x] 完成 baseline 单调性、pending high-water、纯语义校验、旧 journal 回滚和拒绝证据隔离；
-- [x] 完成 2048 schema 5 CAS、owner epoch、重新读取接管、终局补分和 v4 milestone 恢复；
-- [x] 完成 2048 autosave 合并和俄罗斯方块同义键逻辑边沿；
-- [x] 完成 release timeout、隔离 venv wheel smoke、SBOM、Actions SHA 和完整依赖约束；
-- [x] 完成第一轮独立复查并重新验证；
-- [x] 完成第二轮独立复查与完整验证；
-- [x] 提交、推送并核验远端 CI。
+- [x] 读取任务书并建立 F01–F29、P0–P3 证据清单；
+- [x] 修复 import/pending/rollback 的 P0 数据风险；
+- [x] 完成 archive 完整性、planner、legacy status 和 recovery 路径加固；
+- [x] 完成 2048 autosave 与 release smoke 的成立项；
+- [x] 写入逐条审查答复和 108 项矩阵；
+- [x] 第一轮独立复查：故障注入、配额、并发与恢复；
+- [x] 第二轮独立复查：兼容性、性能和完整 release 验证；
+- [ ] 提交、推送并核验远端 CI。
+
+## 当前发现
+
+- F01 成立：当前数据库先 commit，随后才逐个写 pending/evidence，文件失败会产生部分导入；
+- F02/F03 成立：score 次数无上限且按次数 fsync，state schema 3 没有复用 store 的 int64/时间边界；
+- F04/F18 成立：`.restore` 不在启动扫描范围，rollback 失败后 previous 也没有进入 non-durable 状态；
+- F05 部分成立：exclusive lock 能冻结协作的持久层写入，但不能包含 worker 队列中尚未发布的内存动作；
+- F06–F10 成立：store 初始化早于锁、pending 扫描可截断/修改源文件、planner 没有完整预演目标业务冲突；
+- F16 需修正措辞：store 已校验 2048 owner schema，但尚未复用游戏端棋盘、终局和 attempt 语义；
+- F21/F22 成立：当前 150 ms 只有尾沿且一个 Future 引用会覆盖前一个；
+- F23 是策略选择而非数据安全 bug；当前实现是单 autosave + owner CAS，不等于支持多长局；
+- F26/F29 属于仓库管理权限和权利人决定，不能用代码伪造完成状态。
 
 ## 初版验证
 
-- 新增 `test_storage_v9.py`，覆盖危险导出路径、已有文件确认、pending 往返、attempt ID 重映射、
-  alternate unique 冲突、archive hash/深度/NaN、baseline 截止、journal 回滚、健康 receipt 读锁、
-  后台 outbox 启动、2048 v4/终局、autosave 合并、Tetris 同义键和 release timeout/wheel stage；
-- storage 从 128 项增加到 143 项，全部通过；Ruff 与 compileall 通过；
-- 固定 seed 20,000 步、240 次并发写和 100 次资源循环通过，FD 19→19；保存 p99 2.721 ms。
+- 新增 `test_storage_v10.py`，覆盖 attempt/time/revision 边界、state 总配额、reject crash marker、
+  rollback non-durable fallback、post-commit ENOSPC、阶段事务恢复、committed receipt planner、只读
+  partial export、schema compatibility、legacy status、application lease、evidence 路径、2048 最大
+  dirty age/单 Future、score maintenance timeout、replace restore 和 1,005 个 merge components；
+- storage 从 143 项增加到 159 项，全部通过；Ruff、compileall 和独立 wheel+sdist smoke 通过；
+- package smoke 在隔离 venv 先后安装 wheel/sdist，从只读 cwd 在 `GAMES_DATA_DIR` 首次创建数据库，
+  并运行 `classic-games-data --help`。
 
 ## 第一轮复查
 
-- 发现 recovery evidence 原本在数据库提交后才解码，坏 base64 或越界路径可能造成部分导入。
-  现已将路径、base64、单文件/总量和 hash 校验前移到共享 planner；apply 只处理已验证内容；
-- 发现 1 MiB JSON 字符串限制会拒绝本工具导出的较大 base64 evidence，已按 8 MiB 文件上限将
-  JSON 字符串边界调整为 12 MiB，仍保留总 archive 和总 evidence 配额；
-- 发现 2048 CAS 在重新读取后仍可能因最后一刻竞争失败。失败现在立即恢复 load gate、重新读取
-  当前 slot，并清除旧 expectation，避免玩家继续操作一个无法保存的棋盘；
-- wheel smoke 改为无 system-site-packages 的新 venv，按发行约束安装 wheel 及依赖；release 新增
-  CycloneDX JSON SBOM 阶段并纳入 CI artifact；
-- 修复后 Ruff、compileall、142 项 storage 和完整 stress 再次通过。
+- 发现仅在 import 时回滚中断事务会让下一次 export/preview 读取部分状态；现三种维护操作都会先
+  自动恢复，`status` 只读显示 unfinished transaction 数量；
+- 发现路径校验在 macOS `/var → /private/var` 上把系统祖先别名误判为 journal symlink；事务改为
+  发布到已 resolve 且仍位于数据库目录内的 candidate，同时 preview 调用同一 target validator；
+- 发现原计划只有 merge import，不能从旧完整备份真正回滚；新增 `restore-replace`，恢复 committed
+  表、active pending 和 baseline，删除 archive 中不存在的旧 active journal，并保留导入前备份；
+- 发现 sdist smoke 使用 `pip download --no-binary` 对本地目录仍生成 wheel；改为调用 PEP 517
+  backend 构建 sdist，再由隔离 venv 安装以验证实际 source distribution；
+- 发现 macOS 默认用户目录受当前沙箱限制；smoke 使用产品已有 `GAMES_DATA_DIR` 配置测试真实用户
+  数据路径，没有改写 HOME，也没有回退到仓库 cwd。
 
 ## 第二轮复查
 
-- v2 archive 在同一目标重复导入：第二次所有表插入数均为 0；v1 archive 仍能 preview/apply；
-  单独进程持 shared application lock 时，export 在 2 秒内返回可重试 `maintenance_busy`；
-- 发现 export guard 只在 pending 目录已存在时才拦截路径，可能把 archive 创建成第一个 pending
-  文件。现对约定 active 目录无条件做路径包含判断，并加入“目录尚不存在”用例；
-- 发现 status 为统计 pending 而构造 outbox 会顺带迁移 legacy spool，违背查看操作预期。现改用有界
-  raw directory count，status 不解析、不升级、不隔离文件；
-- 发现 target 已有同 request ID、不同 payload 的 pending score 时，原 planner 会在数据库提交后
-  才失败。preview 现在提前读取目标 envelope 并报告冲突；state pending 也预演 progress merge；
-- v1 recovery 的历史绝对路径在兼容转换时只保留 basename；evidence 的各级父目录在写后 fsync；
-  v4 writer 不能覆盖已升级为 v5 的同-token slot；桌面写等待 maintenance 的 worker timeout 扩为
-  300 秒，避免长导入把尚未 journal 的操作变成 Future 异常；
-- 复核 Windows dependency resolution，与 macOS 的完整约束闭包一致；129 行矩阵计数为
-  P0 20、P1 48、P2 34、P3 27。
+- 发现 transaction journal 只有结构校验，若内容被截断或篡改可能按错误 phase/target 恢复；现 journal
+  自带 canonical hash，operations 限制 basename/类型，回滚前对 SQLite 镜像执行 `quick_check`；
+- 发现 import planner 读取目标已有 pending/evidence 时没有先检查文件大小，恶意超大目标仍会制造
+  内存峰值；现 score/state 64 KiB、evidence 8 MiB，整个事务 staging+before 128 MiB；
+- 发现 evidence symlink parent 在 preview 时可能直到 prepare 才失败；preview 和 apply 现共用
+  `validate_file_operations()`，并在读取任何已有 target 前先做 resolve containment；
+- 发现中断数据库被外部删除时，`database.exists()` 分支会跳过可用回滚镜像；import/replace 现无条件
+  扫描阶段事务，可从镜像重建目标；
+- clean venv 没有 setuptools，直接调用 backend 的 sdist smoke 失败；新增 `build==1.5.0` 和
+  `pyproject_hooks==1.2.0` 发行约束，改用标准隔离 `python -m build --sdist`，完整 release 重跑通过。
 
 ## 最终验证
 
-- `run_tests.sh`：107 项 gameplay、143 项 storage/迁移/生命周期、固定 seed 20,000 步全部通过；
-- stress：240 次并发写 `integrity_check=ok`，资源循环 100 次 FD 19→19；渲染 p95 为 Tetris
-  2.255 ms、Snake 2.146 ms、2048 1.453 ms、Sokoban 1.569 ms、Zuma 4.254 ms；本机保存
-  p99 2.426 ms，持锁异步提交 p99 0.040 ms；
-- 独立 release venv 完整通过 8 个阶段：Ruff、dependency audit、CycloneDX SBOM、compile、
-  wheel smoke、storage、stress、gameplay；pip-audit 未发现已知漏洞；
-- wheel smoke 生成 153,855 字节 wheel，在无 system-site-packages 的新 venv 按约束安装 pygame，
-  成功导入 launcher/data/store 并运行 `classic-games-data --help`；
-- `git diff --check`、compileall、Actions SHA 检查、archive v1/v2/重复导入演练和维护锁跨进程演练
-  均通过。
+- 161 项 storage、107 项 gameplay 全部通过；
+- stress 固定 seed 20,000 步、240 次并发写、100 次资源循环通过，FD 19→19，
+  `integrity_check=ok`；Zuma 渲染 p95 4.932 ms，本机保存 p99 4.984 ms；
+- release 八阶段全部通过：Ruff、dependency audit、CycloneDX SBOM、compile、wheel+sdist smoke、
+  storage、stress、gameplay；pip-audit 未发现已知漏洞；
+- wheel/sdist 在隔离 Python 3.13 venv 均能安装；从只读 cwd 创建外部 user-data 数据库并运行
+  `classic-games-data --help`；
+- 29 条 finding 与 P0 12、P1 44、P2 28、P3 24 共 108 项矩阵均已核对。
 
 ## 远端验证
 
-- CI #27 的跨平台矩阵已启动，但 release-gate 在统一 release 命令中退出 1；公开 job 页面没有展开
-  内部 stage 日志。本机同一隔离 release profile 八阶段均通过；复核 GitHub clean runner 差异后，
-  wheel build 改回 PEP 517 默认 build isolation，不再依赖 runner 主环境恰好预装足够新的 setuptools。
-- 修正提交 `10d4c56` 已推送到 `origin/main`。GitHub Actions
-  [CI #28](https://github.com/frankyhitsz/classic_games/actions/runs/32800809233) 完整成功：release-gate、
-  core-only、Python 3.12/3.13、Ubuntu、macOS、Windows 共 7 个 job 全部通过。
+尚未执行。

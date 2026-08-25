@@ -33,6 +33,8 @@ from client.common.ui import (COLORS, SAVE_PENDING, SAVE_SAVING, BaseGame, Butto
                               draw_gradient_bg, draw_text, ease_out_back,
                               ease_out_cubic)
 from game_service.mutation import MAX_SCORE
+from game_service.save_slot_validation import validate_2048_state
+from game_service.store import StoreError
 from game_service.service import (GameDataService, SaveState, SlotLoadResult,
                                   SlotLoadStatus)
 
@@ -52,6 +54,7 @@ SPAWN_DURATION = 0.18  # scale-up for newly spawned tile
 MERGE_DURATION = 0.22  # pop after a merge
 SLOT_LOAD_TIMEOUT_SECONDS = 8.0
 AUTOSAVE_DEBOUNCE_MS = 150
+AUTOSAVE_MAX_DIRTY_MS = 1500
 
 
 def tile_color(value: int):
@@ -133,6 +136,8 @@ class Game2048(BaseGame):
         self._slot_load_started_at = 0.0
         self._autosave_queued = False
         self._autosave_due_at = 0
+        self._autosave_dirty_since = 0
+        self._autosave_release_queued = False
         self._initializing_board = True
         self.reset()
         self._initializing_board = False
@@ -427,12 +432,27 @@ class Game2048(BaseGame):
                 t.merge_pop = max(0.0, t.merge_pop - dt / MERGE_DURATION)
 
     def _save_autosave_slot(self, owner_status: str = "active") -> None:
-        self._autosave_queued = False
         if self.slot_load_state != "ready":
             return
         save_slot = getattr(self.backend, "save_slot_async", None)
         if not callable(save_slot):
             return
+        if (self._slot_save_future is not None
+                and not self._slot_save_future.done()):
+            self._autosave_queued = True
+            self._autosave_release_queued |= owner_status == "released"
+            if not self._autosave_dirty_since:
+                self._autosave_dirty_since = pygame.time.get_ticks()
+            return
+        if self._slot_save_future is not None:
+            self._poll_slot_save()
+            if self._slot_save_future is not None:
+                self._autosave_queued = True
+                self._autosave_release_queued |= owner_status == "released"
+                return
+        self._autosave_queued = False
+        self._autosave_dirty_since = 0
+        self._autosave_release_queued = False
         self._slot_revision += 1
         state = {
             "version": 5,
@@ -465,13 +485,19 @@ class Game2048(BaseGame):
 
     def _queue_autosave_slot(self) -> None:
         """Coalesce rapid settled moves into one durable latest-value write."""
+        now = pygame.time.get_ticks()
+        if not self._autosave_queued:
+            self._autosave_dirty_since = now
         self._autosave_queued = True
-        self._autosave_due_at = (
-            pygame.time.get_ticks() + AUTOSAVE_DEBOUNCE_MS)
+        self._autosave_due_at = now + AUTOSAVE_DEBOUNCE_MS
 
     def _flush_autosave_if_due(self) -> None:
+        now = pygame.time.get_ticks()
         if (self._autosave_queued
-                and pygame.time.get_ticks() >= self._autosave_due_at):
+                and (now >= self._autosave_due_at
+                     or (self._autosave_dirty_since
+                         and now - self._autosave_dirty_since
+                         >= AUTOSAVE_MAX_DIRTY_MS))):
             self._save_autosave_slot()
 
     def _poll_slot_save(self) -> None:
@@ -513,6 +539,10 @@ class Game2048(BaseGame):
                 self._slot_expected_revision = None
                 self._slot_expected_value_hash = None
         self._poll_slot_save_status()
+        if self._autosave_queued and self.slot_load_state == "ready":
+            owner_status = (
+                "released" if self._autosave_release_queued else "active")
+            self._save_autosave_slot(owner_status=owner_status)
 
     def _poll_slot_save_status(self) -> None:
         if not self._slot_save_pending:
@@ -580,6 +610,11 @@ class Game2048(BaseGame):
                        if isinstance(state, dict) else None)
         owner_status = (state.get("owner_status")
                         if isinstance(state, dict) else None)
+        try:
+            validate_2048_state(state)
+        except StoreError:
+            self._quarantine_bad_slot("invalid_2048_slot_semantics")
+            return
         if version in (4, 5):
             owner_epoch = state.get("owner_epoch", 0)
             valid_owner = (
@@ -1073,7 +1108,14 @@ class Game2048(BaseGame):
         future = self._slot_save_future
         if future is not None:
             try:
-                future.result(timeout=1.0)
+                future.result(timeout=0.5)
+            except Exception:  # noqa: BLE001 - durable journal may finish later
+                pass
+            self._poll_slot_save()
+        future = self._slot_save_future
+        if future is not None:
+            try:
+                future.result(timeout=0.5)
             except Exception:  # noqa: BLE001 - durable journal may finish later
                 pass
 

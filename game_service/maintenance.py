@@ -17,6 +17,11 @@ def lock_path(database: Path | str) -> Path:
     return path.with_name(f".{path.name}.maintenance.lock")
 
 
+def application_lock_path(database: Path | str) -> Path:
+    path = Path(database)
+    return path.with_name(f".{path.name}.application.lock")
+
+
 def _try_lock(descriptor: int, exclusive: bool) -> bool:
     if os.name == "nt":
         # msvcrt has no shared byte-range lock. Serializing ordinary writers
@@ -49,6 +54,115 @@ def _unlock(descriptor: int) -> None:
     import fcntl
 
     fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+class ApplicationSession:
+    """Lifetime shared lease proving that a local backend is still active."""
+
+    def __init__(self, descriptor: int, slot: int | None = None):
+        self._descriptor = descriptor
+        self._slot = slot
+
+    @classmethod
+    def acquire(cls, database: Path | str, timeout: float = 2.0):
+        path = application_lock_path(database)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + max(0.0, timeout)
+        try:
+            if os.fstat(descriptor).st_size < 256:
+                os.ftruncate(descriptor, 256)
+                os.fsync(descriptor)
+            if os.name != "nt":
+                while not _try_lock(descriptor, exclusive=False):
+                    if time.monotonic() >= deadline:
+                        raise MaintenanceBusyError(
+                            "local data maintenance is active; retry shortly")
+                    time.sleep(0.02)
+                return cls(descriptor)
+            import msvcrt
+
+            while True:
+                for slot in range(1, 256):
+                    try:
+                        os.lseek(descriptor, slot, os.SEEK_SET)
+                        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    except OSError:
+                        continue
+                    return cls(descriptor, slot)
+                if time.monotonic() >= deadline:
+                    raise MaintenanceBusyError(
+                        "local data maintenance is active; retry shortly")
+                time.sleep(0.02)
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def close(self) -> None:
+        descriptor = self._descriptor
+        if descriptor < 0:
+            return
+        self._descriptor = -1
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(descriptor, int(self._slot), os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                _unlock(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def __del__(self):
+        try:
+            self.close()
+        except OSError:
+            pass
+
+
+@contextmanager
+def inactive_application_lock(database: Path | str, timeout: float = 2.0):
+    """Hold an exclusive lease after every cooperating backend has closed."""
+    path = application_lock_path(database)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if os.fstat(descriptor).st_size < 256:
+            os.ftruncate(descriptor, 256)
+            os.fsync(descriptor)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            if os.name == "nt":
+                import msvcrt
+
+                try:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 256)
+                except OSError:
+                    acquired = False
+                else:
+                    acquired = True
+            else:
+                acquired = _try_lock(descriptor, exclusive=True)
+            if acquired:
+                break
+            if time.monotonic() >= deadline:
+                raise MaintenanceBusyError(
+                    "Classic Games is active; close it before data maintenance")
+            time.sleep(0.02)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                import msvcrt
+
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 256)
+            else:
+                _unlock(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 @contextmanager

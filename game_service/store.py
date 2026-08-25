@@ -376,15 +376,23 @@ class LocalGameStore:
             conn.execute("BEGIN IMMEDIATE")
             self._delete_expired_receipts(conn, cutoff)
             merge_cutoff = cutoff - STATE_MERGE_RECEIPT_RETENTION_DAYS * 86400
-            protected = tuple(dict.fromkeys(protected_merge_ids))[:1000]
+            protected = tuple(dict.fromkeys(protected_merge_ids))
             if protected:
-                placeholders = ",".join("?" for _ in protected)
+                conn.execute(
+                    "CREATE TEMP TABLE IF NOT EXISTS protected_merge_ids ("
+                    "operation_id TEXT PRIMARY KEY)")
+                conn.execute("DELETE FROM protected_merge_ids")
+                conn.executemany(
+                    "INSERT INTO protected_merge_ids(operation_id) VALUES(?)",
+                    ((operation_id,) for operation_id in protected))
                 conn.execute(
                     "DELETE FROM state_merge_receipts WHERE operation_id IN ("
                     "SELECT operation_id FROM state_merge_receipts WHERE "
-                    f"applied_at < ? AND operation_id NOT IN ({placeholders}) "
+                    "applied_at < ? AND NOT EXISTS (SELECT 1 FROM "
+                    "protected_merge_ids p WHERE p.operation_id="
+                    "state_merge_receipts.operation_id) "
                     "ORDER BY applied_at LIMIT 500)",
-                    (merge_cutoff, *protected))
+                    (merge_cutoff,))
             else:
                 conn.execute(
                     "DELETE FROM state_merge_receipts WHERE operation_id IN ("

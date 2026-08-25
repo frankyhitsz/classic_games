@@ -473,7 +473,12 @@ class DataArchiveTests(unittest.TestCase):
             source.set_progress(
                 profile_id, "zuma", "campaign", {"unlocked_level": 3})
             source.save_slot(
-                profile_id, "2048", "manual", {"version": 3, "score": 64})
+                profile_id, "2048", "manual", {
+                    "version": 1, "game_state": "playing", "score": 64,
+                    "won": False,
+                    "grid": [[2, 0, 0, 0], [0, 0, 0, 0],
+                             [0, 0, 0, 0], [0, 0, 0, 0]],
+                })
             exported = export_data(source_path, archive)
             self.assertTrue(exported["ok"])
 

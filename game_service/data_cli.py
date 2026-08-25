@@ -11,18 +11,26 @@ import math
 import os
 import sqlite3
 import sys
+import tempfile
 import time
 import uuid
-from pathlib import Path
+from dataclasses import replace
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from .catalog import VALID_GAME_IDS
-from .local_backend import (PendingSaveEnvelope, PersistentSaveOutbox,
-                            PersistentStateOutbox)
-from .maintenance import MaintenanceBusyError, maintenance_lock
+from .catalog import GAME_BY_ID, VALID_GAME_IDS
+from .import_transaction import (FileOperation, ImportTransaction,
+                                 recover_import_transactions,
+                                 validate_file_operations)
+from .local_backend import (MAX_SPOOL_FILE_BYTES, PendingSaveEnvelope,
+                            PersistentSaveOutbox, PersistentStateOutbox)
+from .maintenance import (MaintenanceBusyError, inactive_application_lock,
+                          maintenance_lock)
 from .mutation import MutationError, canonical_json
 from .profile import ProfileIdentity, ProfileIdentityError
 from .progress import ProgressPolicyError, validate_progress
-from .store import LocalGameStore, StoreError, default_database_path
+from .save_slot_validation import validate_save_slot_payload
+from .store import (SCHEMA_VERSION as STORE_SCHEMA_VERSION, LocalGameStore,
+                    StoreError, default_database_path)
 
 ARCHIVE_VERSION = 2
 SUPPORTED_ARCHIVE_VERSIONS = frozenset({1, ARCHIVE_VERSION})
@@ -109,7 +117,7 @@ def _recovery_paths(database: Path) -> list[Path]:
         f"{database.name}.backup-", f"{database.name}.corrupt-",
         "pending-quarantine", "pending-state-quarantine",
         "pending-migration-backup", "pending-state-migration-backup",
-        "imported-recovery",
+        "imported-recovery", f".{database.name}.import-",
     )
     try:
         entries = list(parent.iterdir())
@@ -185,14 +193,36 @@ def _pending_file_count(path: Path) -> int:
 
 
 def inspect_data(database: Path) -> dict:
-    store = _existing_store(database)
-    with store.connection() as connection:
-        counts = {
-            table: int(connection.execute(
-                f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-            for table in EXPORT_TABLES
-        }
-        integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
+    if not database.is_file():
+        raise StoreError(
+            "database_not_found", "local database does not exist", 404)
+    connection = None
+    try:
+        connection = sqlite3.connect(str(database), timeout=2.0)
+        connection.row_factory = sqlite3.Row
+        with connection:
+            tables = {
+                row["name"] for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+            schema_version = 0
+            if "schema_meta" in tables:
+                row = connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='version'").fetchone()
+                if row is not None:
+                    schema_version = int(row["value"])
+            counts = {
+                table: (int(connection.execute(
+                    f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                    if table in tables else None)
+                for table in EXPORT_TABLES
+            }
+            integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
+    except (sqlite3.Error, TypeError, ValueError) as exc:
+        raise StoreError(
+            "database_unavailable", "local database status is unreadable") from exc
+    finally:
+        if connection is not None:
+            connection.close()
     score_path, state_path = _pending_paths(database)
     recovery = []
     for path in _recovery_paths(database):
@@ -209,17 +239,27 @@ def inspect_data(database: Path) -> dict:
         })
     return {
         "ok": integrity == "ok", "database": str(database),
-        "schema_version": store.schema_version(), "quick_check": integrity,
+        "schema_version": schema_version,
+        "supported_schema_version": STORE_SCHEMA_VERSION,
+        "migration_needed": schema_version != STORE_SCHEMA_VERSION,
+        "missing_tables": [
+            table for table, count in counts.items() if count is None],
+        "quick_check": integrity,
         "counts": counts,
         "pending": {
             "scores": _pending_file_count(score_path),
             "state": _pending_file_count(state_path),
         },
         "recovery": recovery,
+        "unfinished_import_transactions": len([
+            path for path in database.parent.glob(
+                f".{database.name}.import-*")
+            if path.is_dir() and not path.is_symlink()
+        ]),
     }
 
 
-def _export_recovery(database: Path) -> list[dict]:
+def _export_recovery(database: Path) -> tuple[list[dict], dict]:
     result: list[dict] = []
     total = 0
     visited = 0
@@ -232,7 +272,7 @@ def _export_recovery(database: Path) -> list[dict]:
             if visited > MAX_RECOVERY_FILES:
                 result.append({
                     "path": "_remaining", "omitted": "file_count_limit"})
-                return result
+                break
             relative = (root.name if root.is_file() else
                         str(Path(root.name) / path.relative_to(root)))
             try:
@@ -261,7 +301,17 @@ def _export_recovery(database: Path) -> list[dict]:
                 "sha256": hashlib.sha256(raw).hexdigest(),
                 "content_base64": base64.b64encode(raw).decode("ascii"),
             })
-    return result
+        if visited > MAX_RECOVERY_FILES:
+            break
+    omitted = sum("omitted" in item for item in result)
+    return result, {
+        "complete": omitted == 0,
+        "source_count": visited,
+        "included_count": len(result) - omitted,
+        "omitted_count": omitted,
+        "omitted_reasons": sorted({
+            item["omitted"] for item in result if "omitted" in item}),
+    }
 
 
 def _fsync_directory(path: Path) -> None:
@@ -275,13 +325,16 @@ def _fsync_directory(path: Path) -> None:
 
 
 def export_data(database: Path, output: Path,
-                include_recovery: bool = False, *, force: bool = False) -> dict:
+                include_recovery: bool = False, *, force: bool = False,
+                allow_partial: bool = False) -> dict:
     database = database.expanduser().resolve(strict=False)
     store = _existing_store(database)
     output = _guard_export_target(database, output, force=force)
     score_path, state_path = _pending_paths(database)
     try:
-        with maintenance_lock(database, exclusive=True, timeout=2.0):
+        with (inactive_application_lock(database, timeout=2.0),
+              maintenance_lock(database, exclusive=True, timeout=2.0)):
+            recovered_imports = recover_import_transactions(database)
             with store.connection() as connection:
                 connection.execute("BEGIN")
                 tables = {
@@ -289,15 +342,40 @@ def export_data(database: Path, output: Path,
                     for table in EXPORT_TABLES
                 }
                 connection.commit()
+            score_snapshot = PersistentSaveOutbox(
+                score_path, maintain=False).snapshot_envelopes()
+            state_snapshot = PersistentStateOutbox(
+                state_path, recover=False).snapshot_entries()
+            if (not allow_partial
+                    and (not score_snapshot.complete
+                         or not state_snapshot.complete)):
+                raise StoreError(
+                    "incomplete_pending_snapshot",
+                    "active pending journals could not be exported completely",
+                    details={
+                        "scores": score_snapshot.omitted_reasons,
+                        "state": state_snapshot.omitted_reasons,
+                    })
             score_pending = [
                 envelope.to_dict()
                 for envelope, _mutation
-                in PersistentSaveOutbox(score_path).list_envelopes()
+                in score_snapshot.entries
             ]
-            state_pending = PersistentStateOutbox(
-                state_path).list_entries(MAX_TABLE_ROWS)
-            recovery_evidence = (
-                _export_recovery(database) if include_recovery else [])
+            state_pending = list(state_snapshot.entries)
+            if include_recovery:
+                recovery_evidence, recovery_report = _export_recovery(database)
+            else:
+                recovery_evidence = []
+                recovery_report = {
+                    "complete": True, "source_count": 0,
+                    "included_count": 0, "omitted_count": 0,
+                    "omitted_reasons": [],
+                }
+            if not allow_partial and not recovery_report["complete"]:
+                raise StoreError(
+                    "incomplete_recovery_snapshot",
+                    "recovery evidence could not be exported completely",
+                    details=recovery_report)
     except MaintenanceBusyError as exc:
         raise StoreError(
             "maintenance_busy", str(exc), 409, retryable=True) from exc
@@ -312,12 +390,40 @@ def export_data(database: Path, output: Path,
             "pending": {
                 "score_count": len(score_pending),
                 "state_count": len(state_pending),
+                "score": {
+                    "complete": score_snapshot.complete,
+                    "source_count": score_snapshot.source_count,
+                    "included_count": score_snapshot.included_count,
+                    "omitted_count": score_snapshot.omitted_count,
+                    "omitted_reasons": score_snapshot.omitted_reasons,
+                },
+                "state": {
+                    "complete": state_snapshot.complete,
+                    "source_count": state_snapshot.source_count,
+                    "included_count": state_snapshot.included_count,
+                    "omitted_count": state_snapshot.omitted_count,
+                    "omitted_reasons": state_snapshot.omitted_reasons,
+                },
                 "semantics": "restorable-active-journals",
             },
             "recovery": {
                 "count": len(recovery_evidence),
+                **recovery_report,
                 "semantics": "evidence-only; restored outside active paths",
             },
+            "complete": (
+                score_snapshot.complete and state_snapshot.complete
+                and recovery_report["complete"]),
+            "snapshot_scope": (
+                "persisted data only; close the game before export so worker "
+                "queues are empty"),
+            "application": {
+                "id": "classic-games-hub",
+                "rulesets": {
+                    game_id: GAME_BY_ID[game_id].ruleset_version
+                    for game_id in sorted(VALID_GAME_IDS)},
+            },
+            "recovered_imports_before_snapshot": recovered_imports,
             "privacy": (
                 "Contains local profile names, gameplay history, settings, "
                 "save states, and any selected recovery evidence."),
@@ -335,7 +441,8 @@ def export_data(database: Path, output: Path,
         raise StoreError(
             "export_too_large", "archive exceeds the 128 MiB limit")
     output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    temporary = output.with_name(
+        f".{output.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     descriptor = os.open(
         temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
@@ -357,6 +464,8 @@ def export_data(database: Path, output: Path,
         "pending_scores": len(score_pending),
         "pending_state": len(state_pending),
         "recovery_files": len(recovery_evidence),
+        "complete": payload["manifest"]["complete"],
+        "recovered_imports": recovered_imports,
     }
 
 
@@ -392,6 +501,12 @@ def _load_archive(path: Path) -> dict:
         if manifest_hash != expected:
             raise StoreError(
                 "archive_hash_mismatch", "archive content does not match its manifest")
+        database_schema = archive.get("schema_version")
+        if (type(database_schema) is not int
+                or not 1 <= database_schema <= STORE_SCHEMA_VERSION):
+            raise StoreError(
+                "unsupported_archive_schema",
+                "archive database schema is newer than this reader")
     else:
         legacy_evidence = []
         for index, item in enumerate(archive.get("recovery_files", [])):
@@ -482,6 +597,7 @@ def _semantic_row_check(table: str, row: dict) -> None:
             state.get("version", 1) if isinstance(state, dict) else 1)
         if expected_version != row.get("state_version"):
             raise ValueError("save state version metadata does not match")
+        validate_save_slot_payload(row["game_id"], state)
 
 
 def _insert_columns(table: str, row: dict) -> list[str]:
@@ -496,7 +612,7 @@ def _insert_row(connection: sqlite3.Connection, table: str, row: dict) -> None:
         tuple(row[column] for column in columns))
 
 
-def _plan_import(database: Path, archive: dict) -> tuple[dict, dict]:
+def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOperation]]:
     store = _existing_store(database)
     plan = {table: [] for table in IMPORT_TABLES}
     result = {
@@ -644,6 +760,23 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict]:
         _validated_recovery_items(archive)
     except StoreError as exc:
         errors.append(f"recovery evidence is invalid: {exc.message}")
+    file_operations: list[FileOperation] = []
+    try:
+        file_operations = _planned_file_operations(database, archive)
+        with store.connection() as connection:
+            _preview_pending_against_target(
+                database, connection, plan, file_operations)
+    except (OSError, sqlite3.Error, StoreError, MutationError, ValueError,
+            TypeError, RecursionError, UnicodeError, json.JSONDecodeError) as exc:
+        errors.append(f"pending transactional validation failed: {exc}")
+    plan_fingerprint = hashlib.sha256(canonical_json({
+        "archive": archive.get("manifest_hash"),
+        "tables": plan,
+        "files": [{
+            "target": str(operation.target.relative_to(database.parent)),
+            "sha256": hashlib.sha256(operation.data).hexdigest(),
+        } for operation in file_operations],
+    }).encode("utf-8")).hexdigest()
     summary = {
         "ok": not errors, "tables": result,
         "errors": errors[:50],
@@ -654,21 +787,31 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict]:
             "scores": len(archive["pending_scores"]),
             "state": len(archive["pending_state"]),
         },
+        "plan_fingerprint": plan_fingerprint,
+        "archive_completeness": {
+            "complete": archive.get("manifest", {}).get("complete"),
+            "recovery_omitted_count": sum(
+                isinstance(item, dict) and "omitted" in item
+                for item in archive["recovery_evidence"]),
+        },
     }
-    return summary, plan
+    return summary, plan, file_operations
 
 
 def preview_import(database: Path, archive_path: Path) -> dict:
     database = database.expanduser().resolve(strict=False)
     archive = _load_archive(archive_path)
     try:
-        with maintenance_lock(database, exclusive=True, timeout=2.0):
-            result, _plan = _plan_import(database, archive)
+        with (inactive_application_lock(database, timeout=2.0),
+              maintenance_lock(database, exclusive=True, timeout=2.0)):
+            recovered = recover_import_transactions(database)
+            result, _plan, _files = _plan_import(database, archive)
     except MaintenanceBusyError as exc:
         raise StoreError(
             "maintenance_busy", str(exc), 409, retryable=True) from exc
     return {**result, "archive": str(archive_path),
-            "archive_version": archive["archive_version"]}
+            "archive_version": archive["archive_version"],
+            "recovered_imports": recovered}
 
 
 def _restore_pending(database: Path, archive: dict) -> dict:
@@ -680,8 +823,9 @@ def _restore_pending(database: Path, archive: dict) -> dict:
         envelope, mutation = PendingSaveEnvelope.parse(value)
         current = score_outbox.add_mutation(
             mutation, created_at=envelope.created_at)
-        for _ in range(max(0, envelope.attempt_count - current.attempt_count)):
-            score_outbox.increment_attempt(mutation.request_id)
+        score_outbox.set_attempt_count_max(
+            mutation.request_id,
+            max(current.attempt_count, envelope.attempt_count))
         restored_scores += 1
     restored_state = 0
     for value in archive["pending_state"]:
@@ -698,12 +842,24 @@ def _restore_pending(database: Path, archive: dict) -> dict:
 
 
 def _safe_evidence_relative(raw: str) -> Path:
-    path = Path(raw)
-    if path.is_absolute() or not path.parts or any(
-            part in {"", ".", ".."} for part in path.parts):
+    if (not isinstance(raw, str) or not raw or len(raw) > 1024
+            or "\\" in raw or ":" in raw
+            or any(ord(char) < 32 for char in raw)):
         raise StoreError(
             "invalid_archive", "recovery evidence path is unsafe")
-    return Path(*path.parts)
+    posix = PurePosixPath(raw)
+    windows = PureWindowsPath(raw)
+    reserved = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
+                *(f"lpt{i}" for i in range(1, 10))}
+    if (posix.is_absolute() or windows.drive or windows.root
+            or not posix.parts or any(
+                part in {"", ".", ".."}
+                or part.rstrip(" .") != part
+                or part.split(".", 1)[0].casefold() in reserved
+                for part in posix.parts)):
+        raise StoreError(
+            "invalid_archive", "recovery evidence path is unsafe")
+    return Path(*posix.parts)
 
 
 def _validated_recovery_items(archive: dict) -> list[tuple[Path, bytes]]:
@@ -766,45 +922,319 @@ def _restore_recovery_evidence(database: Path, archive: dict) -> dict:
             "directory": str(root) if restored else None}
 
 
+def _read_bounded_target(path: Path, limit: int) -> bytes:
+    try:
+        size = path.stat().st_size
+        if size > limit:
+            raise StoreError(
+                "import_target_too_large",
+                "existing target exceeds the import planning limit")
+        return path.read_bytes()
+    except OSError as exc:
+        raise StoreError(
+            "import_target_unreadable", "existing import target is unreadable"
+        ) from exc
+
+
+def _planned_file_operations(database: Path, archive: dict) -> list[FileOperation]:
+    """Build final pending/evidence bytes without changing the target."""
+    score_path, state_path = _pending_paths(database)
+    score_values: dict[Path, PendingSaveEnvelope] = {}
+    for value in archive["pending_scores"]:
+        envelope, _mutation = PendingSaveEnvelope.parse(value)
+        target = score_path / f"{envelope.request_id}.json"
+        validate_file_operations(database, [FileOperation(target, b"")])
+        current = score_values.get(target)
+        if current is None and target.is_file():
+            raw = json.loads(
+                _read_bounded_target(
+                    target, MAX_SPOOL_FILE_BYTES).decode("utf-8"),
+                parse_constant=_reject_json_constant)
+            current, _current_mutation = PendingSaveEnvelope.parse(raw)
+        if current is not None:
+            if current.payload_hash != envelope.payload_hash:
+                raise StoreError(
+                    "request_id_conflict",
+                    "target pending request ID has another payload")
+            envelope = replace(
+                current,
+                attempt_count=max(
+                    current.attempt_count, envelope.attempt_count),
+                created_at=min(current.created_at, envelope.created_at))
+        score_values[target] = envelope
+
+    state_values: dict[Path, dict] = {}
+    for value in archive["pending_state"]:
+        operation = PersistentStateOutbox._parse(
+            canonical_json(value).encode("utf-8"))
+        LocalGameStore.validate_state_operation(operation)
+        if operation["method"] == "save_slot":
+            validate_save_slot_payload(
+                operation["args"][1], operation["args"][3])
+        target = state_path / (
+            f"{hashlib.sha256(operation['key'].encode('utf-8')).hexdigest()}"
+            ".json")
+        validate_file_operations(database, [FileOperation(target, b"")])
+        current = state_values.get(target)
+        if current is None and target.is_file():
+            current = PersistentStateOutbox._parse(
+                _read_bounded_target(target, MAX_SPOOL_FILE_BYTES))
+        if current is not None:
+            if operation["kind"] == current["kind"] == "progress":
+                operation = PersistentStateOutbox._merge_progress_operations(
+                    current, operation)
+            elif (PersistentStateOutbox._order(operation)
+                  <= PersistentStateOutbox._order(current)):
+                operation = current
+        state_values[target] = operation
+
+    operations = [
+        FileOperation(target, canonical_json(envelope.to_dict()).encode("utf-8"))
+        for target, envelope in sorted(
+            score_values.items(), key=lambda item: str(item[0]))
+    ]
+    operations.extend(
+        FileOperation(target, canonical_json(operation).encode("utf-8"))
+        for target, operation in sorted(
+            state_values.items(), key=lambda item: str(item[0])))
+
+    prepared = _validated_recovery_items(archive)
+    if prepared:
+        archive_id = archive.get("manifest_hash") or hashlib.sha256(
+            canonical_json(archive).encode("utf-8")).hexdigest()
+        root = database.parent / "imported-recovery" / archive_id[:24]
+        for relative, raw in prepared:
+            target = root / relative
+            validate_file_operations(database, [FileOperation(target, b"")])
+            if (target.is_file()
+                    and _read_bounded_target(
+                        target, MAX_RECOVERY_FILE_BYTES) != raw):
+                raise StoreError(
+                    "recovery_evidence_conflict",
+                    "existing recovery evidence differs from the archive")
+            operations.append(FileOperation(target, raw))
+    validate_file_operations(database, operations)
+    return operations
+
+
+def _preview_pending_against_target(
+        database: Path, connection: sqlite3.Connection, plan: dict,
+        operations: list[FileOperation]) -> None:
+    """Replay planned pending operations in an isolated target copy."""
+    with tempfile.TemporaryDirectory(prefix="classic-games-import-plan-") as root:
+        scratch_path = Path(root) / "target.sqlite"
+        scratch_connection = sqlite3.connect(str(scratch_path))
+        try:
+            connection.backup(scratch_connection)
+            scratch_connection.row_factory = sqlite3.Row
+            scratch_connection.execute("PRAGMA foreign_keys=ON")
+            scratch_connection.execute("BEGIN IMMEDIATE")
+            for table in IMPORT_TABLES:
+                for row in plan[table]:
+                    _insert_row(scratch_connection, table, row)
+            scratch_store = LocalGameStore(scratch_path, initialize=False)
+            scratch_store._seed_state_baselines(
+                scratch_connection, missing_only=True)
+            scratch_connection.commit()
+        finally:
+            scratch_connection.close()
+        scratch_store = LocalGameStore(scratch_path, initialize=False)
+        score_parent, state_parent = _pending_paths(database)
+        state_operations = []
+        for operation in operations:
+            if operation.target.parent == score_parent:
+                envelope, mutation = PendingSaveEnvelope.parse(json.loads(
+                    operation.data.decode("utf-8"),
+                    parse_constant=_reject_json_constant))
+                scratch_store.record_mutation(
+                    mutation, occurred_at=envelope.created_at)
+            elif operation.target.parent == state_parent:
+                value = PersistentStateOutbox._parse(operation.data)
+                state_operations.append(value)
+        priority = {"ensure_profile": 0, "set_setting": 1,
+                    "set_progress": 2, "merge_progress": 2, "save_slot": 3}
+        state_operations.sort(key=lambda value: (
+            priority.get(value["method"], 99), value["updated_at"]))
+        for operation in state_operations:
+            scratch_store.apply_state_operation(operation)
+
+
 def import_data(database: Path, archive_path: Path) -> dict:
     database = database.expanduser().resolve(strict=False)
     archive = _load_archive(archive_path)
-    store = LocalGameStore(database)
     try:
-        with maintenance_lock(database, exclusive=True, timeout=2.0):
-            preview, plan = _plan_import(database, archive)
+        with (inactive_application_lock(database, timeout=2.0),
+              maintenance_lock(database, exclusive=True, timeout=2.0)):
+            recovered = recover_import_transactions(database)
+            # Initialization and migration belong inside the exclusive gate.
+            store = LocalGameStore(database)
+            preview, plan, file_operations = _plan_import(database, archive)
             if not preview["ok"]:
                 raise StoreError(
                     "invalid_archive",
                     "archive preview contains invalid rows or conflicts",
                     details={"preview": preview})
             backup = store._backup_database(store.schema_version())
+            transaction = ImportTransaction.prepare(
+                database, file_operations)
             inserted = {}
-            with store.connection(timeout_ms=5000) as connection:
-                connection.execute("BEGIN IMMEDIATE")
-                for table in IMPORT_TABLES:
-                    before = connection.total_changes
-                    for row in plan[table]:
-                        _insert_row(connection, table, row)
-                    inserted[table] = connection.total_changes - before
-                # Imported state receives a baseline only where no receipt
-                # exists. Existing winners are never rewritten or down-rated.
-                store._seed_state_baselines(connection, missing_only=True)
-                violation = connection.execute(
-                    "PRAGMA foreign_key_check").fetchone()
-                if violation is not None:
-                    raise StoreError(
-                        "invalid_archive", "archive violates data relationships")
-                connection.commit()
-            pending = _restore_pending(database, archive)
-            evidence = _restore_recovery_evidence(database, archive)
+            try:
+                with store.connection(timeout_ms=5000) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    for table in IMPORT_TABLES:
+                        before = connection.total_changes
+                        for row in plan[table]:
+                            _insert_row(connection, table, row)
+                        inserted[table] = connection.total_changes - before
+                    # Imported state receives a baseline only where no receipt
+                    # exists. Existing winners are never rewritten or down-rated.
+                    store._seed_state_baselines(connection, missing_only=True)
+                    violation = connection.execute(
+                        "PRAGMA foreign_key_check").fetchone()
+                    if violation is not None:
+                        raise StoreError(
+                            "invalid_archive",
+                            "archive violates data relationships")
+                    connection.commit()
+                transaction.mark("DB_APPLIED")
+                transaction.publish_files()
+            except Exception as exc:
+                transaction.rollback()
+                transaction.finish()
+                if isinstance(exc, StoreError):
+                    raise
+                raise StoreError(
+                    "import_rolled_back",
+                    "import failed after preparation and was rolled back") from exc
+            transaction.finish()
+            pending = {
+                "scores": len(archive["pending_scores"]),
+                "state": len(archive["pending_state"]),
+            }
+            restored_evidence = len(_validated_recovery_items(archive))
+            evidence_root = (
+                database.parent / "imported-recovery"
+                / str(archive.get("manifest_hash") or "")[:24])
+            evidence = {
+                "restored": restored_evidence,
+                "omitted": sum(
+                    isinstance(item, dict) and "omitted" in item
+                    for item in archive["recovery_evidence"]),
+                "complete": archive.get("manifest", {}).get(
+                    "recovery", {}).get("complete"),
+                "directory": (
+                    str(evidence_root) if restored_evidence else None),
+            }
     except MaintenanceBusyError as exc:
         raise StoreError(
             "maintenance_busy", str(exc), 409, retryable=True) from exc
     return {
         "ok": True, "backup": str(backup), "inserted": inserted,
         "pending_restored": pending, "recovery_evidence": evidence,
-        "preview": preview,
+        "preview": preview, "recovered_imports": recovered,
+    }
+
+
+def _replacement_plan(database: Path, archive: dict):
+    """Plan an archive against an empty current-schema database."""
+    with tempfile.TemporaryDirectory(
+            prefix=f".{database.name}.replace-plan-",
+            dir=database.parent) as directory:
+        empty_database = Path(directory) / "empty.sqlite"
+        LocalGameStore(empty_database)
+        preview, plan, temporary_files = _plan_import(empty_database, archive)
+        files = [
+            FileOperation(
+                database.parent
+                / operation.target.relative_to(empty_database.parent),
+                operation.data)
+            for operation in temporary_files
+        ]
+    planned_targets = {operation.target for operation in files}
+    for pending_path in _pending_paths(database):
+        try:
+            with os.scandir(pending_path) as iterator:
+                current = [
+                    Path(entry.path) for entry in iterator
+                    if entry.is_file() and entry.name.endswith(".json")]
+        except (FileNotFoundError, NotADirectoryError):
+            current = []
+        for target in current:
+            if target not in planned_targets:
+                files.append(FileOperation(target, None))
+    validate_file_operations(database, files)
+    preview["policy"] = (
+        "a complete archive replaces committed tables and active pending "
+        "journals after a rollback snapshot")
+    return preview, plan, files
+
+
+def restore_replace_data(database: Path, archive_path: Path) -> dict:
+    """Replace active local data from a complete archive, with rollback."""
+    database = database.expanduser().resolve(strict=False)
+    archive = _load_archive(archive_path)
+    if (archive.get("archive_version") != ARCHIVE_VERSION
+            or archive.get("manifest", {}).get("complete") is not True):
+        raise StoreError(
+            "incomplete_archive",
+            "replace restore requires a complete current-format archive")
+    try:
+        with (inactive_application_lock(database, timeout=2.0),
+              maintenance_lock(database, exclusive=True, timeout=2.0)):
+            recovered = recover_import_transactions(database)
+            store = LocalGameStore(database)
+            preview, plan, file_operations = _replacement_plan(
+                database, archive)
+            if not preview["ok"]:
+                raise StoreError(
+                    "invalid_archive",
+                    "archive cannot be restored into an empty current database",
+                    details={"preview": preview})
+            backup = store._backup_database(store.schema_version())
+            transaction = ImportTransaction.prepare(database, file_operations)
+            inserted = {}
+            try:
+                with store.connection(timeout_ms=5000) as connection:
+                    connection.execute("BEGIN IMMEDIATE")
+                    for table in (
+                            "state_merge_receipts", "state_receipts",
+                            "save_requests", *reversed(IMPORT_TABLES)):
+                        connection.execute(f"DELETE FROM {table}")
+                    for table in IMPORT_TABLES:
+                        before = connection.total_changes
+                        for row in plan[table]:
+                            _insert_row(connection, table, row)
+                        inserted[table] = connection.total_changes - before
+                    store._seed_state_baselines(connection, missing_only=True)
+                    violation = connection.execute(
+                        "PRAGMA foreign_key_check").fetchone()
+                    if violation is not None:
+                        raise StoreError(
+                            "invalid_archive",
+                            "archive violates data relationships")
+                    connection.commit()
+                transaction.mark("DB_APPLIED")
+                transaction.publish_files()
+            except Exception as exc:
+                transaction.rollback()
+                transaction.finish()
+                if isinstance(exc, StoreError):
+                    raise
+                raise StoreError(
+                    "restore_rolled_back",
+                    "replace restore failed and was rolled back") from exc
+            transaction.finish()
+    except MaintenanceBusyError as exc:
+        raise StoreError(
+            "maintenance_busy", str(exc), 409, retryable=True) from exc
+    return {
+        "ok": True, "mode": "replace", "backup": str(backup),
+        "inserted": inserted, "preview": preview,
+        "pending_restored": {
+            "scores": len(archive["pending_scores"]),
+            "state": len(archive["pending_state"]),
+        },
+        "recovered_imports": recovered,
     }
 
 
@@ -818,6 +1248,9 @@ def _parser() -> argparse.ArgumentParser:
     export.add_argument("output", type=Path)
     export.add_argument("--include-recovery", action="store_true")
     export.add_argument(
+        "--allow-partial", action="store_true",
+        help="export readable journals and report omissions instead of failing")
+    export.add_argument(
         "--force", action="store_true",
         help="replace an existing ordinary archive file")
     preview = commands.add_parser(
@@ -828,6 +1261,13 @@ def _parser() -> argparse.ArgumentParser:
     restore.add_argument("archive", type=Path)
     restore.add_argument("--apply", action="store_true",
                          help="required before any database change")
+    replace_restore = commands.add_parser(
+        "restore-replace",
+        help="replace local data from a complete archive after confirmation")
+    replace_restore.add_argument("archive", type=Path)
+    replace_restore.add_argument(
+        "--apply", action="store_true",
+        help="required before replacing the current database and journals")
     return parser
 
 
@@ -840,12 +1280,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "export":
             result = export_data(
                 database, args.output, args.include_recovery,
-                force=args.force)
+                force=args.force, allow_partial=args.allow_partial)
         elif args.command == "preview-import":
             result = preview_import(database, args.archive)
-        elif not args.apply:
+        elif args.command in {"import", "restore-replace"} and not args.apply:
             result = {"ok": False, "code": "confirmation_required",
-                      "error": "run import again with --apply after preview"}
+                      "error": "run the command again with --apply after preview"}
+        elif args.command == "restore-replace":
+            result = restore_replace_data(database, args.archive)
         else:
             result = import_data(database, args.archive)
     except (StoreError, sqlite3.Error, OSError) as exc:

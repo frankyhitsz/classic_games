@@ -29,4 +29,7 @@
 
 `constraints-release.txt` 固定正式验证使用的完整解析依赖闭包；`pyproject.toml` 的范围用于普通
 安装和兼容性 CI。升级约束时应重新解析三平台依赖，运行依赖审计、完整测试和隔离 venv wheel
-smoke，并检查 release profile 输出的 CycloneDX `release-sbom.json`。
+与 sdist smoke，并检查 release profile 输出的 CycloneDX `release-sbom.json` 和
+`release-installed-packages.json`。当前约束是精确版本清单，但还不是带 hash 的跨平台 lock；正式
+发布前若启用 `--require-hashes`，必须同时收集 Windows、macOS 和 Linux 所需 wheel 的 hash，
+不能只锁开发机平台。
