@@ -23,7 +23,7 @@ def main() -> int:
         wheelhouse.mkdir()
         _run([
             sys.executable, "-m", "pip", "wheel", ".", "--no-deps",
-            "--no-build-isolation", "--wheel-dir", str(wheelhouse),
+            "--wheel-dir", str(wheelhouse),
         ], cwd=root)
         wheels = list(wheelhouse.glob("classic_games_hub-*.whl"))
         if len(wheels) != 1:

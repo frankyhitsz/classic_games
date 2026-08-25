@@ -62,3 +62,9 @@
   成功导入 launcher/data/store 并运行 `classic-games-data --help`；
 - `git diff --check`、compileall、Actions SHA 检查、archive v1/v2/重复导入演练和维护锁跨进程演练
   均通过。
+
+## 远端验证
+
+- CI #27 的跨平台矩阵已启动，但 release-gate 在统一 release 命令中退出 1；公开 job 页面没有展开
+  内部 stage 日志。本机同一隔离 release profile 八阶段均通过；复核 GitHub clean runner 差异后，
+  wheel build 改回 PEP 517 默认 build isolation，不再依赖 runner 主环境恰好预装足够新的 setuptools。
