@@ -8,7 +8,7 @@
 - [x] 建立逐 Finding 答复与 167 项 P0–P3 优化矩阵；
 - [x] 第一轮定向、storage、gameplay 验证；
 - [x] 第二轮独立复查、stress、release 和打包验证；
-- [ ] 提交、推送并确认 GitHub CI。
+- [x] 提交、推送并确认 GitHub CI。
 
 ## 首轮核验结论
 
@@ -64,4 +64,5 @@
 - release profile 全阶段通过：Ruff、依赖漏洞审计、CycloneDX SBOM、compile、wheel/sdist 安装、
   只读用户数据冒烟、release manifest、storage、stress、gameplay；
 - Archive v4、slot v6 与包版本同步到 0.9.0；README、CHANGELOG 和 storage protocol 已更新；
-- 远端 CI 在推送后核对。
+- 实现提交 `60ef557` 已推送到 `origin/main`；GitHub CI #48 的 release-gate、core-only、macOS、
+  Ubuntu、Windows、Python 3.12 和 Python 3.13 共 7 个 job 全部通过。
