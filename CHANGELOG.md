@@ -1,5 +1,14 @@
 # 更新记录
 
+## 0.9.0
+
+- 修复 progress aggregate component 重放、state recovery 锁竞争误隔离和 commit 后 cleanup 误报失败。
+- Archive v4 分离 active/forensic 完整性，支持大型 recovery 的 hash-only 清单、深度验证和自读门禁。
+- terminal import transaction 先原子迁出 active namespace；transaction journal reader/writer 预算一致。
+- 2048 slot v6 只保存 settled board，并持久化 RNG state 与 move digest；旧 ruleset 存档保留后再新开。
+- 推箱子练习返回点验证 attempt、ruleset、ledger 与逐步可达性，恢复点在正常结束前保持可用。
+- score lock 改为固定 stripe；后台 worker 完成前不释放 application lease；远端调试 API 要求 token。
+
 ## 0.8.0
 
 - POSIX application lease 增加 transition gate 与 shared-lease 后二次 transaction 扫描，不再依赖

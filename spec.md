@@ -1,41 +1,42 @@
-# 第十六次审查修复规格
+# 第十七次审查修复规格
 
 ## 目标
 
-逐条核对第十六次审查的 26 条 Finding 与 121 个优化任务。优先关闭 score spool 的 hard-link 发布窗口和
-progress set/merge 语义冲突，再加固 orphan、state clock、transaction、archive、构造生命周期和游戏端
-single-flight/退出保存行为。
+逐条核对第十七次审查的 30 条 Finding 与 P0–P3 优化清单。以当前代码和本机测试为准，先关闭
+progress component 重放、state recovery BUSY 分型、archive 自兼容、terminal transaction cleanup 和
+2048 settled autosave 五个发布阻断族，再收口相邻的提交清理、时间、事件、生命周期和推箱子会话契约。
 
-## 范围
+## 当前范围
 
-- score canonical 全程使用 request lock 和 single-link atomic replace；durable receipt 前二次读取验证；
-- progress resolver 明确 set/set、set/merge、merge/set、merge/merge 四种组合；
-- score/state/clock orphan 在 lock 后复查稳定性，lock timeout 保留，坏 canonical 先隔离；
-- state clock bounded/no-follow，future timestamp 拒绝，LocalStateEvent 带完整 winner identity；
-- transaction terminal/unsafe root 分型，raw sidecar 进入 manual recovery，fresh staging 纳入 inventory；
-- import/replace 空间 preflight，reserved prefix 完整保护；export 默认 snapshot-only；
-- archive/pending 全部 descriptor-level bounded read，历史 pending evidence-only，v3 冻结并记录 v4 目录设计；
-- Store/Flask canonical path，backend 构造失败释放 worker/session；
-- slot intent 返回 resolution，2048 RNG 可注入，Sokoban progress 单 key single-flight；
-- Sokoban 练习前 campaign 现场写 durable slot，异常退出后可恢复；
-- API 非 loopback 需显式确认，build-system 精确固定，Python 声明与 3.11–3.13 CI 一致；
-- 任务书、逐 Finding 答复和 121 项矩阵归档到 `docs/audits/`。
+- progress resolver 在 LWW 前识别 aggregate 已吸收的 component；Store 对普通 set replay 同样检查
+  merge receipt；legacy upgrade、live、orphan 和 import 共用 resolver；
+- state reject temp 使用唯一文件名，在 key/digest lock、grace 和稳定 fingerprint 下恢复；BUSY 不隔离
+  journal、marker 或 restore；state timestamp 的解析结果不依赖当前 wall clock；
+- archive writer 发布前执行 reader 等价的节点、字节、manifest 和 hash 校验；增加不打开用户数据库的
+  deep verify；historical pending 先按 ruleset 分类，再决定是否解析为 active；
+- terminal import root 先原子改名到 cleanup namespace，再尽力递归删除；startup、status 和 export 使用
+  同一 transaction classifier；transaction journal 的 reader/writer 共享有界 JSON 契约；
+- 2048 退出只保存 settled board；旧 ruleset slot 先保留到本机隔离记录再新开；
+- SQLite commit 与 journal cleanup 分离，cleanup 失败保留 committed 结果；同 identity state event 遵守
+  终态优先；application lease 覆盖仍在运行的 worker；score lock 改为固定 stripe；
+- Sokoban 恢复统一 attempt identity，检查 outer ruleset、ledger、坐标和逐步可达性；恢复点在正常关闭或
+  明确返回 campaign 前保持 active；异步 Future 创建不再被当作 durable；
+- 任务书、逐 Finding 答复和完整优化矩阵归档到 `docs/audits/`。
 
-## 约束与非目标
+## 约束
 
-- Archive v3、transaction v3 和现有 state journal 不在同一版本号下改字段；需要新字段的设计进入 v4；
-- raw SQLite 主文件无法证明包含 WAL/SHM 时停止自动 rollback，不猜测 sidecar 内容；
-- transaction rollback、fresh DB 和用户 backup 生命周期不同，本轮以 preflight 防止磁盘耗尽，不强行共用；
-- branch protection、三平台 hash lock、LICENSE、签名和安装包需要外部权限或发行环境，准确保留状态；
-- P2/P3 路线不冒充当前 Bug，但每一项都在矩阵中给出已有基础、待办或外部状态。
+- 不把网页端控制流推演当作已证实问题；每项必须有当前代码、定向测试或运行证据；
+- Archive v3 和现有 journal reader 保持兼容；需要新 manifest 语义时使用显式新版本或 ADR；
+- 不删除无法证明可恢复的本机数据；BUSY、INVALID、UNREADABLE 分开处理；
+- Optional Flask 仍是本机调试适配器，默认不联网、不遥测；
+- branch protection、LICENSE、签名和素材权利只在取得相应仓库/权利人证据后标记完成。
 
 ## 验收标准
 
-- 26 条 Finding 有逐条成立性结论；两个 P0 和关键 P1 有 fault/model 回归；
-- canonical score 在发布与扫描期间 `nlink=1`，lock timeout 不丢 temp；
-- set/set 不产生空 component，set/merge 结果可被当前 parser/Store 接受；
-- quarantine 失败、坏 target、future clock、unsafe transaction root 和 raw sidecar 均 fail closed；
-- export 默认不修复，`inspect-archive` 不打开目标数据库；历史 pending 不进入 active outbox；
-- equal revision event、slot resolution、2048 RNG、Sokoban Future coalescing 与 durable campaign 恢复有测试；
-- 至少两轮“发现—修复—复验”，通过 Ruff、compile、storage、gameplay、stress、release 和远端 CI；
+- 30 条 Finding 和完整 P0–P3 ID 均有成立性、处理状态、代码证据与测试证据；
+- 五个 P0 组合不变量有定向故障或逐帧测试；成功 export 必能由同版本 load，BUSY 不触发 quarantine；
+- commit 后 cleanup 锁失败仍为 COMMITTED；terminal cleanup 失败不留下 active `.import-*`；
+- 2048 四方向普通/合并/胜负边界的动画中退出均恢复 settled board；
+- Sokoban 恢复后的 attempt、ruleset、ledger、tombstone 和 durability 契约一致；
+- 至少两轮独立“发现—修复—复验”，通过 Ruff、compile、storage、gameplay、stress、release 和远端 CI；
 - 最终提交推送到 `origin/main`，远端 CI 成功且工作区干净。

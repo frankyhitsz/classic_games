@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import shutil
 import sqlite3
@@ -17,6 +18,10 @@ from .store import StoreError
 
 MAX_TRANSACTION_FILE_BYTES = 16 * 1024 * 1024
 MAX_TRANSACTION_TOTAL_BYTES = 128 * 1024 * 1024
+MAX_TRANSACTION_OPERATIONS = 10_000
+MAX_TRANSACTION_JSON_NODES = 250_000
+MAX_TRANSACTION_JSON_DEPTH = 32
+MAX_TRANSACTION_JSON_STRING = 1024 * 1024
 
 
 def _transaction_pattern(database: Path) -> str:
@@ -27,22 +32,48 @@ def _preparing_pattern(database: Path) -> str:
     return f".{database.name}.preparing-*"
 
 
+def _cleanup_pattern(database: Path) -> str:
+    return f".{database.name}.transaction-cleanup-*"
+
+
+def _reject_json_constant(value: str):
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _validate_transaction_json_shape(value) -> None:
+    stack = [(value, 0)]
+    nodes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if (nodes > MAX_TRANSACTION_JSON_NODES
+                or depth > MAX_TRANSACTION_JSON_DEPTH):
+            raise StoreError(
+                "import_recovery_required",
+                "import phase journal is too complex")
+        if isinstance(item, str) and len(item) > MAX_TRANSACTION_JSON_STRING:
+            raise StoreError(
+                "import_recovery_required",
+                "import phase journal contains an oversized string")
+        if isinstance(item, float) and not math.isfinite(item):
+            raise StoreError(
+                "import_recovery_required",
+                "import phase journal contains a non-finite number")
+        if isinstance(item, dict):
+            stack.extend((key, depth + 1) for key in item)
+            stack.extend((child, depth + 1) for child in item.values())
+        elif isinstance(item, list):
+            stack.extend((child, depth + 1) for child in item)
+
+
 def has_import_transaction_roots(database: Path) -> bool:
     """Report roots that still require recovery, without changing them."""
     database = database.expanduser().resolve(strict=False)
     if any(database.parent.glob(_preparing_pattern(database))):
         return True
     for root in database.parent.glob(_transaction_pattern(database)):
-        try:
-            metadata = os.lstat(root)
-            if (not stat.S_ISDIR(metadata.st_mode)
-                    or getattr(metadata, "st_file_attributes", 0)
-                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
-                return True
-            transaction = ImportTransaction.open(database, root)
-        except (OSError, StoreError):
-            return True
-        if transaction.journal.get("phase") not in {"COMPLETED", "ROLLED_BACK"}:
+        classification = classify_import_transaction_root(database, root)
+        if classification["status"] != "terminal":
             return True
     return False
 
@@ -426,32 +457,52 @@ class ImportTransaction:
             descriptor = os.open(journal_path, flags)
             try:
                 opened = os.fstat(descriptor)
-                if ((metadata.st_dev, metadata.st_ino)
-                        != (opened.st_dev, opened.st_ino)):
+                if ((metadata.st_dev, metadata.st_ino, metadata.st_size,
+                     metadata.st_mtime_ns)
+                        != (opened.st_dev, opened.st_ino, opened.st_size,
+                            opened.st_mtime_ns)):
                     raise OSError("import journal changed while opening")
                 with os.fdopen(descriptor, "rb", closefd=False) as handle:
                     raw = handle.read(MAX_TRANSACTION_FILE_BYTES + 1)
                 if len(raw) > MAX_TRANSACTION_FILE_BYTES:
                     raise OSError("import journal grew while reading")
+                final = os.fstat(descriptor)
+                if ((opened.st_dev, opened.st_ino, opened.st_size,
+                     opened.st_mtime_ns)
+                        != (final.st_dev, final.st_ino, final.st_size,
+                            final.st_mtime_ns)
+                        or len(raw) != final.st_size):
+                    raise OSError("import journal changed while reading")
             finally:
                 os.close(descriptor)
-            journal = json.loads(raw.decode("utf-8"))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            journal = json.loads(
+                raw.decode("utf-8"), parse_constant=_reject_json_constant)
+            _validate_transaction_json_shape(journal)
+        except StoreError:
+            raise
+        except (OSError, TypeError, ValueError, json.JSONDecodeError,
+                UnicodeError, RecursionError, MemoryError) as exc:
             raise StoreError(
                 "import_recovery_required", "import phase journal is unreadable"
             ) from exc
         version = journal.get("version") if isinstance(journal, dict) else None
         if (not isinstance(journal, dict) or version not in {1, 2, 3}
                 or journal.get("database") != database.name
-                or not isinstance(journal.get("operations"), list)):
+                or not isinstance(journal.get("operations"), list)
+                or len(journal["operations"]) > MAX_TRANSACTION_OPERATIONS):
             raise StoreError(
                 "import_recovery_required", "import phase journal is invalid")
         supplied_hash = journal.get("journal_hash")
-        expected_hash = hashlib.sha256(json.dumps(
-            {key: value for key, value in journal.items()
-             if key != "journal_hash"},
-            ensure_ascii=False, allow_nan=False, sort_keys=True,
-            separators=(",", ":")).encode("utf-8")).hexdigest()
+        try:
+            expected_hash = hashlib.sha256(json.dumps(
+                {key: value for key, value in journal.items()
+                 if key != "journal_hash"},
+                ensure_ascii=False, allow_nan=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")).hexdigest()
+        except (TypeError, ValueError, RecursionError, MemoryError) as exc:
+            raise StoreError(
+                "import_recovery_required",
+                "import phase journal hash input is invalid") from exc
         allowed_phases = {
             "PREPARED", "DB_APPLIED", "FILES_PUBLISHED",
             "COMPLETED", "ROLLED_BACK"}
@@ -536,16 +587,38 @@ class ImportTransaction:
         return cls(database.resolve(strict=False), root, journal)
 
     def _write_journal(self) -> None:
-        payload = {
-            key: value for key, value in self.journal.items()
-            if key != "journal_hash"}
-        self.journal["journal_hash"] = hashlib.sha256(json.dumps(
-            payload, ensure_ascii=False, allow_nan=False, sort_keys=True,
-            separators=(",", ":")).encode("utf-8")).hexdigest()
-        encoded = json.dumps(
-            self.journal, ensure_ascii=False, allow_nan=False,
-            sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if (not isinstance(self.journal.get("operations"), list)
+                or len(self.journal["operations"]) > MAX_TRANSACTION_OPERATIONS):
+            raise StoreError(
+                "import_transaction_too_large",
+                "import transaction has too many file operations")
+        try:
+            payload = {
+                key: value for key, value in self.journal.items()
+                if key != "journal_hash"}
+            _validate_transaction_json_shape(payload)
+            self.journal["journal_hash"] = hashlib.sha256(json.dumps(
+                payload, ensure_ascii=False, allow_nan=False, sort_keys=True,
+                separators=(",", ":")).encode("utf-8")).hexdigest()
+            encoded = json.dumps(
+                self.journal, ensure_ascii=False, allow_nan=False,
+                sort_keys=True, separators=(",", ":")).encode("utf-8")
+        except StoreError:
+            raise
+        except (TypeError, ValueError, RecursionError, MemoryError) as exc:
+            raise StoreError(
+                "invalid_import_transaction",
+                "import transaction journal cannot be encoded") from exc
+        if len(encoded) > MAX_TRANSACTION_FILE_BYTES:
+            raise StoreError(
+                "import_transaction_too_large",
+                "import transaction journal exceeds the reader limit")
         _write_file(self.root / "journal.json", encoded)
+        verified = type(self).open(self.database, self.root).journal
+        if verified != self.journal:
+            raise StoreError(
+                "invalid_import_transaction",
+                "published transaction journal failed its reader round-trip")
 
     def mark(self, phase: str) -> None:
         if phase not in {"PREPARED", "DB_APPLIED", "FILES_PUBLISHED",
@@ -685,8 +758,58 @@ class ImportTransaction:
 
     def finish(self) -> None:
         self.mark("COMPLETED")
-        shutil.rmtree(self.root, ignore_errors=True)
-        _fsync_directory(self.root.parent)
+        self.cleanup_terminal()
+
+    def cleanup_terminal(self) -> Path | None:
+        """Retire a terminal root atomically before best-effort deletion."""
+        if self.journal.get("phase") not in {"COMPLETED", "ROLLED_BACK"}:
+            raise StoreError(
+                "import_recovery_required",
+                "only a terminal import transaction can be cleaned")
+        if not self.root.exists():
+            return None
+        identity = self.root.name.split(".import-", 1)[-1]
+        cleanup = self.root.with_name(
+            f".{self.database.name}.transaction-cleanup-{identity}")
+        os.replace(self.root, cleanup)
+        _fsync_directory(cleanup.parent)
+        self.root = cleanup
+        try:
+            shutil.rmtree(cleanup)
+        except OSError:
+            # A locked antivirus/indexer handle can leave cleanup pending,
+            # but this namespace is never classified as an active import.
+            return cleanup
+        _fsync_directory(cleanup.parent)
+        return None
+
+
+def classify_import_transaction_root(database: Path, root: Path) -> dict:
+    """Shared startup/export/status classifier for a published root."""
+    database = database.expanduser().resolve(strict=False)
+    record = {"path": root.name, "status": "invalid", "phase": None,
+              "error": None}
+    try:
+        metadata = os.lstat(root)
+        if (not stat.S_ISDIR(metadata.st_mode)
+                or getattr(metadata, "st_file_attributes", 0)
+                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+            raise StoreError(
+                "import_recovery_required", "transaction root is unsafe")
+        transaction = ImportTransaction.open(database, root)
+    except (OSError, StoreError) as exc:
+        record["error"] = (
+            exc.message if isinstance(exc, StoreError) else str(exc))
+        return record
+    phase = transaction.journal.get("phase")
+    record.update({
+        "phase": phase,
+        "status": ("terminal" if phase in {"COMPLETED", "ROLLED_BACK"}
+                   else "active"),
+        "version": transaction.journal.get("version"),
+        "operation_count": len(transaction.journal.get("operations", [])),
+    })
+    return record
 
 
 def validate_file_operations(database: Path,
@@ -701,6 +824,16 @@ def recover_import_transactions(database: Path, *,
     """Roll back one authenticated transaction; never guess a lineage."""
     database = database.resolve(strict=False)
     recovered = []
+    for cleanup in sorted(database.parent.glob(_cleanup_pattern(database))):
+        try:
+            metadata = os.lstat(cleanup)
+            if (stat.S_ISDIR(metadata.st_mode)
+                    and not getattr(metadata, "st_file_attributes", 0)
+                    & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+                shutil.rmtree(cleanup)
+        except OSError:
+            # Cleanup roots are evidence/status only and never block recovery.
+            pass
     for root in sorted(database.parent.glob(_preparing_pattern(database))):
         metadata = os.lstat(root)
         if (not stat.S_ISDIR(metadata.st_mode)
@@ -713,25 +846,15 @@ def recover_import_transactions(database: Path, *,
         _fsync_directory(database.parent)
     unfinished: list[ImportTransaction] = []
     for root in sorted(database.parent.glob(_transaction_pattern(database))):
-        metadata = os.lstat(root)
-        if (not stat.S_ISDIR(metadata.st_mode)
-                or getattr(metadata, "st_file_attributes", 0)
-                & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+        classification = classify_import_transaction_root(database, root)
+        if classification["status"] == "invalid":
             raise StoreError(
                 "import_recovery_required",
-                f"unsafe import transaction root: {root.name}")
-        journal_path = root / "journal.json"
-        try:
-            os.lstat(journal_path)
-        except FileNotFoundError:
-            raise StoreError(
-                "import_recovery_required",
-                "published import transaction has no phase journal; preserve "
+                "published import transaction is invalid; preserve "
                 f"{root.name} for manual recovery")
         transaction = ImportTransaction.open(database, root)
-        phase = transaction.journal.get("phase")
-        if phase in {"COMPLETED", "ROLLED_BACK"}:
-            shutil.rmtree(root, ignore_errors=True)
+        if classification["status"] == "terminal":
+            transaction.cleanup_terminal()
             continue
         unfinished.append(transaction)
     if len(unfinished) > 1:
@@ -750,7 +873,7 @@ def recover_import_transactions(database: Path, *,
             )
         transaction.rollback()
         recovered.append(transaction.root.name)
-        shutil.rmtree(transaction.root, ignore_errors=True)
+        transaction.cleanup_terminal()
     if recovered:
         _fsync_directory(database.parent)
     return recovered

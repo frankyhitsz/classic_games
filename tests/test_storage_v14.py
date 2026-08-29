@@ -418,10 +418,11 @@ class GameAndAdapterTests(unittest.TestCase):
 
         first = Sokoban(backend=Backend(), profile_id=PROFILE_ID)
         first.load_level(1, practice=False, new_campaign=False)
-        first.player_pos = next(
-            point for point in first.floors
-            if point not in first.boxes and point != first.player_pos)
-        first.moves = 7
+        for direction in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            before = first.moves
+            first._try_move(direction)
+            if first.moves > before:
+                break
         expected = (first.level_idx, first.player_pos, first.moves)
         first._capture_campaign_session()
         self.assertTrue(saved.get("active"))

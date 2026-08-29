@@ -18,7 +18,8 @@ Flask API 作为可选适配器保留。
 “切换档案”会轮换已有的本机档案；按住 Shift 点击可新建档案并立即输入名字。
 中文、日文和韩文输入使用系统输入法的组合文本事件。2048 会自动保存有效移动，并把 150 ms
 内的连续棋盘变化合并为一次 latest-value 写入；终局与关闭仍立即保存
-当前棋盘；推箱子和祖玛会记录关卡进度。若自动存档读取失败或超时，2048 会保持输入门禁；
+最近一个完整结算的棋盘。动画中退出不会保存“已加分但尚未合并/生成”的中间状态；slot v6 还保存
+RNG state 和 move digest，重启后随机序列可继续复现。推箱子和祖玛会记录关卡进度。若自动存档读取失败或超时，2048 会保持输入门禁；
 可按 T 重试、按 N 两次确认新开，或按 Esc 返回菜单，不会把读取故障当成空存档。
 终局存档会恢复原棋盘和结果页，不会自动换成随机新局。同一档案已有另一个活动中的 2048
 窗口时，新窗口会停止写入；按 K 会重新读取存档，再以 owner epoch、slot revision 和完整内容
@@ -83,8 +84,9 @@ GAMES_USE_HTTP=1 GAMES_API_URL=http://127.0.0.1:5010 ./run_launcher.sh
 GAMES_HOST=0.0.0.0 GAMES_PORT=5010 GAMES_UNSAFE_EXPOSE=1 ./run_server.sh
 ```
 
-该调试 API 没有身份验证。绑定 `0.0.0.0` 时，同一网络中的其他设备也可能
-写入记录；只应在可信开发网络中临时使用，并由系统防火墙限制访问。正常游玩
+非回环调试必须同时显式确认暴露，服务会生成并在终端显示一次 bearer token；也可提前设置
+`GAMES_API_TOKEN`。远端请求使用 `Authorization: Bearer <token>` 或 `X-Games-Token`，app factory 路径
+同样执行该边界。它仍只应在可信开发网络中临时使用，并由系统防火墙限制访问。正常游玩
 无需开启它。HTTP 模式只用于检查成绩提交、排行和统计接口，不提供本机档案、
 关卡进度和 2048 自动存档；这些能力以默认的本机模式为准。
 
@@ -167,7 +169,9 @@ classic_games/
 │   ├── test_storage_v10.py
 │   ├── test_storage_v11.py
 │   ├── test_storage_v12.py
-│   └── test_storage_v13.py
+│   ├── test_storage_v13.py
+│   ├── test_storage_v14.py
+│   └── test_storage_v15.py
 ├── docs/               # 审查记录、设计决策和维护文档
 ├── pyproject.toml
 ├── environment.yml
@@ -186,6 +190,8 @@ classic_games/
 同目录下的 `pending/` 保存尚未写入数据库的记录，每个请求使用一个独立 JSON
 文件。文件带版本、payload hash、attempt UUID 和 revision，可由多个进程安全
 写入；无法解析的文件会原样移入 `pending-quarantine/`，不会阻止游戏启动。
+score 写入使用 256 个固定 stripe lock，不会再为每次成绩永久增加 lock 文件；旧版 lock 可在关闭所有
+游戏后用 `classic-games-data cleanup-score-locks --apply` 清理。
 单个文件上限为 64 KiB，数量或总大小异常时启动器会提示。运行中的启动器也会
 发现其他实例后来写入的待保存文件。
 `pending-state/` 使用每个档案或存档键一个文件的状态日志，保存最新昵称、设置、关卡进度和
@@ -202,13 +208,14 @@ classic_games/
 未到期 temp 会让 complete export 明确失败，避免扫描器抢走仍在写入的文件。
 
 查看和迁移本机数据时，可以先使用下列命令。数据维护要求先关闭启动器和游戏；后端的进程级
-lease 会阻止导出遗漏尚在 worker 队列中的动作。archive v3 同时包含已提交表和 active
-score/state pending，记录包版本、导出时规则目录和 reader capability，并用 manifest hash 检测损坏：
+lease 会阻止导出遗漏尚在 worker 队列中的动作。archive v4 同时包含已提交表和 active
+score/state pending，把 active replace 资格和 forensic evidence 完整度分开，并用 manifest hash 检测损坏：
 
 ```bash
 python -m game_service.data_cli status
 python -m game_service.data_cli export classic-games-backup.json --include-recovery
 python -m game_service.data_cli inspect-archive classic-games-backup.json
+python -m game_service.data_cli verify-archive classic-games-backup.json
 python -m game_service.data_cli preview-import classic-games-backup.json
 python -m game_service.data_cli transactions
 ```
@@ -218,11 +225,12 @@ active reject/restore inventory，升级命令会保留为 merge-only 并列出�
 replace 权限：
 
 ```bash
-python -m game_service.data_cli upgrade-archive old-v2.json upgraded-v3.json
+python -m game_service.data_cli upgrade-archive old-v2.json upgraded-v4.json
 ```
 
 导出默认只做 snapshot，不修复 orphan 或 transaction；需要先恢复再导出时显式增加
-`--repair-before-export`。`inspect-archive` 不打开本机数据库，`preview-import` 则会先恢复目标目录中的
+`--repair-before-export`。`inspect-archive` 做结构、manifest 和 hash 检查；`verify-archive` 使用临时空库
+完成行语义、外键、pending 和 evidence 验证，二者都不打开本机数据库。`preview-import` 则会先恢复目标目录中的
 未完成导入事务，再计算合并计划。导出默认不覆盖任何现有文件，也不能写到数据库、SQLite sidecar、
 pending 或 recovery 路径。确认
 要替换普通 archive 时才使用 `--force`。如果任何 active journal 因损坏或配额无法读取，完整导出

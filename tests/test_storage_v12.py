@@ -9,6 +9,7 @@ import random
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from concurrent.futures import Future
 from pathlib import Path
@@ -19,7 +20,8 @@ from game_service.data_cli import (cleanup_recovery_data, export_data,
                                    restore_replace_data, upgrade_archive)
 from game_service.import_transaction import (FileOperation, ImportTransaction,
                                              recover_import_transactions)
-from game_service.local_backend import (PersistentStateOutbox,
+from game_service.local_backend import (ORPHAN_TEMP_GRACE_SECONDS,
+                                        PersistentStateOutbox,
                                         _read_regular_nofollow)
 from game_service.maintenance import (ApplicationSession, MaintenanceBusyError,
                                       _open_control_file,
@@ -169,8 +171,11 @@ class RejectTransactionTests(unittest.TestCase):
             transaction = outbox._reject_transaction(
                 key, new["payload_hash"], old["operation"],
                 phase="rejected", reason="slot-in-use")
-            marker.with_suffix(".tmp").write_text(
+            temporary = marker.with_suffix(".tmp")
+            temporary.write_text(
                 canonical_json(transaction), encoding="utf-8")
+            old_time = time.time() - ORPHAN_TEMP_GRACE_SECONDS - 1
+            os.utime(temporary, (old_time, old_time))
             marker.unlink()
             reopened = PersistentStateOutbox(root / "pending-state")
             self.assertEqual(
@@ -296,7 +301,7 @@ class OwnerClaimTests(unittest.TestCase):
 
 
 class ArchiveCompatibilityTests(unittest.TestCase):
-    def test_archive_v3_records_package_and_reader_contract(self):
+    def test_archive_v4_records_package_and_reader_contract(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = root / "games.db"
@@ -304,10 +309,10 @@ class ArchiveCompatibilityTests(unittest.TestCase):
             LocalGameStore(database)
             export_data(database, archive)
             value = json.loads(archive.read_text(encoding="utf-8"))
-            self.assertEqual(value["archive_version"], 3)
+            self.assertEqual(value["archive_version"], 4)
             self.assertEqual(
                 value["manifest"]["application"]["version"], __version__)
-            self.assertEqual(value["manifest"]["reader"]["min_version"], 3)
+            self.assertEqual(value["manifest"]["reader"]["min_version"], 4)
 
     def test_export_no_clobber_falls_back_without_hard_links(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -319,7 +324,7 @@ class ArchiveCompatibilityTests(unittest.TestCase):
                 export_data(database, archive)
             self.assertEqual(
                 json.loads(archive.read_text(encoding="utf-8"))[
-                    "archive_version"], 3)
+                    "archive_version"], 4)
 
     def test_cleanup_detects_a_file_added_after_fingerprinting(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -336,20 +341,20 @@ class ArchiveCompatibilityTests(unittest.TestCase):
             export_data(database, archive, include_recovery=True)
             from game_service import data_cli
 
-            original = data_cli._read_regular_nofollow
+            original = data_cli._hash_regular_nofollow
             injected = False
 
-            def add_after_first_read(path, limit):
+            def add_after_first_read(path):
                 nonlocal injected
-                raw = original(path, limit)
+                fingerprint = original(path)
                 if Path(path).resolve() == evidence.resolve() and not injected:
                     injected = True
                     (recovery / "appeared.json").write_text(
                         "new", encoding="utf-8")
-                return raw
+                return fingerprint
 
             with patch(
-                    "game_service.data_cli._read_regular_nofollow",
+                    "game_service.data_cli._hash_regular_nofollow",
                     side_effect=add_after_first_read):
                 with self.assertRaises(StoreError) as raised:
                     cleanup_recovery_data(

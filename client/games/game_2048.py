@@ -34,7 +34,8 @@ from client.common.ui import (COLORS, SAVE_PENDING, SAVE_SAVING, BaseGame, Butto
                               draw_gradient_bg, draw_text, ease_out_back,
                               ease_out_cubic)
 from game_service.mutation import MAX_SCORE, canonical_json
-from game_service.save_slot_validation import validate_2048_state
+from game_service.save_slot_validation import (restore_2048_rng_state,
+                                               validate_2048_state)
 from game_service.store import StoreError
 from game_service.service import (GameDataService, SaveState, SlotLoadResult,
                                   SlotLoadStatus)
@@ -105,6 +106,18 @@ class _LineSlot:
     source: Optional[Tile] = None   # tile that merges into ``tile`` (and dies)
 
 
+def _json_rng_state(value, *, depth: int = 0):
+    if depth > 4:
+        raise ValueError("RNG state is too deep")
+    if isinstance(value, tuple):
+        if len(value) > 1_000:
+            raise ValueError("RNG state is too large")
+        return [_json_rng_state(item, depth=depth + 1) for item in value]
+    if value is None or type(value) in {int, float, str}:
+        return value
+    raise ValueError("RNG state contains an unsupported value")
+
+
 class Game2048(BaseGame):
     game_id = "2048"
     title = "2048"
@@ -115,10 +128,12 @@ class Game2048(BaseGame):
                  profile_id: Optional[str] = None, *, rng=None):
         super().__init__(WIDTH, HEIGHT, fps=60, backend=backend, player=player,
                          profile_id=profile_id)
-        self.rng = random if rng is None else rng
+        self.rng = random.Random() if rng is None else rng
         self._slot_load_future = None
         self._slot_save_future = None
         self._slot_quarantine_future = None
+        self._slot_quarantine_action = None
+        self._slot_incompatible_ruleset = False
         self.slot_load_state = "ready"
         self.slot_load_error: Optional[str] = None
         self.slot_save_error: Optional[str] = None
@@ -142,6 +157,7 @@ class Game2048(BaseGame):
         self._autosave_due_at = 0
         self._autosave_dirty_since = 0
         self._autosave_release_queued = False
+        self._pre_move_autosave = None
         self._initializing_board = True
         self.reset()
         self._initializing_board = False
@@ -181,6 +197,10 @@ class Game2048(BaseGame):
             self.slot_load_error = "再按一次 N 确认新开一局；原存档不会被静默覆盖"
             return
         self._new_game_confirm_deadline = 0
+        if self._slot_incompatible_ruleset:
+            self._quarantine_bad_slot(
+                "historical_2048_ruleset", action="new_game")
+            return
         self.slot_load_state = "ready"
         self.slot_load_error = None
         self.reset()
@@ -202,9 +222,13 @@ class Game2048(BaseGame):
         self.submitted_score: Optional[int] = None
         self.submitted_extra = None
         self._queued_score_submission = None
+        self._move_count = 0
+        self._move_digest = hashlib.sha256(
+            f"2048:{self._score_attempt_uuid}".encode()).hexdigest()
         self.state = "playing"
         self.overlay_buttons = []
         self.anim_t = 1.0  # 1.0 = no animation in progress
+        self._pre_move_autosave = None
         # Retain a short ordered burst during the slide animation.
         self._queued_directions: deque[str] = deque(maxlen=2)
         self._won_announced = False  # only pop the win overlay once
@@ -277,6 +301,11 @@ class Game2048(BaseGame):
                 self._queued_directions.append(direction)
             return False
 
+        # Score and logical tile positions are updated before their animation
+        # settles. Retain the last fully settled state so shutdown can never
+        # serialize that intermediate representation.
+        self._pre_move_autosave = self._settled_autosave_fields()
+
         # Reset per-move animation state.
         for t in self.tiles:
             t.from_row = t.row
@@ -341,6 +370,7 @@ class Game2048(BaseGame):
                     moved = True
 
         if not moved:
+            self._pre_move_autosave = None
             # A win takes precedence over game-over so the player can see
             # the 2048 celebration first.  If they then continue on an
             # already-locked board, the first attempted move must still
@@ -355,6 +385,10 @@ class Game2048(BaseGame):
 
         # Begin animation; spawn + state transition happen when it ends.
         self.anim_t = 0.0
+        self._move_count += 1
+        self._move_digest = hashlib.sha256(
+            f"{self._move_digest}:{self._move_count}:{direction}".encode()
+        ).hexdigest()
         return True
 
     # ------------------------------------------------------------------
@@ -420,6 +454,8 @@ class Game2048(BaseGame):
 
             if pending is not None:
                 self._save_autosave_slot()
+
+            self._pre_move_autosave = None
 
             # Discard no-op commands immediately. Otherwise a blocked command
             # can leave a later direction queued until an unrelated future
@@ -493,18 +529,36 @@ class Game2048(BaseGame):
                 self.slot_load_state = "failed"
                 self.slot_load_error = "自动存档占用权确认失败，请重试"
 
-    def _build_autosave_state(self, owner_status: str) -> dict:
-        self._slot_revision += 1
+    def _settled_autosave_fields(self) -> dict:
+        try:
+            rng_state = _json_rng_state(self.rng.getstate())
+        except (AttributeError, TypeError, ValueError):
+            rng_state = None
         return {
-            "version": 5,
             "game_state": self.state,
             "score": self.score,
             "won": self.won,
             "won_announced": self._won_announced,
             "attempt_uuid": self._score_attempt_uuid,
             "attempt_revision": self.attempt_context.revision,
-            "slot_revision": self._slot_revision,
             "confirmed_score": self.submitted_score,
+            "rng_state": rng_state,
+            "move_count": self._move_count,
+            "move_digest": self._move_digest,
+            "grid": [[self.grid[row][col].value
+                      if self.grid[row][col] is not None else 0
+                      for col in range(GRID)] for row in range(GRID)],
+        }
+
+    def _build_autosave_state(self, owner_status: str) -> dict:
+        self._slot_revision += 1
+        settled = (self._pre_move_autosave
+                   if self.anim_t < 1.0 and self._pre_move_autosave is not None
+                   else self._settled_autosave_fields())
+        return {
+            "version": 6,
+            **settled,
+            "slot_revision": self._slot_revision,
             "owner_token": self._slot_owner_token,
             "owner_status": owner_status,
             "owner_epoch": self._slot_owner_epoch,
@@ -512,9 +566,6 @@ class Game2048(BaseGame):
             "expected_owner_epoch": self._slot_expected_owner_epoch,
             "expected_slot_revision": self._slot_expected_revision,
             "expected_value_hash": self._slot_expected_value_hash,
-            "grid": [[self.grid[row][col].value
-                      if self.grid[row][col] is not None else 0
-                      for col in range(GRID)] for row in range(GRID)],
         }
 
     def _queue_autosave_slot(self) -> None:
@@ -706,12 +757,23 @@ class Game2048(BaseGame):
                        if isinstance(state, dict) else None)
         owner_status = (state.get("owner_status")
                         if isinstance(state, dict) else None)
+        # Ruleset classification must precede current-format parsing. An old
+        # ruleset may legitimately use a state shape this version no longer
+        # understands; preserve it as historical data until the player
+        # explicitly confirms a new current-rules game.
+        if saved.get("ruleset_version") != self.attempt_context.ruleset_version:
+            self._slot_incompatible_ruleset = True
+            self.slot_load_state = "failed"
+            self.slot_load_error = (
+                "自动存档来自不兼容的规则版本；可返回菜单或确认新开，"
+                "原存档不会被当作损坏数据删除")
+            return
         try:
             validate_2048_state(state)
         except StoreError:
             self._quarantine_bad_slot("invalid_2048_slot_semantics")
             return
-        if version in (4, 5):
+        if version in (4, 5, 6):
             owner_epoch = state.get("owner_epoch", 0)
             valid_owner = (
                 isinstance(owner_token, str)
@@ -723,7 +785,7 @@ class Game2048(BaseGame):
                 self._quarantine_bad_slot("invalid_2048_slot_owner")
                 return
             value_hash = saved.get("value_hash")
-            if (version == 5
+            if (version in (5, 6)
                     and (not isinstance(value_hash, str)
                          or len(value_hash) != 64
                          or any(char not in "0123456789abcdef"
@@ -755,13 +817,7 @@ class Game2048(BaseGame):
         flat = ([value for row in grid for value in row]
                 if isinstance(grid, list)
                 and all(isinstance(row, list) for row in grid) else [])
-        if saved.get("ruleset_version") != self.attempt_context.ruleset_version:
-            self.slot_load_state = "failed"
-            self.slot_load_error = (
-                "自动存档来自不兼容的规则版本；可返回菜单或确认新开，"
-                "原存档不会被当作损坏数据删除")
-            return
-        if (not isinstance(state, dict) or version not in (1, 2, 3, 4, 5)
+        if (not isinstance(state, dict) or version not in (1, 2, 3, 4, 5, 6)
                 or type(score) is not int or not 0 <= score <= MAX_SCORE
                 or not isinstance(grid, list) or len(grid) != GRID
                 or any(not isinstance(row, list) or len(row) != GRID
@@ -792,7 +848,7 @@ class Game2048(BaseGame):
                 game_state = "gameover"
         confirmed_score = None
         slot_revision = 0
-        if version in (2, 3, 4, 5):
+        if version in (2, 3, 4, 5, 6):
             attempt_uuid = state.get("attempt_uuid")
             revision = state.get(
                 "attempt_revision", state.get("revision"))
@@ -804,7 +860,8 @@ class Game2048(BaseGame):
                 and all(char.isascii()
                         and (char.isalnum() or char in "-_")
                         for char in attempt_uuid))
-            if (not valid_attempt or type(revision) is not int or revision < 0
+            if (not valid_attempt or type(revision) is not int
+                    or not 0 <= revision <= (1 << 63) - 1
                     or type(slot_revision) is not int
                     or not 0 <= slot_revision <= (1 << 63) - 1
                     or (confirmed_score is not None
@@ -829,18 +886,15 @@ class Game2048(BaseGame):
         self.state = game_state
         self._won_announced = (
             bool(state.get("won_announced"))
-            if version in (2, 3, 4, 5) else self.won)
+            if version in (2, 3, 4, 5, 6) else self.won)
         if self.state == "playing" and self.won and not self._won_announced:
             # A crash can happen after the 2048 tile is committed but before
             # the overlay/score acknowledgement. Restore that milestone as a
             # terminal UI state instead of silently marking it announced.
             self.state = "won"
             self._won_announced = True
-        if version in (2, 3, 4, 5):
-            self.attempt_context.attempt_uuid = attempt_uuid
-            self.attempt_context.revision = revision
-            self._score_attempt_uuid = attempt_uuid
-            self._score_attempt_revision = revision
+        if version in (2, 3, 4, 5, 6):
+            self.restore_attempt_identity(attempt_uuid, revision)
             # v2 stored a process-local SQLite row ID. It is deliberately
             # ignored; attempt_uuid is the stable identity.
             self._score_submission_id = None
@@ -848,21 +902,35 @@ class Game2048(BaseGame):
             self.submitted_score = confirmed_score
             self.score_submitted = confirmed_score is not None
             self._slot_revision = slot_revision
+        if version == 6:
+            self._move_count = state["move_count"]
+            self._move_digest = state["move_digest"]
+            try:
+                restore_2048_rng_state(self.rng, state.get("rng_state"))
+            except (AttributeError, TypeError, ValueError):
+                self.slot_load_state = "failed"
+                self.slot_load_error = "当前随机源无法恢复此自动存档"
+                return
+        else:
+            self._move_count = 0
+            self._move_digest = hashlib.sha256(
+                f"2048:{self._score_attempt_uuid}".encode()).hexdigest()
         current_epoch = (
-            state.get("owner_epoch", 0) if version in (4, 5) else 0)
+            state.get("owner_epoch", 0) if version in (4, 5, 6) else 0)
         self._slot_owner_epoch = current_epoch
         self.anim_t = 1.0
         self.slot_load_state = "ready"
+        self._slot_incompatible_ruleset = False
         self.slot_load_error = None
         needs_owner_claim = (
             version in (1, 2, 3)
-            or (version in (4, 5) and owner_status == "released")
-            or (version in (4, 5)
+            or (version in (4, 5, 6) and owner_status == "released")
+            or (version in (4, 5, 6)
                 and owner_token != self._slot_owner_token))
         if needs_owner_claim:
             self.slot_load_state = "claiming"
             self._slot_expected_owner_token = (
-                owner_token if version in (4, 5) else None)
+                owner_token if version in (4, 5, 6) else None)
             self._slot_expected_owner_epoch = current_epoch
             self._slot_expected_revision = slot_revision
             self._slot_expected_value_hash = saved.get("value_hash")
@@ -905,7 +973,8 @@ class Game2048(BaseGame):
         self.slot_load_error = None
         self._slot_load_started_at = pygame.time.get_ticks() / 1000.0
 
-    def _quarantine_bad_slot(self, reason: str) -> None:
+    def _quarantine_bad_slot(self, reason: str, *, action=None) -> None:
+        self._slot_quarantine_action = action
         quarantine = getattr(self.backend, "quarantine_slot_async", None)
         if callable(quarantine):
             try:
@@ -931,10 +1000,21 @@ class Game2048(BaseGame):
         except Exception:  # noqa: BLE001
             quarantined = False
         if quarantined:
+            action = self._slot_quarantine_action
+            self._slot_quarantine_action = None
+            if action == "new_game":
+                self._slot_incompatible_ruleset = False
+                self._clear_slot_claim_expectations()
+                self._slot_owner_epoch = 0
+                self.slot_load_state = "ready"
+                self.slot_load_error = None
+                self.reset()
+                return
             self.slot_load_state = "failed"
             self.slot_load_error = (
                 "自动存档内容损坏，原始数据已隔离；可重试或确认新开")
         else:
+            self._slot_quarantine_action = None
             self.slot_load_state = "quarantine_failed"
             self.slot_load_error = (
                 "自动存档内容损坏但隔离未确认；不会覆盖原数据，可返回菜单")
@@ -1210,6 +1290,7 @@ class Game2048(BaseGame):
         # SQLite is slow and the durable claim replays later.
         if self.slot_load_state not in {"ready", "claiming"}:
             return
+        self._queued_directions.clear()
         publish_intent = getattr(self.backend, "publish_slot_intent", None)
         if callable(publish_intent):
             try:

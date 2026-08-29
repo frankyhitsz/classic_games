@@ -375,16 +375,16 @@ class JournalRecoveryTests(unittest.TestCase):
 
 
 class ArchiveEvolutionTests(unittest.TestCase):
-    def test_future_reader_dispatches_manifest_v3_by_archive_format(self):
+    def test_future_reader_dispatches_manifest_v4_by_archive_format(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = root / "games.db"
             LocalGameStore(database)
             archive_path = root / "archive.json"
             export_data(database, archive_path)
-            with patch("game_service.data_cli.MANIFEST_FORMAT_VERSION", 4):
+            with patch("game_service.data_cli.MANIFEST_FORMAT_VERSION", 5):
                 archive = _load_archive(archive_path)
-            self.assertEqual(archive["manifest"]["format_version"], 3)
+            self.assertEqual(archive["manifest"]["format_version"], 4)
 
     def test_added_current_game_does_not_invalidate_old_catalog(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -400,7 +400,7 @@ class ArchiveEvolutionTests(unittest.TestCase):
             self.assertNotIn(
                 "zuma", _load_archive(archive_path)["manifest"]
                 ["application"]["rulesets"])
-            self.assertEqual(archive["archive_version"], 3)
+            self.assertEqual(archive["archive_version"], 4)
 
     def test_row_game_must_be_declared_by_archive_catalog(self):
         with tempfile.TemporaryDirectory() as directory:

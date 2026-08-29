@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import hmac
 import ipaddress
+import secrets
 import sqlite3
 import time
 import weakref
@@ -46,9 +48,14 @@ def create_app(config: dict | None = None) -> Flask:
         INITIALIZE_DB=True,
         LEGACY_DB_PATH=None,
         APPLICATION_LEASE=None,
+        ALLOW_REMOTE_API=os.environ.get("GAMES_UNSAFE_EXPOSE") == "1",
+        API_TOKEN=os.environ.get("GAMES_API_TOKEN"),
     )
     if config:
         app.config.update(config)
+    if (app.config.get("ALLOW_REMOTE_API")
+            and not app.config.get("API_TOKEN")):
+        app.config["API_TOKEN"] = secrets.token_urlsafe(32)
 
     lease_enabled = app.config.get("APPLICATION_LEASE")
     if lease_enabled is None:
@@ -136,8 +143,28 @@ def create_app(config: dict | None = None) -> Flask:
         return api_error("internal_error", "unexpected server error", 500)
 
     @app.before_request
-    def before_request() -> None:
+    def before_request():
         g.started = time.time()
+        remote = request.remote_addr or ""
+        try:
+            loopback = ipaddress.ip_address(remote).is_loopback
+        except ValueError:
+            loopback = remote.casefold() == "localhost"
+        if loopback:
+            return None
+        if not app.config.get("ALLOW_REMOTE_API"):
+            return api_error(
+                "remote_api_disabled",
+                "the optional debug API only accepts loopback clients", 403)
+        expected = str(app.config.get("API_TOKEN") or "")
+        authorization = request.headers.get("Authorization", "")
+        supplied = (authorization[7:] if authorization.startswith("Bearer ")
+                    else request.headers.get("X-Games-Token", ""))
+        if not expected or not hmac.compare_digest(expected, supplied):
+            return api_error(
+                "api_token_required",
+                "a valid debug API token is required for remote access", 401)
+        return None
 
     @app.after_request
     def after_request(response):
@@ -268,6 +295,8 @@ def main() -> None:
     port = int(os.environ.get("GAMES_PORT", "5000"))
     app = create_app()
     print(f"[server] http://{host}:{port}  (db={app.config['DB_PATH']})")
+    if not loopback:
+        print(f"[server] bearer token: {app.config['API_TOKEN']}")
     try:
         app.run(host=host, port=port, debug=False)
     finally:

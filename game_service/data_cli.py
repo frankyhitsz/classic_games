@@ -23,10 +23,12 @@ from .catalog import GAME_BY_ID, VALID_GAME_IDS
 from .import_transaction import (FileOperation, ImportTransaction,
                                  MAX_TRANSACTION_FILE_BYTES,
                                  MAX_TRANSACTION_TOTAL_BYTES,
+                                 classify_import_transaction_root,
                                  recover_import_transactions,
                                  validate_file_operations)
 from .local_backend import (MAX_SPOOL_FILE_BYTES, PendingSaveEnvelope,
-                            PersistentSaveOutbox, PersistentStateOutbox)
+                            PersistentSaveOutbox, PersistentStateOutbox,
+                            SCORE_LOCK_STRIPES)
 from .maintenance import (MaintenanceBusyError, inactive_application_lock,
                           maintenance_lock, application_lock_path,
                           application_transition_lock_path, lock_path)
@@ -38,14 +40,16 @@ from .store import (SCHEMA_VERSION as STORE_SCHEMA_VERSION, LocalGameStore,
                     StoreError, default_database_path)
 from .version import __version__ as PACKAGE_VERSION
 
-ARCHIVE_VERSION = 3
-MANIFEST_FORMAT_VERSION = 3
-SUPPORTED_ARCHIVE_VERSIONS = frozenset({1, 2, ARCHIVE_VERSION})
-STRICT_EVIDENCE_MANIFESTS = frozenset({2, MANIFEST_FORMAT_VERSION})
+ARCHIVE_VERSION = 4
+MANIFEST_FORMAT_VERSION = 4
+SUPPORTED_ARCHIVE_VERSIONS = frozenset({1, 2, 3, ARCHIVE_VERSION})
+STRICT_EVIDENCE_MANIFESTS = frozenset({2, 3, MANIFEST_FORMAT_VERSION})
 ARCHIVE_CAPABILITIES = (
     "complete-active-journal-inventory",
     "strict-recovery-evidence",
     "historical-ruleset-rows",
+    "split-active-forensic-completeness",
+    "hash-only-recovery-inventory",
 )
 EXPORT_TABLES = (
     "profiles", "attempts", "settings", "progress", "save_slots",
@@ -80,18 +84,28 @@ def _reject_json_constant(value: str):
     raise ValueError(f"non-standard JSON constant: {value}")
 
 
-def _validate_json_shape(value) -> None:
+def _validate_json_shape(value) -> dict[str, int]:
     stack = [(value, 0)]
     nodes = 0
+    maximum_depth = 0
+    maximum_string = 0
     while stack:
         item, depth = stack.pop()
         nodes += 1
+        maximum_depth = max(maximum_depth, depth)
         if nodes > MAX_JSON_NODES or depth > MAX_JSON_DEPTH:
             raise StoreError(
-                "archive_too_complex", "archive nesting or item count is too large")
-        if isinstance(item, str) and len(item) > MAX_JSON_STRING:
-            raise StoreError(
-                "archive_string_too_large", "archive contains an oversized string")
+                "archive_too_complex", "archive nesting or item count is too large",
+                details={"nodes": nodes, "node_limit": MAX_JSON_NODES,
+                         "depth": depth, "depth_limit": MAX_JSON_DEPTH})
+        if isinstance(item, str):
+            maximum_string = max(maximum_string, len(item))
+            if len(item) > MAX_JSON_STRING:
+                raise StoreError(
+                    "archive_string_too_large",
+                    "archive contains an oversized string",
+                    details={"string_length": len(item),
+                             "string_limit": MAX_JSON_STRING})
         if isinstance(item, float) and not math.isfinite(item):
             raise StoreError(
                 "invalid_archive", "archive contains a non-finite number")
@@ -100,6 +114,9 @@ def _validate_json_shape(value) -> None:
             stack.extend((child, depth + 1) for child in item.values())
         elif isinstance(item, list):
             stack.extend((child, depth + 1) for child in item)
+    return {"nodes": nodes, "node_limit": MAX_JSON_NODES,
+            "depth": maximum_depth, "depth_limit": MAX_JSON_DEPTH,
+            "max_string": maximum_string, "string_limit": MAX_JSON_STRING}
 
 
 def _existing_store(database: Path) -> LocalGameStore:
@@ -117,12 +134,35 @@ def _bounded_rows(connection: sqlite3.Connection, table: str) -> list[dict]:
             raise StoreError(
                 "export_too_large", f"{table} exceeds the export row limit")
         value = dict(row)
-        encoded_bytes += len(canonical_json(value).encode("utf-8"))
+        try:
+            for column, child in value.items():
+                canonical_json(child)
+            encoded = canonical_json(value).encode("utf-8")
+        except (MutationError, TypeError, ValueError,
+                RecursionError, MemoryError) as exc:
+            bad_column = next((
+                column for column, child in value.items()
+                if _archive_value_is_unsupported(child)), None)
+            raise StoreError(
+                "invalid_archive_source",
+                f"{table} row {index} contains an unsupported value",
+                details={"table": table, "row": index,
+                         "column": bad_column}) from exc
+        encoded_bytes += len(encoded)
         if encoded_bytes > MAX_TABLE_BYTES:
             raise StoreError(
                 "export_too_large", f"{table} exceeds the export memory limit")
         rows.append(value)
     return rows
+
+
+def _archive_value_is_unsupported(value) -> bool:
+    try:
+        canonical_json(value)
+    except (MutationError, TypeError, ValueError,
+            RecursionError, MemoryError):
+        return True
+    return False
 
 
 def _recovery_paths(database: Path) -> list[Path]:
@@ -135,6 +175,7 @@ def _recovery_paths(database: Path) -> list[Path]:
         "imported-recovery", f".{database.name}.import-",
         f".{database.name}.preparing-",
         f".{database.name}.fresh-replace-",
+        f".{database.name}.transaction-cleanup-",
     )
     try:
         entries = list(parent.iterdir())
@@ -150,6 +191,7 @@ def _recovery_source(database: Path, name: str) -> str:
         (f".{database.name}.import-", "import_transaction"),
         (f".{database.name}.preparing-", "import_preparation"),
         (f".{database.name}.fresh-replace-", "fresh_replace_staging"),
+        (f".{database.name}.transaction-cleanup-", "transaction_cleanup"),
         (f"{database.name}.backup-", "database_backup"),
         (f"{database.name}.corrupt-", "corrupt_database"),
         ("pending-quarantine", "score_quarantine"),
@@ -199,6 +241,7 @@ def _guard_export_target(database: Path, requested: Path, *, force: bool) -> Pat
         f".{database.name}.import-", f".{database.name}.preparing-",
         f".{database.name}.fresh-replace-",
         f".{database.name}.replace-plan-",
+        f".{database.name}.transaction-cleanup-",
     )
     try:
         relative_output = output.relative_to(database.parent)
@@ -229,8 +272,20 @@ def _active_protocol_report(database: Path) -> dict:
     """List unresolved active journals that a complete snapshot cannot omit."""
     score_path, state_path = _pending_paths(database)
     candidates = [database.with_name("pending_saves.json")]
-    candidates.extend(database.parent.glob(f".{database.name}.import-*"))
     candidates.extend(database.parent.glob(f".{database.name}.preparing-*"))
+    unresolved = []
+    for root in database.parent.glob(f".{database.name}.import-*"):
+        classification = classify_import_transaction_root(database, root)
+        if classification["status"] == "terminal":
+            continue
+        unresolved.append({
+            "path": root.name,
+            "reason": ("unfinished_transaction"
+                       if classification["status"] == "active"
+                       else "invalid_transaction"),
+            "phase": classification.get("phase"),
+            "error": classification.get("error"),
+        })
     try:
         with os.scandir(score_path) as entries:
             candidates.extend(
@@ -249,7 +304,6 @@ def _active_protocol_report(database: Path) -> dict:
                     and entry.name.endswith((".restore", ".tmp"))))
     except (FileNotFoundError, NotADirectoryError, OSError):
         pass
-    unresolved = []
     for path in candidates:
         try:
             metadata = os.lstat(path)
@@ -275,7 +329,7 @@ def _pending_paths(database: Path) -> tuple[Path, Path]:
 
 
 def _require_import_space(database: Path, archive_path: Path, *,
-                          replacement: bool) -> None:
+                          replacement: bool) -> dict:
     """Refuse an import before staging when rollback space is insufficient."""
     try:
         database_bytes = database.stat().st_size if database.is_file() else 0
@@ -286,13 +340,24 @@ def _require_import_space(database: Path, archive_path: Path, *,
             "import_space_unknown", "available import space cannot be verified",
             503, retryable=True) from exc
     archive_copies = 3 if replacement else 1
-    required = (database_bytes * 2 + archive_bytes * archive_copies
-                + MIN_IMPORT_SPACE_MARGIN)
+    rollback_bytes = database_bytes
+    staging_bytes = database_bytes + archive_bytes * archive_copies
+    required = rollback_bytes + staging_bytes + MIN_IMPORT_SPACE_MARGIN
+    report = {
+        "database_bytes": database_bytes,
+        "archive_bytes": archive_bytes,
+        "rollback_bytes": rollback_bytes,
+        "staging_bytes": staging_bytes,
+        "margin_bytes": MIN_IMPORT_SPACE_MARGIN,
+        "required_bytes": required,
+        "free_bytes": free,
+    }
     if free < required:
         raise StoreError(
             "insufficient_import_space",
             "not enough free space for staging and authenticated rollback",
-            507, details={"required_bytes": required, "free_bytes": free})
+            507, details=report)
+    return report
 
 
 def _pending_file_count(path: Path) -> int:
@@ -322,6 +387,40 @@ def _bounded_file_count(path: Path) -> int:
     except (FileNotFoundError, NotADirectoryError, OSError):
         return 0
     return count
+
+
+def _score_lock_inventory(path: Path) -> dict:
+    striped = 0
+    legacy = []
+    unsafe = []
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                name = entry.name
+                if not (name.startswith(".") and name.endswith(".lock")):
+                    continue
+                try:
+                    metadata = entry.stat(follow_symlinks=False)
+                except OSError:
+                    unsafe.append(name)
+                    continue
+                if (not stat.S_ISREG(metadata.st_mode)
+                        or metadata.st_nlink > 1):
+                    unsafe.append(name)
+                elif name.startswith(".score-lock-"):
+                    striped += 1
+                else:
+                    legacy.append(name)
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        pass
+    return {
+        "striped": striped,
+        "stripe_limit": SCORE_LOCK_STRIPES,
+        "legacy": len(legacy),
+        "legacy_files": sorted(legacy)[:100],
+        "unsafe": len(unsafe),
+        "unsafe_files": sorted(unsafe)[:100],
+    }
 
 
 def _read_regular_nofollow(path: Path, limit: int) -> bytes:
@@ -360,6 +459,49 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
         raise StoreError(
             "unsafe_snapshot_file", "snapshot file is unsafe or unreadable"
         ) from exc
+
+
+def _hash_regular_nofollow(path: Path) -> tuple[int, str]:
+    """Hash a stable ordinary file without loading large evidence into RAM."""
+    try:
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink > 1:
+            raise OSError("unsafe recovery file")
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(path, flags)
+        try:
+            opened = os.fstat(descriptor)
+            if ((before.st_dev, before.st_ino, before.st_size,
+                 before.st_mtime_ns)
+                    != (opened.st_dev, opened.st_ino, opened.st_size,
+                        opened.st_mtime_ns)
+                    or not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink > 1):
+                raise OSError("recovery file changed while opening")
+            digest = hashlib.sha256()
+            size = 0
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                digest.update(chunk)
+            final = os.fstat(descriptor)
+            if (size != final.st_size
+                    or (opened.st_dev, opened.st_ino, opened.st_size,
+                        opened.st_mtime_ns)
+                    != (final.st_dev, final.st_ino, final.st_size,
+                        final.st_mtime_ns)):
+                raise OSError("recovery file changed while hashing")
+            return size, digest.hexdigest()
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise StoreError(
+            "unsafe_snapshot_file",
+            "recovery evidence is unsafe or changed while hashing") from exc
 
 
 def inspect_data(database: Path) -> dict:
@@ -447,13 +589,54 @@ def inspect_data(database: Path) -> dict:
             "scores": _pending_file_count(score_path),
             "state": _pending_file_count(state_path),
         },
+        "score_locks": _score_lock_inventory(score_path),
         "recovery": recovery,
-        "unfinished_import_transactions": len([
-            path for path in database.parent.glob(
-                f".{database.name}.import-*")
-            if path.is_dir() and not path.is_symlink()
-        ]),
+        "unfinished_import_transactions": sum(
+            classify_import_transaction_root(database, path)["status"]
+            != "terminal"
+            for path in database.parent.glob(f".{database.name}.import-*")),
     }
+
+
+def cleanup_score_locks(database: Path, *, apply: bool = False) -> dict:
+    """Remove obsolete per-request score locks while every app is inactive."""
+    database = database.expanduser().resolve(strict=False)
+    score_path, _state_path = _pending_paths(database)
+    removed = []
+    try:
+        with (inactive_application_lock(database, timeout=2.0),
+              maintenance_lock(database, exclusive=True, timeout=2.0)):
+            before = _score_lock_inventory(score_path)
+            if apply:
+                try:
+                    names = [
+                        entry.name for entry in os.scandir(score_path)
+                        if (entry.name.startswith(".")
+                            and entry.name.endswith(".lock")
+                            and not entry.name.startswith(".score-lock-"))
+                    ]
+                except (FileNotFoundError, NotADirectoryError, OSError):
+                    names = []
+                for name in names[:MAX_TABLE_ROWS]:
+                    path = score_path / name
+                    try:
+                        metadata = os.lstat(path)
+                        if (not stat.S_ISREG(metadata.st_mode)
+                                or metadata.st_nlink > 1):
+                            continue
+                        path.unlink()
+                        removed.append(name)
+                    except (FileNotFoundError, OSError):
+                        continue
+                if removed:
+                    _fsync_directory(score_path)
+            after = _score_lock_inventory(score_path)
+    except MaintenanceBusyError as exc:
+        raise StoreError(
+            "maintenance_busy", str(exc), 409, retryable=True) from exc
+    return {"ok": True, "applied": apply, "before": before,
+            "after": after, "removed": removed,
+            "removed_count": len(removed)}
 
 
 def inspect_transactions(database: Path) -> dict:
@@ -461,27 +644,20 @@ def inspect_transactions(database: Path) -> dict:
     database = database.expanduser().resolve(strict=False)
     transactions = []
     for root in sorted(database.parent.glob(f".{database.name}.import-*")):
-        record = {"path": root.name, "phase": None, "valid": False,
-                  "error": None}
+        classification = classify_import_transaction_root(database, root)
+        record = {
+            **classification,
+            "valid": classification["status"] != "invalid",
+        }
         try:
-            if root.is_symlink() or not root.is_dir():
-                raise StoreError(
-                    "import_recovery_required", "transaction root is unsafe")
-            transaction = ImportTransaction.open(database, root)
-            record.update({
-                "phase": transaction.journal["phase"], "valid": True,
-                "version": transaction.journal["version"],
-                "operation_count": len(transaction.journal["operations"]),
-                "modified_at": os.lstat(root / "journal.json").st_mtime,
-            })
-        except (OSError, StoreError) as exc:
-            record["error"] = (
-                exc.message if isinstance(exc, StoreError) else str(exc))
+            record["modified_at"] = os.lstat(root / "journal.json").st_mtime
+        except OSError:
+            record["modified_at"] = None
         transactions.append(record)
     return {"ok": True, "database": str(database),
             "transactions": transactions, "count": len(transactions),
-            "requires_recovery": any(not item["valid"] or item["phase"] not in {
-                "COMPLETED", "ROLLED_BACK"} for item in transactions)}
+            "requires_recovery": any(
+                item["status"] != "terminal" for item in transactions)}
 
 
 def _validated_transaction_evidence(
@@ -648,17 +824,18 @@ def cleanup_recovery_data(database: Path, *, older_than_days: int,
     if archive_path is not None:
         archive = _load_archive(archive_path)
         manifest = archive.get("manifest", {})
-        if (manifest.get("format_version") != MANIFEST_FORMAT_VERSION
-                or manifest.get("complete") is not True
-                or manifest.get("recovery", {}).get("complete") is not True):
+        current_format = manifest.get("format_version")
+        recovery_proven = (
+            manifest.get("completeness", {}).get(
+                "forensic_evidence_complete") is True
+            if current_format == 4
+            else (manifest.get("complete") is True
+                  and manifest.get("recovery", {}).get("complete") is True))
+        if (current_format not in {3, 4} or not recovery_proven):
             raise StoreError(
                 "incomplete_archive",
                 "cleanup proof must be a complete current-format archive")
-        evidence_hashes = {
-            PurePosixPath(*relative.parts).as_posix():
-                hashlib.sha256(raw).hexdigest()
-            for relative, raw in _validated_recovery_items(archive)
-        }
+        evidence_hashes = _validated_recovery_hashes(archive)
     if apply and archive is None:
         raise StoreError(
             "cleanup_archive_required",
@@ -732,16 +909,11 @@ def cleanup_recovery_data(database: Path, *, older_than_days: int,
                 fingerprint_bytes = 0
                 try:
                     for path, relative in paths:
-                        raw = _read_regular_nofollow(
-                            path, MAX_RECOVERY_FILE_BYTES)
-                        fingerprint_bytes += len(raw)
-                        if fingerprint_bytes > MAX_RECOVERY_TOTAL_BYTES:
-                            raise StoreError(
-                                "recovery_too_large",
-                                "recovery cleanup proof exceeds size limit")
-                        fingerprints[relative] = hashlib.sha256(raw).hexdigest()
+                        size, digest = _hash_regular_nofollow(path)
+                        fingerprint_bytes += size
+                        fingerprints[relative] = digest
                 except StoreError:
-                    item["reason"] = "unreadable_or_oversized"
+                    item["reason"] = "unreadable_or_changed"
                     candidates.append(item)
                     continue
                 item["files"] = len(fingerprints)
@@ -801,9 +973,9 @@ def cleanup_recovery_data(database: Path, *, older_than_days: int,
                             409)
                     for relative, expected_hash in item["fingerprints"].items():
                         evidence_path = current_files[relative]
-                        raw = _read_regular_nofollow(
-                            evidence_path, MAX_RECOVERY_FILE_BYTES)
-                        if hashlib.sha256(raw).hexdigest() != expected_hash:
+                        _size, current_hash = _hash_regular_nofollow(
+                            evidence_path)
+                        if current_hash != expected_hash:
                             raise StoreError(
                                 "cleanup_target_changed",
                                 "cleanup candidate changed after verification", 409)
@@ -895,15 +1067,26 @@ def _export_recovery(database: Path) -> tuple[list[dict], dict]:
             except OSError:
                 result.append({"path": relative, "omitted": "unreadable"})
                 continue
-            if size > MAX_RECOVERY_FILE_BYTES:
+            hash_only_reason = None
+            if root.name == "imported-recovery":
+                hash_only_reason = "previously_imported"
+            elif size > MAX_RECOVERY_FILE_BYTES:
+                hash_only_reason = "content_too_large"
+            elif total + size > MAX_RECOVERY_TOTAL_BYTES:
+                hash_only_reason = "content_total_limit"
+            if hash_only_reason is not None:
+                try:
+                    stable_size, digest = _hash_regular_nofollow(path)
+                except StoreError:
+                    result.append({"path": relative, "size": size,
+                                   "omitted": "unreadable"})
+                    continue
                 result.append({
-                    "path": relative, "size": size,
-                    "omitted": "file_too_large"})
-                continue
-            if total + size > MAX_RECOVERY_TOTAL_BYTES:
-                result.append({
-                    "path": relative, "size": size,
-                    "omitted": "total_size_limit"})
+                    "path": relative, "size": stable_size,
+                    "sha256": digest, "omitted": hash_only_reason,
+                    "retention_class": _recovery_source(
+                        database, root.name),
+                })
                 continue
             try:
                 raw = _read_regular_nofollow(
@@ -921,11 +1104,18 @@ def _export_recovery(database: Path) -> tuple[list[dict], dict]:
         if visited > MAX_RECOVERY_FILES:
             break
     omitted = sum("omitted" in item for item in result)
+    hashed = sum(
+        "omitted" in item and "sha256" in item for item in result)
+    unproven = omitted - hashed
     return result, {
         "complete": omitted == 0,
+        "content_complete": omitted == 0,
+        "inventory_complete": unproven == 0,
         "source_count": visited,
         "included_count": len(result) - omitted,
         "omitted_count": omitted,
+        "hashed_count": hashed,
+        "unproven_count": unproven,
         "omitted_reasons": sorted({
             item["omitted"] for item in result if "omitted" in item}),
     }
@@ -1101,21 +1291,25 @@ def export_data(database: Path, output: Path,
                     for path in recovery_paths]
                 recovery_report = {
                     "complete": not recovery_paths,
+                    "content_complete": not recovery_paths,
+                    "inventory_complete": not recovery_paths,
                     "source_count": len(recovery_paths),
                     "included_count": 0,
                     "omitted_count": len(recovery_paths),
+                    "hashed_count": 0,
+                    "unproven_count": len(recovery_paths),
                     "omitted_reasons": (
                         ["not_selected"] if recovery_paths else []),
                 }
-            if not allow_partial and not recovery_report["complete"]:
-                raise StoreError(
-                    "incomplete_recovery_snapshot",
-                    "recovery evidence could not be exported completely",
-                    details=recovery_report)
     except MaintenanceBusyError as exc:
         raise StoreError(
             "maintenance_busy", str(exc), 409, retryable=True) from exc
 
+    active_journals_complete = (
+        score_snapshot.complete and state_snapshot.complete)
+    transaction_inventory_complete = active_report["complete"]
+    replace_eligible = (
+        active_journals_complete and transaction_inventory_complete)
     payload = {
         "archive_version": ARCHIVE_VERSION,
         "schema_version": schema_version,
@@ -1149,10 +1343,18 @@ def export_data(database: Path, output: Path,
                 **recovery_report,
                 "semantics": "evidence-only; restored outside active paths",
             },
-            "complete": (
-                score_snapshot.complete and state_snapshot.complete
-                and active_report["complete"]
-                and recovery_report["complete"]),
+            "completeness": {
+                "active_data_complete": True,
+                "active_journals_complete": active_journals_complete,
+                "transaction_inventory_complete":
+                    transaction_inventory_complete,
+                "forensic_evidence_complete":
+                    recovery_report["inventory_complete"],
+                "forensic_content_complete":
+                    recovery_report["content_complete"],
+                "replace_eligible": replace_eligible,
+            },
+            "complete": replace_eligible,
             "snapshot_scope": (
                 "persisted data only; close the game before export so worker "
                 "queues are empty"),
@@ -1183,6 +1385,11 @@ def export_data(database: Path, output: Path,
     if len(encoded) > MAX_ARCHIVE_BYTES:
         raise StoreError(
             "export_too_large", "archive exceeds the 128 MiB limit")
+    # Publication is the final irreversible step. Apply the exact same JSON,
+    # manifest, hash, and reader-capability checks first so a successful
+    # export is guaranteed to be readable by this version.
+    budget = _validate_json_shape(archive)
+    _decode_archive(encoded)
     _publish_output(database, output, encoded, force=force)
     return {
         "ok": True, "output": str(output), "bytes": len(encoded),
@@ -1195,12 +1402,13 @@ def export_data(database: Path, output: Path,
         "recovered_imports": recovered_imports,
         "repair_before_export": repair_before_export,
         "repair_report": repair_report,
+        "archive_budget": {**budget, "bytes": len(encoded),
+                           "byte_limit": MAX_ARCHIVE_BYTES},
     }
 
 
-def _load_archive(path: Path) -> dict:
+def _decode_archive(raw: bytes) -> dict:
     try:
-        raw = _read_regular_nofollow(path, MAX_ARCHIVE_BYTES)
         archive = json.loads(
             raw.decode("utf-8"), parse_constant=_reject_json_constant)
         _validate_json_shape(archive)
@@ -1216,7 +1424,7 @@ def _load_archive(path: Path) -> dict:
             or not isinstance(archive.get("tables"), dict)):
         raise StoreError("invalid_archive", "unsupported archive format")
     version = archive["archive_version"]
-    if version in {2, 3}:
+    if version in {2, 3, 4}:
         for table in IMPORT_TABLES:
             rows = archive["tables"].get(table, [])
             if (not isinstance(rows, list)
@@ -1244,10 +1452,11 @@ def _load_archive(path: Path) -> dict:
         if not isinstance(manifest, dict):
             raise StoreError("invalid_archive", "archive manifest is missing")
         manifest_format = manifest.get("format_version")
-        if version == 3:
-            if manifest_format != 3:
+        if version in {3, 4}:
+            if manifest_format != version:
                 raise StoreError(
-                    "invalid_archive", "archive v3 requires manifest format 3")
+                    "invalid_archive",
+                    f"archive v{version} requires manifest format {version}")
             _validate_current_manifest(archive)
         elif manifest_format == 2:
             _validate_current_manifest(archive)
@@ -1293,9 +1502,21 @@ def _load_archive(path: Path) -> dict:
     return archive
 
 
+def _load_archive(path: Path) -> dict:
+    try:
+        raw = _read_regular_nofollow(path, MAX_ARCHIVE_BYTES)
+    except StoreError:
+        raise
+    except OSError as exc:
+        raise StoreError(
+            "invalid_archive", "archive is not a safe ordinary file") from exc
+    return _decode_archive(raw)
+
+
 def inspect_archive(archive_path: Path) -> dict:
-    """Validate and summarize an archive without opening local game data."""
-    archive = _load_archive(archive_path.expanduser().resolve(strict=False))
+    """Structurally inspect an archive without opening local game data."""
+    lexical = Path(os.path.abspath(archive_path.expanduser()))
+    archive = _load_archive(lexical)
     return {
         "ok": True,
         "archive": str(archive_path),
@@ -1309,6 +1530,39 @@ def inspect_archive(archive_path: Path) -> dict:
         "pending_scores": len(archive.get("pending_scores", [])),
         "pending_state": len(archive.get("pending_state", [])),
         "recovery_evidence": len(archive.get("recovery_evidence", [])),
+        "complete": archive.get("manifest", {}).get("complete"),
+        "validation": "bounded structure, manifest, and hashes",
+    }
+
+
+def verify_archive(archive_path: Path) -> dict:
+    """Deep-verify rows, relationships, pending data and evidence in isolation."""
+    lexical = Path(os.path.abspath(archive_path.expanduser()))
+    archive = _load_archive(lexical)
+    with tempfile.TemporaryDirectory(
+            prefix="classic-games-archive-verify-") as directory:
+        database = Path(directory) / "verify.sqlite"
+        LocalGameStore(database)
+        preview, _plan, operations = _plan_import(database, archive)
+    if not preview["ok"]:
+        raise StoreError(
+            "invalid_archive_semantics",
+            "archive cannot be imported into an empty current database",
+            details={"errors": preview["errors"],
+                     "plan_fingerprint": preview["plan_fingerprint"]})
+    return {
+        "ok": True,
+        "archive": str(archive_path),
+        "archive_version": archive["archive_version"],
+        "manifest_hash": archive.get("manifest_hash"),
+        "validation": (
+            "bounded structure, hashes, row semantics, natural keys, "
+            "foreign keys, pending policy, recovery evidence, and empty-schema "
+            "import plan"),
+        "plan_fingerprint": preview["plan_fingerprint"],
+        "planned_file_operations": len(operations),
+        "tables": preview["tables"],
+        "pending": preview["pending"],
         "complete": archive.get("manifest", {}).get("complete"),
     }
 
@@ -1349,7 +1603,7 @@ def _validate_current_manifest(archive: dict) -> None:
             or not _valid_ruleset_catalog(application.get("rulesets"))):
         raise StoreError(
             "invalid_archive", "archive application or rulesets are inconsistent")
-    if format_version == 3:
+    if format_version in {3, 4}:
         reader = manifest.get("reader")
         if (not isinstance(application.get("version"), str)
                 or not application["version"]
@@ -1407,9 +1661,39 @@ def _validate_current_manifest(archive: dict) -> None:
     active_complete = (isinstance(transactions, dict)
                        and transactions.get("complete") is True
                        and transactions.get("unresolved_count") == 0)
-    expected_complete = (
-        pending["score"]["complete"] and pending["state"]["complete"]
-        and active_complete and recovery["complete"])
+    if format_version == 4:
+        hashed = sum(
+            isinstance(item, dict) and "omitted" in item and "sha256" in item
+            for item in evidence)
+        unproven = omitted - hashed
+        if (recovery.get("hashed_count") != hashed
+                or recovery.get("unproven_count") != unproven
+                or recovery.get("content_complete") is not (omitted == 0)
+                or recovery.get("inventory_complete") is not (unproven == 0)):
+            raise StoreError(
+                "invalid_archive",
+                "archive recovery inventory report is inconsistent")
+        completeness = manifest.get("completeness")
+        active_journals_complete = (
+            pending["score"]["complete"] and pending["state"]["complete"])
+        replace_eligible = active_journals_complete and active_complete
+        expected_completeness = {
+            "active_data_complete": True,
+            "active_journals_complete": active_journals_complete,
+            "transaction_inventory_complete": active_complete,
+            "forensic_evidence_complete": unproven == 0,
+            "forensic_content_complete": omitted == 0,
+            "replace_eligible": replace_eligible,
+        }
+        if completeness != expected_completeness:
+            raise StoreError(
+                "invalid_archive",
+                "archive completeness dimensions are inconsistent")
+        expected_complete = replace_eligible
+    else:
+        expected_complete = (
+            pending["score"]["complete"] and pending["state"]["complete"]
+            and active_complete and recovery["complete"])
     if manifest.get("complete") is not expected_complete:
         raise StoreError(
             "invalid_archive", "archive completeness flags are inconsistent")
@@ -1443,7 +1727,7 @@ def _validate_legacy_v2_manifest(archive: dict) -> None:
 
 def upgrade_archive(database: Path, source: Path, output: Path, *,
                     force: bool = False) -> dict:
-    """Rewrite a verified v2 archive under the explicit v3 reader contract."""
+    """Rewrite a verified v2 archive under the current v4 contract."""
     database = database.expanduser().resolve(strict=False)
     output = _guard_export_target(database, output, force=force)
     archive = _load_archive(source)
@@ -1467,17 +1751,45 @@ def upgrade_archive(database: Path, source: Path, output: Path, *,
     application["version"] = (
         application.get("version")
         or ("0.6.0" if old_format == 2 else "legacy-unknown"))
+    recovery = dict(old_manifest.get("recovery", {}))
+    omitted = int(recovery.get("omitted_count") or 0)
+    recovery.update({
+        "content_complete": omitted == 0,
+        "inventory_complete": omitted == 0,
+        "hashed_count": 0,
+        "unproven_count": omitted,
+    })
+    active_journals_complete = bool(
+        isinstance(pending.get("score"), dict)
+        and pending["score"].get("complete") is True
+        and isinstance(pending.get("state"), dict)
+        and pending["state"].get("complete") is True)
+    transaction_complete = bool(
+        pending["transactions"].get("complete") is True
+        and pending["transactions"].get("unresolved_count") == 0)
+    replace_eligible = (
+        replace_eligible and active_journals_complete
+        and transaction_complete)
     manifest = {
         **old_manifest,
         "format_version": MANIFEST_FORMAT_VERSION,
         "application": application,
         "pending": pending,
+        "recovery": recovery,
         "reader": {
             "min_version": MANIFEST_FORMAT_VERSION,
             "max_version": MANIFEST_FORMAT_VERSION,
             "required_capabilities": list(ARCHIVE_CAPABILITIES),
         },
         "complete": replace_eligible,
+        "completeness": {
+            "active_data_complete": True,
+            "active_journals_complete": active_journals_complete,
+            "transaction_inventory_complete": transaction_complete,
+            "forensic_evidence_complete": omitted == 0,
+            "forensic_content_complete": omitted == 0,
+            "replace_eligible": replace_eligible,
+        },
         "upgraded_from": {
             "archive_version": 2,
             "manifest_format": old_format,
@@ -1734,6 +2046,8 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
 
     # Pending entries are validated with the same parsers used on restore.
     for index, value in enumerate(archive["pending_scores"]):
+        if _is_historical_pending(value, state=False):
+            continue
         try:
             envelope, _mutation = PendingSaveEnvelope.parse(value)
             target = _pending_paths(database)[0] / f"{envelope.request_id}.json"
@@ -1752,6 +2066,8 @@ def _plan_import(database: Path, archive: dict) -> tuple[dict, dict, list[FileOp
             if not _is_historical_pending(value, state=False):
                 errors.append(f"pending_scores[{index}] is invalid")
     for index, value in enumerate(archive["pending_state"]):
+        if _is_historical_pending(value, state=True):
+            continue
         try:
             operation = PersistentStateOutbox._parse(
                 canonical_json(value).encode("utf-8"))
@@ -1892,6 +2208,7 @@ def _validated_recovery_items(archive: dict) -> list[tuple[Path, bytes]]:
     total = 0
     strict = archive.get("manifest", {}).get(
         "format_version") in STRICT_EVIDENCE_MANIFESTS
+    format_version = archive.get("manifest", {}).get("format_version")
     for item in items:
         if not isinstance(item, dict):
             raise StoreError(
@@ -1899,10 +2216,24 @@ def _validated_recovery_items(archive: dict) -> list[tuple[Path, bytes]]:
         relative = _safe_evidence_relative(str(item.get("path", "")))
         identity = PurePosixPath(*relative.parts).as_posix()
         if "content_base64" not in item:
+            allowed_omission = ({"path", "size", "omitted", "sha256",
+                                 "retention_class"}
+                                if format_version == 4
+                                else {"path", "size", "omitted"})
             if strict and ("omitted" not in item
-                           or not set(item) <= {"path", "size", "omitted"}):
+                           or not set(item) <= allowed_omission):
                 raise StoreError(
                     "invalid_archive", "recovery omission metadata is incomplete")
+            if format_version == 4 and "sha256" in item:
+                digest = item["sha256"]
+                if (type(item.get("size")) is not int or item["size"] < 0
+                        or not isinstance(digest, str) or len(digest) != 64
+                        or any(char not in "0123456789abcdef"
+                               for char in digest)
+                        or not isinstance(item.get("retention_class"), str)):
+                    raise StoreError(
+                        "invalid_archive",
+                        "recovery hash-only inventory is incomplete")
             value = ("omitted", canonical_json(item))
             previous = seen.get(identity)
             if previous is not None and previous != value:
@@ -1944,6 +2275,21 @@ def _validated_recovery_items(archive: dict) -> list[tuple[Path, bytes]]:
         seen[identity] = value
         prepared.append((relative, raw))
     return prepared
+
+
+def _validated_recovery_hashes(archive: dict) -> dict[str, str]:
+    """Return embedded and hash-only evidence identities after full validation."""
+    embedded = {
+        PurePosixPath(*relative.parts).as_posix():
+            hashlib.sha256(raw).hexdigest()
+        for relative, raw in _validated_recovery_items(archive)
+    }
+    for item in archive["recovery_evidence"]:
+        if (isinstance(item, dict) and "content_base64" not in item
+                and isinstance(item.get("sha256"), str)):
+            relative = _safe_evidence_relative(str(item.get("path", "")))
+            embedded[PurePosixPath(*relative.parts).as_posix()] = item["sha256"]
+    return embedded
 
 
 def _restore_recovery_evidence(database: Path, archive: dict) -> dict:
@@ -2035,6 +2381,10 @@ def _planned_file_operations(
     score_values: dict[Path, PendingSaveEnvelope] = {}
     historical_operations: list[FileOperation] = []
     for index, value in enumerate(archive["pending_scores"]):
+        if _is_historical_pending(value, state=False):
+            historical_operations.append(_historical_pending_operation(
+                database, archive, value, state=False, index=index))
+            continue
         try:
             envelope, _mutation = PendingSaveEnvelope.parse(value)
         except (StoreError, TypeError, ValueError, MutationError,
@@ -2067,6 +2417,10 @@ def _planned_file_operations(
 
     state_values: dict[Path, dict] = {}
     for index, value in enumerate(archive["pending_state"]):
+        if _is_historical_pending(value, state=True):
+            historical_operations.append(_historical_pending_operation(
+                database, archive, value, state=True, index=index))
+            continue
         try:
             operation = PersistentStateOutbox._parse(
                 canonical_json(value).encode("utf-8"))
@@ -2178,7 +2532,8 @@ def import_data(database: Path, archive_path: Path) -> dict:
     try:
         with (inactive_application_lock(database, timeout=2.0),
               maintenance_lock(database, exclusive=True, timeout=2.0)):
-            _require_import_space(database, archive_path, replacement=False)
+            disk_preflight = _require_import_space(
+                database, archive_path, replacement=False)
             recovered = recover_import_transactions(database)
             # Initialization and migration belong inside the exclusive gate.
             store = LocalGameStore(database)
@@ -2188,9 +2543,21 @@ def import_data(database: Path, archive_path: Path) -> dict:
                     "invalid_archive",
                     "archive preview contains invalid rows or conflicts",
                     details={"preview": preview})
-            backup = store._backup_database(store.schema_version())
             transaction = ImportTransaction.prepare(
                 database, file_operations)
+            try:
+                database_before = transaction.journal["database_before"]
+                backup_bytes = _read_regular_nofollow(
+                    transaction.root / database_before["path"],
+                    MAX_TRANSACTION_TOTAL_BYTES)
+                backup = database.with_name(
+                    f"{database.name}.backup-import-{time.time_ns()}-"
+                    f"{uuid.uuid4().hex[:8]}.sqlite")
+                _publish_output(database, backup, backup_bytes, force=False)
+            except Exception:
+                transaction.rollback()
+                transaction.cleanup_terminal()
+                raise
             inserted = {}
             try:
                 with store.connection(timeout_ms=5000) as connection:
@@ -2258,6 +2625,7 @@ def import_data(database: Path, archive_path: Path) -> dict:
         "ok": True, "backup": str(backup), "inserted": inserted,
         "pending_restored": pending, "recovery_evidence": evidence,
         "preview": preview, "recovered_imports": recovered,
+        "disk_preflight": disk_preflight,
     }
 
 
@@ -2358,7 +2726,7 @@ def restore_replace_data(database: Path, archive_path: Path) -> dict:
     """Atomically replace active data from a complete archive, with rollback."""
     database = database.expanduser().resolve(strict=False)
     archive = _load_archive(archive_path)
-    if (archive.get("archive_version") != ARCHIVE_VERSION
+    if (archive.get("archive_version") not in {3, ARCHIVE_VERSION}
             or archive.get("manifest", {}).get("complete") is not True):
         raise StoreError(
             "incomplete_archive",
@@ -2366,7 +2734,8 @@ def restore_replace_data(database: Path, archive_path: Path) -> dict:
     try:
         with (inactive_application_lock(database, timeout=2.0),
               maintenance_lock(database, exclusive=True, timeout=2.0)):
-            _require_import_space(database, archive_path, replacement=True)
+            disk_preflight = _require_import_space(
+                database, archive_path, replacement=True)
             recovered = recover_import_transactions(database)
             preview, plan, file_operations, expected_schema = _replacement_plan(
                 database, archive)
@@ -2442,6 +2811,7 @@ def restore_replace_data(database: Path, archive_path: Path) -> dict:
         "inserted": inserted, "preview": preview,
         "pending_restored": pending_restored,
         "recovered_imports": recovered,
+        "disk_preflight": disk_preflight,
     }
 
 
@@ -2480,6 +2850,12 @@ def _parser() -> argparse.ArgumentParser:
     cleanup.add_argument(
         "--apply", action="store_true",
         help="remove only eligible roots verified against --archive")
+    lock_cleanup = commands.add_parser(
+        "cleanup-score-locks",
+        help="plan or remove obsolete per-request score lock files")
+    lock_cleanup.add_argument(
+        "--apply", action="store_true",
+        help="remove legacy locks while no game process is active")
     export = commands.add_parser("export", help="create a portable JSON archive")
     export.add_argument("output", type=Path)
     export.add_argument("--include-recovery", action="store_true")
@@ -2494,7 +2870,7 @@ def _parser() -> argparse.ArgumentParser:
         help="recover unfinished local journals before taking the snapshot")
     upgrade = commands.add_parser(
         "upgrade-archive",
-        help="rewrite a verified v2 archive with the v3 reader contract")
+        help="rewrite a verified v2 archive with the v4 reader contract")
     upgrade.add_argument("source", type=Path)
     upgrade.add_argument("output", type=Path)
     upgrade.add_argument(
@@ -2502,8 +2878,16 @@ def _parser() -> argparse.ArgumentParser:
         help="replace an existing ordinary upgraded archive")
     inspect_archive_parser = commands.add_parser(
         "inspect-archive",
-        help="validate an archive without opening or repairing local data")
+        help="inspect bounded structure and hashes without opening local data")
     inspect_archive_parser.add_argument("archive", type=Path)
+    inspect_header_parser = commands.add_parser(
+        "inspect-header",
+        help="alias for the structural archive inspection")
+    inspect_header_parser.add_argument("archive", type=Path)
+    verify_archive_parser = commands.add_parser(
+        "verify-archive",
+        help="deep-verify archive semantics against an isolated empty schema")
+    verify_archive_parser.add_argument("archive", type=Path)
     preview = commands.add_parser(
         "preview-import",
         help="recover local import journals, then compare an archive")
@@ -2546,13 +2930,17 @@ def main(argv: list[str] | None = None) -> int:
             result = cleanup_recovery_data(
                 database, older_than_days=args.older_than_days,
                 archive_path=args.archive, apply=args.apply)
+        elif args.command == "cleanup-score-locks":
+            result = cleanup_score_locks(database, apply=args.apply)
         elif args.command == "export":
             result = export_data(
                 database, args.output, args.include_recovery,
                 force=args.force, allow_partial=args.allow_partial,
                 repair_before_export=args.repair_before_export)
-        elif args.command == "inspect-archive":
+        elif args.command in {"inspect-archive", "inspect-header"}:
             result = inspect_archive(args.archive)
+        elif args.command == "verify-archive":
+            result = verify_archive(args.archive)
         elif args.command == "upgrade-archive":
             result = upgrade_archive(
                 database, args.source, args.output, force=args.force)

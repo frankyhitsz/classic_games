@@ -30,6 +30,8 @@ SCHEMA_VERSION = 7
 # ordinary bursts while still falling back far sooner than the old 5 s wait.
 DEFAULT_BUSY_TIMEOUT_MS = 250
 RECEIPT_RETENTION_DAYS = 180
+# Kept for source compatibility. Component receipts now follow the lifetime
+# of their authoritative state receipt instead of expiring after this age.
 STATE_MERGE_RECEIPT_RETENTION_DAYS = 365
 LEGACY_RULESET_VERSION = "legacy-v1"
 MAX_LEGACY_EXTRA_RAW_BYTES = 64 * 1024
@@ -377,7 +379,10 @@ class LocalGameStore:
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._delete_expired_receipts(conn, cutoff)
-            merge_cutoff = cutoff - STATE_MERGE_RECEIPT_RETENTION_DAYS * 86400
+            # Component receipts are part of the authoritative progress
+            # identity, not a time-based cache. Keep them for as long as the
+            # corresponding state receipt exists; otherwise an old component
+            # replay could erase progress after an arbitrary retention date.
             protected = tuple(dict.fromkeys(protected_merge_ids))
             if protected:
                 conn.execute(
@@ -387,20 +392,16 @@ class LocalGameStore:
                 conn.executemany(
                     "INSERT INTO protected_merge_ids(operation_id) VALUES(?)",
                     ((operation_id,) for operation_id in protected))
-                conn.execute(
-                    "DELETE FROM state_merge_receipts WHERE operation_id IN ("
-                    "SELECT operation_id FROM state_merge_receipts WHERE "
-                    "applied_at < ? AND NOT EXISTS (SELECT 1 FROM "
-                    "protected_merge_ids p WHERE p.operation_id="
-                    "state_merge_receipts.operation_id) "
-                    "ORDER BY applied_at LIMIT 500)",
-                    (merge_cutoff,))
-            else:
-                conn.execute(
-                    "DELETE FROM state_merge_receipts WHERE operation_id IN ("
-                    "SELECT operation_id FROM state_merge_receipts WHERE "
-                    "applied_at < ? ORDER BY applied_at LIMIT 500)",
-                    (merge_cutoff,))
+            conn.execute(
+                "DELETE FROM state_merge_receipts WHERE operation_id IN ("
+                "SELECT merge.operation_id FROM state_merge_receipts AS merge "
+                "LEFT JOIN state_receipts AS state "
+                "ON state.semantic_key=merge.semantic_key "
+                "WHERE state.semantic_key IS NULL "
+                + ("AND NOT EXISTS (SELECT 1 FROM protected_merge_ids p "
+                   "WHERE p.operation_id=merge.operation_id) "
+                   if protected else "")
+                + "ORDER BY merge.applied_at LIMIT 500)")
             conn.commit()
 
     def state_high_water(self) -> int:
@@ -2192,7 +2193,7 @@ class LocalGameStore:
                 or not 1 <= state_version <= 2147483647):
             raise StoreError("invalid_state_version", "invalid save state version")
         if (game_id == "2048" and isinstance(state, dict)
-                and state_version in (4, 5)):
+                and state_version in (4, 5, 6)):
             owner_token = state.get("owner_token")
             owner_status = state.get("owner_status")
             owner_epoch = state.get("owner_epoch", 0)
@@ -2205,7 +2206,7 @@ class LocalGameStore:
                     or type(slot_revision) is not int
                     or not 0 <= slot_revision <= (1 << 63) - 1):
                 raise StoreError("invalid_slot_owner", "invalid autosave owner")
-            if state_version == 5:
+            if state_version in (5, 6):
                 expected_owner = state.get("expected_owner_token")
                 expected_epoch = state.get("expected_owner_epoch")
                 expected_revision = state.get("expected_slot_revision")
@@ -2332,6 +2333,45 @@ class LocalGameStore:
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             applied_components: set[str] = set()
+            if method == "set_progress":
+                absorbed = conn.execute(
+                    "SELECT semantic_key,payload_hash FROM "
+                    "state_merge_receipts WHERE operation_id=?",
+                    (operation_id,)).fetchone()
+                if absorbed is not None:
+                    if (absorbed["semantic_key"] != key
+                            or absorbed["payload_hash"] != payload_hash):
+                        conn.rollback()
+                        raise StoreError(
+                            "state_operation_conflict",
+                            "progress component ID was already used for "
+                            "another state", 409)
+                    authoritative = self._authoritative_state(
+                        conn, method, state_ref)
+                    if authoritative is not None:
+                        current, _value_hash, _updated_at = authoritative
+                        winner = conn.execute(
+                            "SELECT logical_revision,operation_id FROM "
+                            "state_receipts WHERE semantic_key=?", (key,)
+                        ).fetchone()
+                        result = {
+                            **current, "duplicate_operation": True,
+                            "state_apply": "duplicate", "semantic_key": key,
+                            "logical_revision": revision,
+                            "operation_id": operation_id,
+                            "absorbed_component": True,
+                        }
+                        if winner is not None:
+                            result.update({
+                                "winning_logical_revision": int(
+                                    winner["logical_revision"]),
+                                "winning_operation_id": winner["operation_id"],
+                            })
+                        conn.commit()
+                        return result
+                    conn.execute(
+                        "DELETE FROM state_merge_receipts WHERE operation_id=?",
+                        (operation_id,))
             if method == "merge_progress":
                 for component in components:
                     merge_receipt = conn.execute(
@@ -2632,11 +2672,11 @@ class LocalGameStore:
                         "invalid_state_version", "invalid save state version")
                 self._require_profile(conn, profile_id)
                 if game_id == "2048" and isinstance(state, dict) \
-                        and state.get("version") in (4, 5):
+                        and state.get("version") in (4, 5, 6):
                     owner_token = state.get("owner_token")
                     owner_status = state.get("owner_status")
                     owner_epoch = (state.get("owner_epoch", 0)
-                                   if state.get("version") == 5 else 0)
+                                   if state.get("version") in (5, 6) else 0)
                     slot_revision = state.get("slot_revision", 0)
                     if (not isinstance(owner_token, str)
                             or not 16 <= len(owner_token) <= 64
@@ -2665,13 +2705,13 @@ class LocalGameStore:
                             if isinstance(current_state, dict) else None)
                         current_owner = (
                             current_state.get("owner_token")
-                            if current_version in (4, 5) else None)
+                            if current_version in (4, 5, 6) else None)
                         current_status = (
                             current_state.get("owner_status")
-                            if current_version in (4, 5) else "released")
+                            if current_version in (4, 5, 6) else "released")
                         current_epoch = (
                             current_state.get("owner_epoch", 0)
-                            if current_version in (4, 5) else 0)
+                            if current_version in (4, 5, 6) else 0)
                         current_revision = (
                             current_state.get("slot_revision", 0)
                             if isinstance(current_state, dict) else 0)
@@ -2690,11 +2730,11 @@ class LocalGameStore:
                             current_status == "active"
                             and current_owner == owner_token
                             and current_epoch == owner_epoch
-                            and (state.get("version") == 5
+                            and (state.get("version") in (5, 6)
                                  or current_version == 4))
                         if same_live_owner:
                             owner_match = slot_revision > current_revision
-                        elif state.get("version") == 5:
+                        elif state.get("version") in (5, 6):
                             expected_owner = state.get("expected_owner_token")
                             expected_epoch = state.get("expected_owner_epoch")
                             expected_revision = state.get(
@@ -2723,7 +2763,7 @@ class LocalGameStore:
                                     "current_slot_revision": current_revision,
                                     "current_value_hash": current_value_hash,
                                 })
-                    elif state.get("version") == 5:
+                    elif state.get("version") in (5, 6):
                         if (owner_epoch != 0
                                 or state.get("expected_owner_token") is not None
                                 or state.get("expected_owner_epoch") is not None
@@ -2781,6 +2821,14 @@ class LocalGameStore:
                     method=method, state_ref=state_ref, value_hash=value_hash,
                     receipt_kind="operation", result=result,
                     occurred_at=occurred_at, applied_at=now)
+            if method == "set_progress":
+                # A genuinely newer set establishes a new replacement
+                # baseline. Components from the superseded aggregate no
+                # longer describe the authoritative state and must not grow
+                # forever; its state receipt still orders any late replay.
+                conn.execute(
+                    "DELETE FROM state_merge_receipts WHERE semantic_key=?",
+                    (key,))
             if method == "merge_progress":
                 for component in components:
                     conn.execute(

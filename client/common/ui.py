@@ -8,6 +8,7 @@ the score and show the leaderboard.
 from __future__ import annotations
 
 import abc
+import logging
 import uuid
 from dataclasses import dataclass
 from typing import Callable, List, Optional
@@ -27,6 +28,7 @@ SAVE_SAVING = "saving"
 SAVE_SAVED = "saved"
 SAVE_PENDING = "pending"
 SAVE_FAILED = "failed"
+LOGGER = logging.getLogger(__name__)
 
 # ----------------------------------------------------------------------------
 # Palette
@@ -581,6 +583,21 @@ class BaseGame(abc.ABC):
         self._destructive_action_deadline = 0
         self.invalidate_overlay_leaderboard()
 
+    def restore_attempt_identity(self, attempt_uuid: str, revision: int) -> None:
+        """Restore every score identity field from one validated save point."""
+        if (not isinstance(attempt_uuid, str)
+                or not 16 <= len(attempt_uuid) <= 64
+                or any(not char.isascii()
+                       or (not char.isalnum() and char not in "-_")
+                       for char in attempt_uuid)
+                or type(revision) is not int
+                or not 0 <= revision <= (1 << 63) - 1):
+            raise ValueError("invalid saved attempt identity")
+        self.attempt_context.attempt_uuid = attempt_uuid
+        self.attempt_context.revision = revision
+        self._score_attempt_uuid = attempt_uuid
+        self._score_attempt_revision = revision
+
     def request_destructive_action(self, name: str,
                                    action: Callable[[], None]) -> bool:
         """Apply one save-aware guard to quit, reset, keys, and buttons."""
@@ -844,7 +861,21 @@ class BaseGame(abc.ABC):
             try:
                 self.before_close()
             except Exception:  # noqa: BLE001 - shutdown must still release SDL
-                pass
+                LOGGER.exception(
+                    "game before_close persistence failed",
+                    extra={"game_id": self.game_id,
+                           "attempt_uuid": self._score_attempt_uuid,
+                           "attempt_revision": self._score_attempt_revision})
+                notice = "退出时最后一条本机保存意图未能确认，请检查恢复状态"
+                reporter = getattr(
+                    self.backend, "report_recovery_notice", None)
+                if callable(reporter):
+                    try:
+                        reporter(notice)
+                    except Exception:  # noqa: BLE001
+                        LOGGER.exception(
+                            "failed to publish local recovery notice")
+                self.score_save_message = notice
             if self._owns_backend:
                 close_backend = getattr(self.backend, "close", None)
                 if callable(close_backend):

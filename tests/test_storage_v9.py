@@ -48,7 +48,7 @@ class ArchiveSafetyTests(unittest.TestCase):
                 export_data(database, archive)
             self.assertEqual(raised.exception.code, "export_target_exists")
             export_data(database, archive, force=True)
-            self.assertEqual(json.loads(archive.read_text())["archive_version"], 3)
+            self.assertEqual(json.loads(archive.read_text())["archive_version"], 4)
 
     def test_active_pending_round_trip_preserves_envelopes_and_state(self):
         with tempfile.TemporaryDirectory() as directory:

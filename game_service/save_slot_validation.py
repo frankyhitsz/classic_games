@@ -2,12 +2,36 @@
 
 from __future__ import annotations
 
+import random
+
 from .mutation import MAX_SCORE
 from .store import StoreError
 
 
+def _rng_tuple(value, *, depth: int = 0):
+    if depth > 4:
+        raise ValueError("RNG state is too deep")
+    if isinstance(value, list):
+        if len(value) > 1_000:
+            raise ValueError("RNG state is too large")
+        return tuple(_rng_tuple(item, depth=depth + 1) for item in value)
+    if value is None or type(value) in {int, float, str}:
+        return value
+    raise ValueError("RNG state contains an unsupported value")
+
+
+def restore_2048_rng_state(rng, value) -> None:
+    if value is None:
+        return
+    state = _rng_tuple(value)
+    probe = random.Random()
+    probe.setstate(state)
+    rng.setstate(state)
+
+
 def validate_2048_state(state) -> dict:
-    if not isinstance(state, dict) or state.get("version") not in {1, 2, 3, 4, 5}:
+    if (not isinstance(state, dict)
+            or state.get("version") not in {1, 2, 3, 4, 5, 6}):
         raise StoreError("invalid_2048_slot", "unsupported 2048 save version")
     version = state["version"]
     score = state.get("score")
@@ -36,7 +60,8 @@ def validate_2048_state(state) -> dict:
                 or any(not char.isascii()
                        or (not char.isalnum() and char not in "-_")
                        for char in attempt_uuid)
-                or type(revision) is not int or revision < 0
+                or type(revision) is not int
+                or not 0 <= revision <= (1 << 63) - 1
                 or type(slot_revision) is not int
                 or not 0 <= slot_revision <= (1 << 63) - 1
                 or (confirmed_score is not None
@@ -53,7 +78,7 @@ def validate_2048_state(state) -> dict:
                 or status not in {"active", "released"}
                 or type(epoch) is not int or not 0 <= epoch <= (1 << 63) - 1):
             raise StoreError("invalid_2048_slot", "invalid 2048 owner")
-    if version == 5:
+    if version in {5, 6}:
         expected_owner = state.get("expected_owner_token")
         expected_epoch = state.get("expected_owner_epoch")
         expected_revision = state.get("expected_slot_revision")
@@ -73,6 +98,20 @@ def validate_2048_state(state) -> dict:
                          or any(char not in "0123456789abcdef"
                                 for char in expected_hash)))):
             raise StoreError("invalid_2048_slot", "invalid 2048 expectation")
+    if version == 6:
+        move_digest = state.get("move_digest")
+        move_count = state.get("move_count")
+        if (not isinstance(move_digest, str) or len(move_digest) != 64
+                or any(char not in "0123456789abcdef" for char in move_digest)
+                or type(move_count) is not int
+                or not 0 <= move_count <= (1 << 63) - 1):
+            raise StoreError(
+                "invalid_2048_slot", "invalid 2048 replay identity")
+        try:
+            restore_2048_rng_state(random.Random(), state.get("rng_state"))
+        except (TypeError, ValueError) as exc:
+            raise StoreError(
+                "invalid_2048_slot", "invalid 2048 RNG state") from exc
     return state
 
 

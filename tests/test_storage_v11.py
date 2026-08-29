@@ -255,8 +255,10 @@ class ArchiveBoundaryTests(unittest.TestCase):
             output = root / "backup.json"
             result = export_data(
                 database, output, include_recovery=True, allow_partial=True)
-            self.assertFalse(result["complete"])
+            self.assertTrue(result["complete"])
             archive = json.loads(output.read_text(encoding="utf-8"))
+            self.assertFalse(archive["manifest"]["completeness"]
+                             ["forensic_evidence_complete"])
             paths = [item["path"] for item in archive["recovery_evidence"]]
             self.assertIn("pending-quarantine/nested/safe.bin", paths)
             self.assertTrue(any(item.get("omitted") == "unsafe_file_type"
