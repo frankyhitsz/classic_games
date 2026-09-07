@@ -41,7 +41,7 @@ def _commands(profile: str) -> list[tuple[str, list[str]]]:
         commands[:0] = [
             ("ruff", [sys.executable, "-m", "ruff", "check",
                       "client", "game_service", "server", "tests"]),
-            ("typing", [sys.executable, "-m", "mypy"]),
+            ("typing", [sys.executable, "-m", "tests.check_types"]),
             ("workflow-config", [sys.executable, "-m", "tests.check_workflows"]),
             ("dependency-audit", [sys.executable, "-m", "pip_audit",
                                   "--cache-dir", str(Path(tempfile.gettempdir())

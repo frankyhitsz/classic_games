@@ -24,28 +24,33 @@ def is_safe_regular(metadata) -> bool:
             and metadata.st_nlink == 1)
 
 
+def _check_rename_result(result: int, target: Path) -> None:
+    if result != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), str(target))
+
+
 def rename_noreplace(source: Path, target: Path) -> None:
     """Atomic no-clobber rename. Unsupported filesystems fail before publishing.
 
     Do not emulate this with link/unlink or an O_EXCL copy: both expose an
     unreadable final filename if the process dies halfway through publication.
     """
-    if os.name == "nt":
+    if sys.platform == "win32":
         os.rename(source, target)
         return
     library = ctypes.CDLL(None, use_errno=True)
     if sys.platform == "darwin":
         rename = library.renamex_np
         rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
-        args = (os.fsencode(source), os.fsencode(target), 4)  # RENAME_EXCL
+        rename.restype = ctypes.c_int
+        _check_rename_result(rename(os.fsencode(source), os.fsencode(target), 4), target)
     elif sys.platform.startswith("linux") and hasattr(library, "renameat2"):
         rename = library.renameat2
         rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
                            ctypes.c_char_p, ctypes.c_uint)
-        args = (-100, os.fsencode(source), -100, os.fsencode(target), 1)
+        rename.restype = ctypes.c_int
+        _check_rename_result(rename(-100, os.fsencode(source), -100, os.fsencode(target), 1),
+                             target)
     else:
         raise OSError(errno.ENOTSUP, "atomic no-replace rename unavailable")
-    rename.restype = ctypes.c_int
-    if rename(*args) != 0:
-        code = ctypes.get_errno()
-        raise OSError(code, os.strerror(code), str(target))

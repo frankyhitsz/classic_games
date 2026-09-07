@@ -43,7 +43,10 @@
 - 实现提交 `7d82db6` 已推送到 origin/main。CI #50 在解析 YAML 时失败，尚未创建测试 job：
   单行 run 中 `--only-binary=:all:` 后的冒号被当作 YAML 分隔符。
 - 已把四处安装命令改为 YAML 多行字符串，并新增本地 workflow-config 解析门禁及 hash-locked PyYAML；
-  本地配置检查通过。修复提交和远端测试结果待补。
+  本地配置检查通过，修复提交 `fd18ee6` 已推送。完整本机 release 十一个阶段全部通过。
+- CI #51 的 Windows mypy 报 POSIX 分支局部名未定义；运行时提前返回没有问题，但原 os.name 判断
+  未被静态分析识别。已将系统调用及结果检查放在各自平台分支内，并增加三目标平台的本地类型预检。
+  CI #51 其余六个 job 通过；Windows 继续验证修正后的结果。
 
 ## 第一轮复查
 
