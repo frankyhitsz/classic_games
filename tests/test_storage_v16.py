@@ -329,6 +329,34 @@ class RecoveryTests(Fixture):
 
 
 class ArchiveTests(Fixture):
+    def test_binary_snapshot_and_digest_preserve_all_bytes(self):
+        from game_service.data_cli import _hash_regular_nofollow, _read_regular_nofollow
+        from game_service.import_transaction import _read_file_snapshot
+        raw = bytes(range(256)) * 8192 + b"\r\n\x1aafter-eof\r\n"
+        source = self.root / "binary-evidence"
+        source.write_bytes(raw)
+        expected = (len(raw), hashlib.sha256(raw).hexdigest())
+        self.assertEqual(_hash_regular_nofollow(source), expected)
+        self.assertEqual(_read_regular_nofollow(source, len(raw)), raw)
+        self.assertEqual(_read_file_snapshot(source, len(raw)), (raw, *expected))
+
+    def test_lock_inventory_uses_fresh_link_counts(self):
+        from game_service.data_cli import _score_lock_inventory
+        root = self.root / "pending"
+        root.mkdir()
+        path = root / ".old-request.lock"
+        path.write_bytes(b"\0")
+        entry = SimpleNamespace(name=path.name, path=str(path))
+
+        @contextmanager
+        def entries(_root):
+            yield iter([entry])
+
+        with patch("game_service.data_cli.os.scandir", entries):
+            inventory = _score_lock_inventory(root)
+        self.assertEqual(inventory["legacy"], 1)
+        self.assertEqual(inventory["unsafe"], 0)
+
     def test_memory_error_has_stable_public_error(self):
         from game_service import data_cli
         with patch.object(data_cli, "_archive_ruleset_catalog", side_effect=MemoryError):

@@ -435,7 +435,8 @@ def _score_lock_inventory(path: Path) -> dict:
                 if not (name.startswith(".") and name.endswith(".lock")):
                     continue
                 try:
-                    metadata = entry.stat(follow_symlinks=False)
+                    # DirEntry.stat() omits link counts on Windows.
+                    metadata = os.lstat(entry.path)
                 except OSError:
                     unsafe.append(name)
                     continue
@@ -465,7 +466,7 @@ def _read_regular_nofollow(path: Path, limit: int) -> bytes:
         if (not is_safe_regular(before) or before.st_nlink > 1
                 or before.st_size > limit):
             raise OSError("unsafe or oversized file")
-        flags = os.O_RDONLY
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(path, flags)
@@ -502,7 +503,7 @@ def _hash_regular_nofollow(path: Path) -> tuple[int, str]:
         before = os.lstat(path)
         if not is_safe_regular(before) or before.st_nlink > 1:
             raise OSError("unsafe recovery file")
-        flags = os.O_RDONLY
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(path, flags)
@@ -803,7 +804,7 @@ def export_transaction_data(database: Path, transaction_name: str,
                 raise StoreError(
                     "transaction_too_large", "transaction has too many files")
             for entry in candidates:
-                metadata = entry.stat(follow_symlinks=False)
+                metadata = os.lstat(entry.path)
                 if (not is_safe_regular(metadata)
                         or metadata.st_nlink > 1):
                     files.append({"path": entry.name,

@@ -137,7 +137,7 @@ def _read_file_snapshot(path: Path, limit: int) -> tuple[bytes, int, str]:
         if (not is_safe_regular(metadata)
                 or metadata.st_nlink > 1):
             raise OSError("not a regular transaction file")
-        flags = os.O_RDONLY
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         descriptor = os.open(path, flags)
@@ -470,7 +470,7 @@ class ImportTransaction:
                     or metadata.st_nlink > 1
                     or metadata.st_size > MAX_TRANSACTION_FILE_BYTES):
                 raise OSError("unsafe import journal")
-            flags = os.O_RDONLY
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             descriptor = os.open(journal_path, flags)

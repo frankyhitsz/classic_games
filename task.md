@@ -47,6 +47,11 @@
 - CI #51 的 Windows mypy 报 POSIX 分支局部名未定义；运行时提前返回没有问题，但原 os.name 判断
   未被静态分析识别。已将系统调用及结果检查放在各自平台分支内，并增加三目标平台的本地类型预检。
   CI #51 其余六个 job 通过；Windows 继续验证修正后的结果。
+- CI #52 的 Windows 类型检查通过，storage 揭示两个真实平台差异：底层 `os.read` 需要二进制标志，
+  否则 CRLF/0x1a 会改变读取字节；`DirEntry.stat()` 在 Windows 返回的链接数为 0，不能用于安全类型判断。
+  已为文件读取显式指定 O_BINARY，目录项检查改为新鲜 lstat，保留拒绝硬链接与 reparse point 的约束。
+  新增全字节二进制往返/摘要与无缓存链接数测试。行为依据见
+  [Python 3.11 os 文档](https://docs.python.org/3.11/library/os.html#os.open)及其 DirEntry.stat 说明。
 
 ## 第一轮复查
 
