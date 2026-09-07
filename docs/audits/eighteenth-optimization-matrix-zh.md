@@ -54,8 +54,8 @@
 | --- | --- | --- | --- |
 | CG18-P1-01 | Preparing root先rename再删 | 完成 | preparing 先迁 cleanup；改名失败保留原目录。 |
 | CG18-P1-02 | Preparing cleanup namespace | 完成 | preparing 先迁 cleanup；改名失败保留原目录。 |
-| CG18-P1-03 | SafeTreeWalker | 部分 | 共享 no-follow/reparse predicates；Windows 测试交给 CI，全树 descriptor/budget 抽象未完成。 |
-| CG18-P1-04 | Windows junction实机test | 部分 | 共享 no-follow/reparse predicates；Windows 测试交给 CI，全树 descriptor/budget 抽象未完成。 |
+| CG18-P1-03 | SafeTreeWalker | 部分 | 共享 no-follow/reparse predicates；全树 descriptor/budget 抽象未完成。 |
+| CG18-P1-04 | Windows junction实机test | 完成 | GitHub Windows runner 的根目录和子目录 junction 检查通过；CI #53 storage 通过。 |
 | CG18-P1-05 | Recovery lock deadline传播 | 完成 | 恢复锁使用剩余 deadline；不声称能中断阻塞的文件系统调用。 |
 | CG18-P1-06 | Nonblocking recovery try-lock | 完成 | 恢复锁使用剩余 deadline；不声称能中断阻塞的文件系统调用。 |
 | CG18-P1-07 | Winner identity in Store result | 完成 | Store winner hash/revision/ID 与 backend semantic status、operation event 分离。 |

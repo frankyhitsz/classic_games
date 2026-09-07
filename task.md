@@ -9,7 +9,7 @@
 - [x] 第一轮独立复查、修复和复验。
 - [x] 第二轮独立复查、修复和复验。
 - [x] 更新 30 条答复、162 项优化矩阵与协议文档。
-- [ ] 提交、推送和远端 CI。
+- [x] 提交、推送和远端 CI（实现提交 `03ea7e8`，CI #53 七个 job 通过）。
 
 ## 已核实
 
@@ -25,11 +25,11 @@
 
 最终本机检查：
 
-- storage 共 331 项，329 通过、2 项 Windows 专用跳过；v16 新增 37 项定向检查。
+- storage 共 333 项，331 通过、2 项 Windows 专用跳过；v16 新增 39 项定向检查。
 - Ruff（包含新 B012/B018）与三个核心契约/工具模块 mypy 通过。
 - Windows/Linux wheel 下载均通过 require-hashes 校验；macOS 在隔离环境强制重装全部 hash-locked 依赖成功。
 - 20,000 步 gameplay stress、100 次资源循环（FD 18→18）、240 次并发写入及 integrity check 通过。
-- release 环境的同步 local-save p99 约 2.42 ms；锁竞争下提交入队 p99 约 0.046 ms。它们不是同一种计时，
+- 最后一次 release 的同步 local-save p99 约 2.88 ms；锁竞争下提交入队 p99 约 0.045 ms。它们不是同一种计时，
   不用同步写入数据冒充 enqueue 指标。
 - storage+stress 的 Store/Archive/Transaction 分支覆盖率合计约 79%，尚未达到 90%。
 - 初次最终 release 因新测试比较 macOS /var 与 /private/var 路径别名失败；路径断言已改为 canonical path，
@@ -37,6 +37,8 @@
 - 最终 107 项 gameplay/API 通过；合并 coverage 后全仓约 78%。CI 全仓下限由 60% 提高到 75%，
   Store/Archive/Transaction 另设 75% 下限；没有修改测试排除项。
 - 包版本 0.10.0 的 wheel/sdist 安装、只读用户数据 smoke、SBOM/manifest、依赖漏洞审计均通过。
+- Windows 文件修正后，本机完整 release 十一个阶段再次全部通过；机器可读结果保存在
+  `/private/tmp/classic-games-eighteenth-verified.json` 与同名前缀的 JUnit XML。
 
 ## GitHub 交付
 
@@ -52,6 +54,10 @@
   已为文件读取显式指定 O_BINARY，目录项检查改为新鲜 lstat，保留拒绝硬链接与 reparse point 的约束。
   新增全字节二进制往返/摘要与无缓存链接数测试。行为依据见
   [Python 3.11 os 文档](https://docs.python.org/3.11/library/os.html#os.open)及其 DirEntry.stat 说明。
+- 实现提交 `03ea7e8` 的 [CI #53](https://github.com/frankyhitsz/classic_games/actions/runs/34081282128)
+  七个 job 全部通过：Linux/macOS/Windows、Python 3.12/3.13、最小依赖和完整 release gate。
+  Windows 专用 junction 测试实际执行通过；平台 job 的 storage、stress、gameplay 与覆盖率门禁均通过。
+  本机无 gh 可执行文件，推送使用已配置 SSH git；远端 CI 通过已有 GitHub 连接器只读核验。
 
 ## 第一轮复查
 
