@@ -190,15 +190,15 @@ classic_games/
 同目录下的 `pending/` 保存尚未写入数据库的记录，每个请求使用一个独立 JSON
 文件。文件带版本、payload hash、attempt UUID 和 revision，可由多个进程安全
 写入；无法解析的文件会原样移入 `pending-quarantine/`，不会阻止游戏启动。
-score 写入使用 256 个固定 stripe lock，不会再为每次成绩永久增加 lock 文件；旧版 lock 可在关闭所有
-游戏后用 `classic-games-data cleanup-score-locks --apply` 清理。
+score 写入使用 256 个固定 stripe lock，并在兼容 0.8 的过渡期同时取得旧式 request lock。
+旧式锁文件可在关闭所有游戏后用 `classic-games-data cleanup-score-locks --apply` 清理；运行时不能删除。
 单个文件上限为 64 KiB，数量或总大小异常时启动器会提示。运行中的启动器也会
 发现其他实例后来写入的待保存文件。
 `pending-state/` 使用每个档案或存档键一个文件的状态日志，保存最新昵称、设置、关卡进度和
 自动存档。schema 3 日志冻结 ruleset，用跨进程文件锁串行同一 key，以持久 logical revision
 防止晚到旧值覆盖新值；`merge_progress` 为每次贡献记录 component ID/hash 后按游戏规则单调合并，
 兼容的 `set_progress` 则按完整 revision/operation ID 做 LWW，不会被误当成空 component 增量。
-数据库 schema v7 在同一事务保存状态值、业务值 hash 和胜出回执；旧库升级先为既有状态建立
+数据库 schema v8 在同一事务保存状态值、业务值 hash、胜出回执和重置/删除屏障；旧库升级先为既有状态建立
 基线，因此 journal 已删除、业务行隔离或时钟损坏后仍能按权威值恢复。数据库解除锁定后会自动
 补写，成功后仅在 hash 仍匹配时删除对应日志。损坏的状态文件移入
 `pending-state-quarantine/`；v1 升级原件保存在 `pending-state-migration-backup/`。替换同一状态键前会先
@@ -217,10 +217,11 @@ python -m game_service.data_cli export classic-games-backup.json --include-recov
 python -m game_service.data_cli inspect-archive classic-games-backup.json
 python -m game_service.data_cli verify-archive classic-games-backup.json
 python -m game_service.data_cli preview-import classic-games-backup.json
+python -m game_service.data_cli preview-replace classic-games-backup.json
 python -m game_service.data_cli transactions
 ```
 
-0.6.0 生成的 manifest format 2 archive 可先升级，再用于精确替换。更早的 format-less v2 没有
+完整 v3 备份可直接覆盖恢复，也可与 manifest format 2 的 v2 备份一样先升级到 v4。更早的 format-less v2 没有
 active reject/restore inventory，升级命令会保留为 merge-only 并列出无法证明的部分，不会擅自授予
 replace 权限：
 
@@ -254,8 +255,14 @@ python -m game_service.data_cli import classic-games-backup.json --apply
 archive 不允许替换：
 
 ```bash
-python -m game_service.data_cli restore-replace classic-games-backup.json --apply
+python -m game_service.data_cli preview-replace classic-games-backup.json
+python -m game_service.data_cli restore-replace classic-games-backup.json --apply --plan-fingerprint <预览返回的指纹>
 ```
+
+预览会列出替换的表、待写入/删除文件、备份目录和空间估计；本机数据在确认期间改变时会拒绝执行。
+成功导出前会使用当前 reader 和空数据库验证内容。输出采用不覆盖目标的原子改名；不支持该操作的
+文件系统会明确报错，不使用可能留下半份输出的复制回退。导入成功但清理暂未完成时，结果包含
+`business_outcome=COMMITTED` 和 `cleanup_state=PENDING`，无需重复导入。
 
 导入先写 staging 和阶段 journal，再提交数据库并原子发布文件。任一阶段失败会自动恢复导入前的
 数据库和 journal；进程在中途退出时，下一次普通客户端、HTTP 服务或维护命令会在打开数据库前

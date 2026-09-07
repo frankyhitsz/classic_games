@@ -242,11 +242,15 @@ class ReceiptRecoveryTests(unittest.TestCase):
                 (profile_id, "2048", "autosave", {"version": 3}, ruleset),
                 2, "slot")
             store.apply_state_operation(operation)
-            self.assertTrue(store.quarantine_slot(
-                profile_id, "2048", "autosave", "manual_test"))
+            saved = store.load_slot(profile_id, "2048", "autosave")
+            self.assertEqual(store.quarantine_slot(
+                profile_id, "2048", "autosave", "manual_test",
+                expected_value_hash=saved["value_hash"],
+                expected_ruleset=saved["ruleset_version"],
+                expected_state_version=saved["state_version"])["status"], "QUARANTINED")
             self.assertIsNone(store.get_state_receipt(key))
-            store.apply_state_operation(operation)
-            self.assertIsNotNone(store.load_slot(profile_id, "2048", "autosave"))
+            self.assertTrue(store.apply_state_operation(operation)["superseded"])
+            self.assertIsNone(store.load_slot(profile_id, "2048", "autosave"))
 
 
 class BaselineMigrationTests(unittest.TestCase):

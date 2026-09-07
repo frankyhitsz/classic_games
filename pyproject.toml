@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "classic-games-hub"
-version = "0.9.0"
+version = "0.10.0"
 description = "Five local-first pygame classics with SQLite records"
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -24,6 +24,7 @@ dev = [
     "ruff>=0.6",
     "pip-audit>=2.10,<3",
     "build>=1.5,<2",
+    "mypy>=2.3,<3",
 ]
 
 [project.scripts]
@@ -42,7 +43,12 @@ target-version = "py311"
 # Keep CI on the project's established correctness checks. Ruff 0.16 changed
 # its implicit rule set; new modernization/style families are adopted only
 # after a dedicated cleanup instead of turning an unrelated release red.
-select = ["E4", "E7", "E9", "F"]
+select = ["E4", "E7", "E9", "F", "B012", "B018"]
+
+[tool.mypy]
+files = ["game_service/service.py", "game_service/safe_fs.py", "game_service/sokoban_history.py"]
+follow_imports = "silent"
+check_untyped_defs = true
 
 [tool.coverage.run]
 branch = true

@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Any, Optional, Protocol
+from typing import Any, Literal, Optional, Protocol, TypedDict
 
 from .catalog import GAME_BY_ID
 from .profile import ProfileIdentity
@@ -72,6 +72,22 @@ class SlotLoadStatus(str, Enum):
     TEMPORARY_FAILURE = "temporary_failure"
     PROFILE_PENDING = "profile_pending"
     CORRUPT = "corrupt"
+
+
+class SlotQuarantineReceipt(TypedDict, total=False):
+    ok: bool
+    status: Literal["QUARANTINED", "CHANGED", "ABSENT", "BUSY", "FAILED"]
+    committed: bool
+    retryable: bool
+    logical_revision: int
+
+
+@dataclass(frozen=True)
+class BackendCloseResult:
+    read_drained: bool
+    write_drained: bool
+    lease_released: bool
+    background_completion: bool
 
 
 @dataclass(frozen=True)
@@ -223,7 +239,8 @@ class GameDataService(Protocol):
 
     def quarantine_slot_async(
             self, profile_id: str, game_id: str,
-            slot_id: str, reason: str): ...
+            slot_id: str, reason: str, *, expected_value_hash: str,
+            expected_ruleset: str, expected_state_version: int): ...
 
     def submit_score_reliable_async(
             self, game_id: str, player: str, score: int, *, extra=None,
@@ -252,4 +269,4 @@ class GameDataService(Protocol):
 
     def report_recovery_notice(self, message: str) -> None: ...
 
-    def close(self): ...
+    def close(self) -> BackendCloseResult: ...

@@ -233,7 +233,7 @@ class ArchiveBoundaryTests(unittest.TestCase):
                 Path(destination).write_bytes(b"winner")
                 raise FileExistsError
 
-            with patch("game_service.data_cli.os.link", side_effect=racing_link):
+            with patch("game_service.data_cli.rename_noreplace", side_effect=racing_link):
                 with self.assertRaises(StoreError) as raised:
                     export_data(database, output)
             self.assertEqual(raised.exception.code, "export_target_exists")

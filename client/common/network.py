@@ -15,7 +15,7 @@ from typing import Any, Dict, Optional
 
 import requests
 
-from game_service.service import parse_score_response
+from game_service.service import BackendCloseResult, parse_score_response
 
 DEFAULT_BASE = os.environ.get("GAMES_API_URL", "http://127.0.0.1:5000")
 TIMEOUT = (0.30, 0.70)  # local connect/read timeouts
@@ -44,6 +44,7 @@ class BackendClient:
         self._save_sequence = 0
         self._retrying_request_ids: set[str] = set()
         self._closed = False
+        self._close_complete = threading.Event()
 
     def _session(self) -> requests.Session:
         session = getattr(self._thread_local, "session", None)
@@ -93,11 +94,12 @@ class BackendClient:
                 self._condition.wait(remaining)
             return True
 
-    def close(self) -> None:
+    def close(self) -> BackendCloseResult:
         """Close worker and HTTP resources. Safe to call more than once."""
         with self._lock:
             if self._closed:
-                return
+                complete = self._close_complete.is_set()
+                return BackendCloseResult(complete, complete, True, not complete)
             self._closed = True
             executor = self._executor
             self._executor = None
@@ -108,6 +110,8 @@ class BackendClient:
             self._sessions.clear()
         for session in sessions:
             session.close()
+        self._close_complete.set()
+        return BackendCloseResult(True, True, True, False)
 
     def _request_allowed(self, kind: str) -> bool:
         with self._lock:

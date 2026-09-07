@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from .store import StoreError
+from .safe_fs import is_safe_directory, is_safe_regular
 
 MAX_TRANSACTION_FILE_BYTES = 16 * 1024 * 1024
 MAX_TRANSACTION_TOTAL_BYTES = 128 * 1024 * 1024
@@ -34,6 +35,24 @@ def _preparing_pattern(database: Path) -> str:
 
 def _cleanup_pattern(database: Path) -> str:
     return f".{database.name}.transaction-cleanup-*"
+
+
+def _retire_preparation(database: Path, root: Path) -> Path | None:
+    cleanup = root.with_name(
+        f".{database.name}.transaction-cleanup-preparing-{uuid.uuid4().hex}")
+    try:
+        os.replace(root, cleanup)
+        _fsync_directory(root.parent)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return root
+    try:
+        shutil.rmtree(cleanup)
+        _fsync_directory(cleanup.parent)
+    except OSError:
+        return cleanup
+    return None
 
 
 def _reject_json_constant(value: str):
@@ -115,7 +134,7 @@ def _write_file(path: Path, data: bytes) -> None:
 def _read_file_snapshot(path: Path, limit: int) -> tuple[bytes, int, str]:
     try:
         metadata = os.lstat(path)
-        if (not stat.S_ISREG(metadata.st_mode)
+        if (not is_safe_regular(metadata)
                 or metadata.st_nlink > 1):
             raise OSError("not a regular transaction file")
         flags = os.O_RDONLY
@@ -124,7 +143,7 @@ def _read_file_snapshot(path: Path, limit: int) -> tuple[bytes, int, str]:
         descriptor = os.open(path, flags)
         try:
             opened = os.fstat(descriptor)
-            if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink > 1
+            if (not is_safe_regular(opened) or opened.st_nlink > 1
                     or (metadata.st_dev, metadata.st_ino)
                     != (opened.st_dev, opened.st_ino)):
                 raise OSError("transaction file changed while opening")
@@ -249,10 +268,10 @@ def _ensure_safe_target(database: Path, target: Path) -> Path:
         if stat.S_ISLNK(metadata.st_mode):
             raise StoreError(
                 "unsafe_import_target", "import target contains a symbolic link")
-        if cursor != candidate and not stat.S_ISDIR(metadata.st_mode):
+        if cursor != candidate and not is_safe_directory(metadata):
             raise StoreError(
                 "unsafe_import_target", "import target parent is not a directory")
-        if cursor == candidate and not stat.S_ISREG(metadata.st_mode):
+        if cursor == candidate and not is_safe_regular(metadata):
             raise StoreError(
                 "unsafe_import_target", "import target is not an ordinary file")
     resolved = candidate.resolve(strict=False)
@@ -439,7 +458,7 @@ class ImportTransaction:
             return transaction
         except Exception:
             if not published:
-                shutil.rmtree(preparing_root, ignore_errors=True)
+                _retire_preparation(database, preparing_root)
             raise
 
     @classmethod
@@ -447,7 +466,7 @@ class ImportTransaction:
         try:
             journal_path = root / "journal.json"
             metadata = os.lstat(journal_path)
-            if (not stat.S_ISREG(metadata.st_mode)
+            if (not is_safe_regular(metadata)
                     or metadata.st_nlink > 1
                     or metadata.st_size > MAX_TRANSACTION_FILE_BYTES):
                 raise OSError("unsafe import journal")
@@ -624,6 +643,9 @@ class ImportTransaction:
         if phase not in {"PREPARED", "DB_APPLIED", "FILES_PUBLISHED",
                          "COMPLETED", "ROLLED_BACK"}:
             raise ValueError("invalid import transaction phase")
+        if (self.journal.get("phase") in {"COMPLETED", "ROLLED_BACK"}
+                and phase != self.journal["phase"]):
+            raise ValueError("terminal import outcome cannot change")
         self.journal["phase"] = phase
         self._write_journal()
 
@@ -756,9 +778,15 @@ class ImportTransaction:
                 500,
             ) from exc
 
-    def finish(self) -> None:
-        self.mark("COMPLETED")
-        self.cleanup_terminal()
+    def finish(self) -> dict:
+        if self.journal.get("phase") != "ROLLED_BACK":
+            self.mark("COMPLETED")
+        pending = self.cleanup_terminal()
+        return {"business_outcome": (
+                    "ROLLED_BACK" if self.journal["phase"] == "ROLLED_BACK"
+                    else "COMMITTED"),
+                "cleanup_state": "PENDING" if pending else "CLEAN",
+                "cleanup_path": str(pending) if pending else None}
 
     def cleanup_terminal(self) -> Path | None:
         """Retire a terminal root atomically before best-effort deletion."""
@@ -771,16 +799,16 @@ class ImportTransaction:
         identity = self.root.name.split(".import-", 1)[-1]
         cleanup = self.root.with_name(
             f".{self.database.name}.transaction-cleanup-{identity}")
-        os.replace(self.root, cleanup)
-        _fsync_directory(cleanup.parent)
-        self.root = cleanup
         try:
+            os.replace(self.root, cleanup)
+            self.root = cleanup
+            _fsync_directory(cleanup.parent)
             shutil.rmtree(cleanup)
+            _fsync_directory(cleanup.parent)
         except OSError:
             # A locked antivirus/indexer handle can leave cleanup pending,
             # but this namespace is never classified as an active import.
-            return cleanup
-        _fsync_directory(cleanup.parent)
+            return self.root
         return None
 
 
@@ -791,7 +819,7 @@ def classify_import_transaction_root(database: Path, root: Path) -> dict:
               "error": None}
     try:
         metadata = os.lstat(root)
-        if (not stat.S_ISDIR(metadata.st_mode)
+        if (not is_safe_directory(metadata)
                 or getattr(metadata, "st_file_attributes", 0)
                 & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
             raise StoreError(
@@ -827,7 +855,7 @@ def recover_import_transactions(database: Path, *,
     for cleanup in sorted(database.parent.glob(_cleanup_pattern(database))):
         try:
             metadata = os.lstat(cleanup)
-            if (stat.S_ISDIR(metadata.st_mode)
+            if (is_safe_directory(metadata)
                     and not getattr(metadata, "st_file_attributes", 0)
                     & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
                 shutil.rmtree(cleanup)
@@ -836,14 +864,13 @@ def recover_import_transactions(database: Path, *,
             pass
     for root in sorted(database.parent.glob(_preparing_pattern(database))):
         metadata = os.lstat(root)
-        if (not stat.S_ISDIR(metadata.st_mode)
+        if (not is_safe_directory(metadata)
                 or getattr(metadata, "st_file_attributes", 0)
                 & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
             raise StoreError(
                 "import_recovery_required",
                 f"unsafe import preparation root: {root.name}")
-        shutil.rmtree(root)
-        _fsync_directory(database.parent)
+        _retire_preparation(database, root)
     unfinished: list[ImportTransaction] = []
     for root in sorted(database.parent.glob(_transaction_pattern(database))):
         classification = classify_import_transaction_root(database, root)

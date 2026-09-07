@@ -11,6 +11,8 @@ Symbol legend in level strings:
 """
 from __future__ import annotations
 
+from game_service.sokoban_history import decode_history, encode_history
+
 import math
 from typing import List, Optional, Tuple
 
@@ -307,6 +309,8 @@ class Sokoban(BaseGame):
         self._campaign_snapshot = None
         self._campaign_session_load_future = None
         self._campaign_session_save_future = None
+        self._campaign_session_queued = None
+        self._pending_practice_level = None
         self._campaign_session_save_signature = None
         self._campaign_session_confirmed_signature = None
         self._restored_campaign_session_active = False
@@ -393,16 +397,12 @@ class Sokoban(BaseGame):
         if not active or snapshot is None:
             return {"version": 1, "active": False}
         return {
-            "version": 1, "active": True,
+            "version": 2, "active": True,
             "level_idx": snapshot["level_idx"],
             "boxes": [list(point) for point in sorted(snapshot["boxes"])],
             "player_pos": list(snapshot["player_pos"]),
             "moves": snapshot["moves"], "pushes": snapshot["pushes"],
-            "history": [
-                [list(position), [list(point) for point in sorted(boxes)],
-                 moves, pushes]
-                for position, boxes, moves, pushes in snapshot["history"]
-            ],
+            "commands": encode_history(snapshot["history"], snapshot["player_pos"]),
             "score": snapshot["score"], "state": snapshot["state"],
             "total_score": self.total_score,
             "level_scores": {str(key): value
@@ -412,10 +412,17 @@ class Sokoban(BaseGame):
             "attempt_revision": self.attempt_context.revision,
         }
 
-    def _persist_campaign_session(self, *, active: bool) -> bool:
-        value = self._campaign_session_value(active=active)
+    def _persist_campaign_session(self, *, active: bool, async_only: bool = False) -> bool:
+        try:
+            value = self._campaign_session_value(active=active)
+        except (ValueError, KeyError):
+            self._progress_save_messages["campaign"] = "闯关现场超过保存步数限制，未进入练习"
+            return False
         signature = canonical_json(value)
-        publish = getattr(self.backend, "publish_slot_intent", None)
+        if len(signature.encode("utf-8")) > 60 * 1024:
+            self._progress_save_messages["campaign"] = "闯关现场超过保存大小限制，未进入练习"
+            return False
+        publish = (None if async_only else getattr(self.backend, "publish_slot_intent", None))
         if callable(publish):
             try:
                 receipt = publish(
@@ -429,10 +436,9 @@ class Sokoban(BaseGame):
                     self._progress_save_messages["campaign"] = (
                         "较新的闯关现场已保留")
                     return False
-                capabilities = getattr(self.backend, "capabilities", ())
-                if ("durable_slot_intent" in capabilities
-                        or isinstance(receipt, dict)
-                        and receipt.get("durable_pending") is True):
+                if (isinstance(receipt, dict) and receipt.get("ok") is True
+                        and (receipt.get("durable_pending") is True
+                             or receipt.get("committed") is True)):
                     self._campaign_session_confirmed_signature = signature
                     self._restored_campaign_session_active = active
                     return True
@@ -445,6 +451,7 @@ class Sokoban(BaseGame):
         if callable(save):
             if (self._campaign_session_save_future is not None
                     and not self._campaign_session_save_future.done()):
+                self._campaign_session_queued = (value, signature, active)
                 self._progress_save_messages["campaign"] = (
                     "正在确认闯关现场已保存")
                 return False
@@ -476,19 +483,39 @@ class Sokoban(BaseGame):
         try:
             result = future.result()
         except Exception:  # noqa: BLE001
-            self._progress_save_messages["campaign"] = "闯关现场暂时未保存"
-            return
-        if (not isinstance(result, dict)
-                or result.get("ok", True) is not False):
+            result = {"ok": False}
+        if (isinstance(result, dict) and result.get("ok") is True
+                and (result.get("committed") is True
+                     or result.get("state_apply") in {"committed", "duplicate"}
+                     or result.get("durable_pending") is True)):
             if signature is not None:
                 self._campaign_session_confirmed_signature = signature[0]
                 self._restored_campaign_session_active = signature[1]
             self._progress_save_messages["campaign"] = ""
         else:
             self._progress_save_messages["campaign"] = "闯关现场暂时未保存"
+        queued = self._campaign_session_queued
+        self._campaign_session_queued = None
+        if queued is not None and queued[1] != self._campaign_session_confirmed_signature:
+            try:
+                self._campaign_session_save_future = self.backend.save_slot_async(
+                    self.profile_id, self.game_id, CAMPAIGN_SESSION_SLOT,
+                    queued[0], self.attempt_context.ruleset_version)
+                self._campaign_session_save_signature = queued[1:]
+            except Exception:  # noqa: BLE001
+                self._progress_save_messages["campaign"] = "闯关现场暂时未保存"
+            return
+        target = self._pending_practice_level
+        if target is not None:
+            self._pending_practice_level = None
+            if (signature is not None and signature[1]
+                    and self._campaign_session_confirmed_signature == signature[0]):
+                self.load_level(target, practice=True, new_campaign=False)
+            else:
+                self._campaign_snapshot = None
 
     def _restore_campaign_session(self, value) -> bool:
-        if (not isinstance(value, dict) or value.get("version") != 1
+        if (not isinstance(value, dict) or value.get("version") not in {1, 2}
                 or value.get("active") is not True
                 or type(value.get("level_idx")) is not int
                 or not 0 <= value["level_idx"] < len(LEVELS)
@@ -496,7 +523,7 @@ class Sokoban(BaseGame):
                 or type(value.get("pushes")) is not int
                 or not 0 <= value["pushes"] <= value["moves"] <= MAX_SCORE
                 or type(value.get("score")) is not int
-                or not 0 <= value["score"] <= MAX_SCORE
+                or value["score"] != 0
                 or type(value.get("total_score")) is not int
                 or not 0 <= value["total_score"] <= MAX_SCORE
                 or not isinstance(value.get("attempt_uuid"), str)
@@ -513,6 +540,18 @@ class Sokoban(BaseGame):
                 parse_level(LEVELS[value["level_idx"]]))
             boxes = self._session_points(value["boxes"])
             player_pos = self._session_point(value["player_pos"])
+            if value["version"] == 2:
+                if "history" in value:
+                    return False
+                restored, end_player, end_boxes, end_pushes = decode_history(
+                    value.get("commands"), initial_player, initial_boxes, floors)
+                if (end_player != player_pos or end_boxes != boxes
+                        or end_pushes != value["pushes"]
+                        or len(restored) != value["moves"]):
+                    return False
+                value = {**value, "history": [
+                    [list(position), [list(point) for point in saved_boxes], moves, pushes]
+                    for position, saved_boxes, moves, pushes in restored]}
             raw_history = value.get("history", [])
             if not isinstance(raw_history, list):
                 return False
@@ -634,7 +673,13 @@ class Sokoban(BaseGame):
         except Exception:  # noqa: BLE001 - a fresh campaign remains playable
             return
         outer_ruleset = None
+        slot_identity = {}
         if isinstance(saved, dict) and isinstance(saved.get("state"), dict):
+            slot_identity = {
+                "expected_value_hash": saved.get("value_hash"),
+                "expected_ruleset": saved.get("ruleset_version"),
+                "expected_state_version": saved.get("state_version"),
+            }
             outer_ruleset = saved.get("ruleset_version")
             saved = saved["state"]
         if (outer_ruleset is not None
@@ -654,7 +699,8 @@ class Sokoban(BaseGame):
                 try:
                     quarantine(
                         self.profile_id, self.game_id,
-                        CAMPAIGN_SESSION_SLOT, "invalid_sokoban_session")
+                        CAMPAIGN_SESSION_SLOT, "invalid_sokoban_session",
+                        **slot_identity)
                 except Exception:  # noqa: BLE001
                     pass
 
@@ -761,9 +807,10 @@ class Sokoban(BaseGame):
         self.offset_x = (self.width - w * CELL) // 2
         self.offset_y = 66
 
-    def _capture_campaign_session(self) -> bool:
+    def _capture_campaign_session(self, *, async_only: bool = False) -> bool:
         if self.practice_mode or self._campaign_snapshot is not None:
-            return self._campaign_snapshot is not None
+            return (self._campaign_snapshot is not None
+                    and self._persist_campaign_session(active=True, async_only=async_only))
         self._campaign_snapshot = {
             "level_idx": self.level_idx,
             "walls": set(self.walls), "targets": set(self.targets),
@@ -774,8 +821,9 @@ class Sokoban(BaseGame):
                         for position, boxes, moves, pushes in self.history],
             "score": self.score, "state": self.state,
         }
-        if not self._persist_campaign_session(active=True):
-            self._campaign_snapshot = None
+        if not self._persist_campaign_session(active=True, async_only=async_only):
+            if self._campaign_session_save_future is None:
+                self._campaign_snapshot = None
             return False
         return True
 
@@ -799,11 +847,26 @@ class Sokoban(BaseGame):
         return True
 
     def before_close(self) -> None:
+        if self._pending_practice_level is not None:
+            self._pending_practice_level = None
+            self._persist_campaign_session(active=False)
         if self._restored_campaign_session_active and not self.practice_mode:
             self._persist_campaign_session(active=False)
 
     def update(self, dt: float):
         self._poll_progress()
+
+    def _refresh_resumed_checkpoint(self) -> None:
+        if not self._restored_campaign_session_active or self.practice_mode:
+            return
+        if self.state != "playing":
+            self._persist_campaign_session(active=False, async_only=True)
+            return
+        # A practice return point follows subsequent settled campaign moves.
+        # Ordinary campaigns do not start autosaving through this path.
+        self._campaign_snapshot = None
+        self._capture_campaign_session(async_only=True)
+        self._campaign_snapshot = None
 
     def _select_practice_level(self, index: int) -> bool:
         """Open an unlocked level without changing the ranked campaign run."""
@@ -825,8 +888,14 @@ class Sokoban(BaseGame):
             return False
         self._practice_select_target = None
         self._practice_select_deadline = 0
+        self._pending_practice_level = index
         if not self._capture_campaign_session():
+            if self._campaign_session_save_future is None:
+                self._pending_practice_level = None
             return False
+        self._pending_practice_level = None
+        if self.practice_mode:
+            return True
         self.load_level(index, practice=True, new_campaign=False)
         return True
 
@@ -836,6 +905,8 @@ class Sokoban(BaseGame):
         if super().handle_event(event):
             return
         self._poll_campaign_session()
+        if self._pending_practice_level is not None:
+            return
         if self._campaign_session_load_future is not None:
             return
         if event.type != pygame.KEYDOWN:
@@ -916,6 +987,7 @@ class Sokoban(BaseGame):
         self.player_pos = (nx, ny)
         self.moves += 1
         self._check_win()
+        self._refresh_resumed_checkpoint()
 
     def _undo(self) -> None:
         """Undo one successful walk/push without affecting earlier levels."""
@@ -923,6 +995,7 @@ class Sokoban(BaseGame):
             return
         (self.player_pos, boxes, self.moves, self.pushes) = self.history.pop()
         self.boxes = set(boxes)
+        self._refresh_resumed_checkpoint()
 
     def _check_win(self):
         if self.boxes == self.targets:

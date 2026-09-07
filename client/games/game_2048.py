@@ -747,6 +747,11 @@ class Game2048(BaseGame):
             self.slot_load_error = None
             self._save_autosave_slot(allow_claim=True)
             return
+        self._slot_loaded_identity = {
+            "expected_value_hash": saved.get("value_hash"),
+            "expected_ruleset": saved.get("ruleset_version"),
+            "expected_state_version": saved.get("state_version"),
+        }
         state = saved.get("state")
         grid = state.get("grid") if isinstance(state, dict) else None
         score = state.get("score") if isinstance(state, dict) else None
@@ -770,7 +775,12 @@ class Game2048(BaseGame):
             return
         try:
             validate_2048_state(state)
-        except StoreError:
+        except StoreError as exc:
+            if exc.code in {"unsupported_rng", "unsupported_slot_version"}:
+                self._slot_incompatible_ruleset = True
+                self.slot_load_state = "failed"
+                self.slot_load_error = "存档格式暂不兼容，已保留；请使用原版本继续或确认新开"
+                return
             self._quarantine_bad_slot("invalid_2048_slot_semantics")
             return
         if version in (4, 5, 6):
@@ -979,7 +989,8 @@ class Game2048(BaseGame):
         if callable(quarantine):
             try:
                 self._slot_quarantine_future = quarantine(
-                    self.profile_id, self.game_id, "autosave", reason)
+                    self.profile_id, self.game_id, "autosave", reason,
+                    **getattr(self, "_slot_loaded_identity", {}))
             except Exception:  # noqa: BLE001
                 self._slot_quarantine_future = None
         if self._slot_quarantine_future is None:
@@ -996,7 +1007,16 @@ class Game2048(BaseGame):
             return
         self._slot_quarantine_future = None
         try:
-            quarantined = bool(future.result())
+            receipt = future.result()
+            if isinstance(receipt, dict) and receipt.get("status") == "CHANGED":
+                self._slot_quarantine_action = None
+                self.slot_load_state = "failed"
+                self.slot_load_error = "存档已在另一窗口改变，未删除；请重试读取后再决定"
+                return
+            quarantined = (isinstance(receipt, dict)
+                           and receipt.get("ok") is True
+                           and receipt.get("committed") is True
+                           and receipt.get("status") in {"QUARANTINED", "ABSENT"})
         except Exception:  # noqa: BLE001
             quarantined = False
         if quarantined:

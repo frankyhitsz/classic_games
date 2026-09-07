@@ -30,6 +30,9 @@ def restore_2048_rng_state(rng, value) -> None:
 
 
 def validate_2048_state(state) -> dict:
+    if (isinstance(state, dict) and type(state.get("version")) is int
+            and state["version"] > 6):
+        raise StoreError("unsupported_slot_version", "newer 2048 save format; preserved")
     if (not isinstance(state, dict)
             or state.get("version") not in {1, 2, 3, 4, 5, 6}):
         raise StoreError("invalid_2048_slot", "unsupported 2048 save version")
@@ -99,6 +102,10 @@ def validate_2048_state(state) -> dict:
                                 for char in expected_hash)))):
             raise StoreError("invalid_2048_slot", "invalid 2048 expectation")
     if version == 6:
+        rng_state = state.get("rng_state")
+        if (isinstance(rng_state, list) and rng_state
+                and type(rng_state[0]) is int and rng_state[0] not in {2, 3}):
+            raise StoreError("unsupported_rng", "unknown RNG state format; preserved")
         move_digest = state.get("move_digest")
         move_count = state.get("move_count")
         if (not isinstance(move_digest, str) or len(move_digest) != 64

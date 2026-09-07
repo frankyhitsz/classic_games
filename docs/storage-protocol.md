@@ -26,7 +26,7 @@ journal、阶段文件或数据库镜像的 hash 不匹配时停止启动，保�
 还会确认目标仍与 prepare 时相同。事务目标仅允许 active score/state journal、旧版 pending/migrated
 evidence 的删除，以及 `imported-recovery/<archive-id>/` evidence。
 
-score canonical 只在 256 个固定 stripe lock 内用 `os.replace` 发布，发布、重试计数、扫描、删除和隔离不使用硬链接，
+score canonical 在固定 stripe 与旧式 request 两种锁内用 `os.replace` 发布，发布、重试计数、扫描、删除和隔离不使用硬链接，
 因此 canonical 的链接数始终为 1。发布完成后用 replay 同款 bounded/no-follow reader 再读一次，才返回
 durable receipt。旧版 per-request lock 只在所有应用退出后的 `cleanup-score-locks --apply` 中删除。
 state `set_progress` 使用完整 order 的 LWW；只有 `merge_progress` 增量参与 component merge，旧 set 与新
@@ -70,7 +70,7 @@ replace 资格。超过 8 MiB 或嵌入总预算的 recovery file 记录 path/si
 流式复核原文件 hash。`imported-recovery` 默认只进入 hash inventory，不再次嵌入，多轮 export/import
 不会形成嵌套证据树。
 
-`upgrade-archive` 可把严格 manifest format 2 的 v2 archive 重写为 v4，并保留其可证明的 active complete 状态。
+`upgrade-archive` 可把严格 manifest format 2 的 v2 archive 或完整 v3 archive 重写为 v4，并保留其可证明的 active complete 状态。
 format-less v2 没有 active reject/restore inventory，归档自身无法证明当时没有遗漏，因此升级结果明确为
 merge-only。这是证据边界，不允许通过补一个字段伪造成完整备份。
 
@@ -93,6 +93,21 @@ v4 仍沿用有硬上限的 canonical JSON，不假称流式表格式。若 128 
 必须另行设计逐项 hash、随机访问索引和中断恢复，不能向已发布格式继续堆可选字段。
 
 ## 保留与清理
+
+schema 8 新增 `state_barriers`。显式进度 set 写入 reset order；直接写入与旧库迁移的 baseline 使用
+业务时间屏障。存档隔离必须匹配加载时的 value hash、outer ruleset 和 state version，归档原始内容、
+删除行和写入删除屏障在同一个 SQLite 事务中完成。隔离没有“先确认、后写入”的 pending 成功：
+数据库不可写就返回 BUSY/FAILED 并保留原行。旧待写入操作不能跨越屏障，导出时也不再把它作为 active
+journal；manifest 的 `retired_state_journals` 记录这类文件数量，原文件仍由正常重试流程处理。
+普通 merge import 拒绝早于本机删除的 slot，显式 replace 则按用户选择的完整备份重建数据库。
+
+业务 COMMITTED / ROLLED_BACK 与 CLEAN / PENDING 清理结果分开。已回滚的 phase 不允许再改成
+COMPLETED；terminal 目录改名或删除失败可重试。preparing 也先迁入 cleanup namespace 后才递归清理。
+final reject marker 按文件名 digest 取得锁后读取、校验、恢复或隔离；恢复锁等待不超过剩余扫描预算。
+
+推箱子 practice-return v2 使用 U/D/L/R 指令保存最多 10,000 步撤销历史；v1 继续可读。练习入口只接受
+明确的 committed / durable_pending ACK；等待时不处理移动，失败解除等待，取消排队 inactive tombstone。
+恢复后的 campaign 移动和撤销通过同槽单飞队列更新返回点，不在每一步等待磁盘。
 
 `status` 输出 recovery 项的名称、类型、字节数和修改时间；`transactions` 另外显示 phase、版本和
 operation 数。事务可先用 `export-transaction` 保存为 no-follow JSON evidence，再用

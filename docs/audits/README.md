@@ -3,6 +3,9 @@
 这里保存外部审查任务书和对应核对结果。代码、`spec.md` 与 `task.md` 记录当前行为；审查
 材料只作为当时问题和取舍的依据，不应被当作最新使用说明。
 
+第十八次审查：`eighteenth-code-review-taskbook-zh.md`、`eighteenth-code-review-response-zh.md`、
+`eighteenth-optimization-matrix-zh.md`。协议取舍记录在 `docs/adr/eighteenth-protocol-boundaries.md`。
+
 第八次审查对应文件：
 
 - `eighth-code-review-taskbook-zh.md`

@@ -1,68 +1,56 @@
-# 第十七次审查修复记录
+# 第十八次审查修复记录
 
 ## 状态
 
-- [x] 完整读取 2014 行任务书并锁定当前基线 `4e723c7`；
-- [x] 首轮核验五个 P0 族及 F01–F30 当前控制流；
-- [x] 完成全部 F01–F30 合理修复和实现方式修正；
-- [x] 建立逐 Finding 答复与 167 项 P0–P3 优化矩阵；
-- [x] 第一轮定向、storage、gameplay 验证；
-- [x] 第二轮独立复查、stress、release 和打包验证；
-- [x] 提交、推送并确认 GitHub CI。
+- [x] 完整读取 1919 行任务书；基线 `984cd84`，当前分支 `main`。
+- [x] 确认初始工作区只有用户新提供的任务书未跟踪。
+- [x] 核对 F01–F30，实施本轮修复；未完成边界单独列在答复和优化矩阵。
+- [x] 新增定向测试，完成首轮实现验证。
+- [x] 第一轮独立复查、修复和复验。
+- [x] 第二轮独立复查、修复和复验。
+- [x] 更新 30 条答复、162 项优化矩阵与协议文档。
+- [ ] 提交、推送和远端 CI。
 
-## 首轮核验结论
+## 已核实
 
-- aggregate 确实没有在 LWW 前识别自身 component；普通 `set_progress` replay 也不查询
-  `state_merge_receipts`，可确定性回退已合并进度；legacy v1 upgrade 另走 merge helper；
-- `list_entries` 首次 lock timeout 后会二次取锁并盲目隔离，reject marker/restore timeout 也落入 invalid；
-  reject writer 使用固定 temp，scanner 缺少同一 key lock；
-- exporter 只检查 128 MiB byte limit，而 reader 对整个 JSON 限制 250,000 nodes，成功发布后可自拒绝；
-- terminal transaction 在 active namespace 内 `rmtree(ignore_errors=True)`，部分删除能留下无 journal 的
-  `.import-*`；export 和 startup 对 terminal root 的判断不一致；
-- 2048 在 `_move` 中先加分、移动 grid，动画结束才 double tile 和 spawn，`before_close` 会保存半结算状态；
-- Store commit 后 score/state cleanup 的新锁异常未被完整捕获；event cache 同 identity 无终态优先级；
-  worker timeout 后仍会提前释放 application lease；score request lock 文件无界累积；
-- historical pending 确实 parse-first；`inspect-archive` 先 resolve final symlink；transaction JSON reader/writer
-  缺 shape、post-fstat、operation/encoded-size 对称门禁；
-- Sokoban 确实只恢复 `attempt_context`，忽略 BaseGame 私有提交 identity；outer ruleset 未检查，恢复后立刻
-  tombstone；validator 未验证 ledger 总和、exact int 和逐步可达性；
-- 推箱子的同步 `publish_slot_intent` 已是 durable，这一点比任务书表述更强；真正缺口是异步 adapter
-  把 Future 创建等同 durable，以及恢复点的后续生命周期。
+- component resolver 把 raw merge 的整体 hash 与 component semantic hash 比较，定义不一致。
+- Store 的旧 merge 分支未区分前一操作是 set 还是 merge；outbox 也缺 set/旧 merge 分支。
+- final reject marker 在锁外读取，存在使用旧快照的窗口。
+- 存档隔离接口未携带已加载身份，直接删除执行时的当前行。
+- F05、F20 的部分描述已被第十七轮末次修复覆盖，需保留原有定向测试作为反证。
 
-## 已实施
+## 验证记录
 
-- progress aggregate/component dominance、hash conflict、Store set receipt 检查和 v1 共享 resolver；
-- merge component receipt 与 authoritative state 同生命周期，不再按 365 天任意失效；
-- reject unique temp、digest lock、grace/fingerprint，scanner/marker/restore 对 BUSY 保留；
-- state parser 去除 wall-clock 依赖，clock quarantine 失败 fail closed，event reducer 终态优先；
-- archive node 预算在发布前检查并完成内存 reader round-trip；增加 `verify-archive`，修正 final symlink 与
-  historical classify-first，SQLite 动态类型返回结构化 source error；
-- terminal root 原子迁移到 transaction-cleanup namespace；共享 transaction classifier；transaction reader/
-  writer 增加 shape、constant、post-fstat、operation count 和 encoded-size 门禁；
-- 2048 保留 pre-move settled snapshot，动画中退出不再保存半结算 board；旧 ruleset slot 先隔离再新开；
-- commit/cleanup 分离；score lock 改为 256 stripes并增加 lock inventory/cleanup 命令；lease 等 worker 真正结束
-  后再释放；
-- BaseGame 增加统一 attempt identity restore 和 before-close structured warning；Sokoban 加固 ruleset、ledger、
-  reachability、attempt、tombstone 与 async durability。
+初版检查：318 项 storage 通过（1 项 Windows 专用跳过），107 项游戏/API 检查通过，Ruff 通过。
 
-## 两轮复查发现
+最终本机检查：
 
-- 第一轮完整运行发现 event queue 为防同 identity 回退而过度丢弃“较旧 operation 的 superseded 通知”，
-  已改为只抑制同 identity 回退，保留不同 operation 的结果事件；
-- 第二轮逐文件复查发现 historical score planner 仍是 parse-first、hash-only cleanup apply 仍回到 8 MiB
-  reader、Archive v4 CLI 文案残留、2048 v6 takeover 的 owner epoch 被归零、旧 ruleset 仍在 current parser
-  之后分类，以及 attempt revision 未同步 63-bit 上限；均已修复并增加定向检查；
-- state recovery 原实现只有各子扫描单独 250 ms，不能保证首帧总预算；现由 orphan、marker、restore 和 count
-  共享同一个 250 ms deadline，达到预算后保留未处理文件并显示恢复提示。
+- storage 共 331 项，329 通过、2 项 Windows 专用跳过；v16 新增 37 项定向检查。
+- Ruff（包含新 B012/B018）与三个核心契约/工具模块 mypy 通过。
+- Windows/Linux wheel 下载均通过 require-hashes 校验；macOS 在隔离环境强制重装全部 hash-locked 依赖成功。
+- 20,000 步 gameplay stress、100 次资源循环（FD 18→18）、240 次并发写入及 integrity check 通过。
+- release 环境的同步 local-save p99 约 2.42 ms；锁竞争下提交入队 p99 约 0.046 ms。它们不是同一种计时，
+  不用同步写入数据冒充 enqueue 指标。
+- storage+stress 的 Store/Archive/Transaction 分支覆盖率合计约 79%，尚未达到 90%。
+- 初次最终 release 因新测试比较 macOS /var 与 /private/var 路径别名失败；路径断言已改为 canonical path，
+  storage 复跑通过，完整 release 十个阶段全部通过。
+- 最终 107 项 gameplay/API 通过；合并 coverage 后全仓约 78%。CI 全仓下限由 60% 提高到 75%，
+  Store/Archive/Transaction 另设 75% 下限；没有修改测试排除项。
+- 包版本 0.10.0 的 wheel/sdist 安装、只读用户数据 smoke、SBOM/manifest、依赖漏洞审计均通过。
 
-## 最终验证
+## 第一轮复查
 
-- Ruff 与 compileall 已通过当前修改文件；
-- `test_storage_v15.py` 新增 34 项定向检查；完整 storage 294 项通过、1 项 Windows junction 专用跳过；
-- `run_tests.sh`：gameplay/API 107 项通过；storage 294 项通过、1 项平台跳过；20,000 步 stress、
-  100 次资源循环、240 次并发写入与 SQLite integrity check 通过；
-- release profile 全阶段通过：Ruff、依赖漏洞审计、CycloneDX SBOM、compile、wheel/sdist 安装、
-  只读用户数据冒烟、release manifest、storage、stress、gameplay；
-- Archive v4、slot v6 与包版本同步到 0.9.0；README、CHANGELOG 和 storage protocol 已更新；
-- 实现提交 `60ef557` 已推送到 `origin/main`；GitHub CI #48 的 release-gate、core-only、macOS、
-  Ubuntu、Windows、Python 3.12 和 Python 3.13 共 7 个 job 全部通过。
+- 异步练习保存抛异常会留下 pending transition，已改为失败结果也执行状态收尾。
+- 同步存档不能仅凭 backend capability 宣称成功，现要求明确的持久化收据。
+- Store 的 reset barrier 必须在 component receipt 查重/冲突之后检查，已调整顺序。
+- 老测试的故障注入点与收据更新为新协议；原有数据保护断言保留，slot replay 改为验证不复活。
+
+## 第二轮复查
+
+- 删除屏障原本只约束运行中的数据库；导出旧 pending 后在空库恢复仍可复活存档。
+  已按持久屏障过滤不再活跃的 journal，并在 manifest 单独记录退休数量；原文件不删除。
+- merge import 不再插入时间早于本机删除屏障的 committed slot；显式覆盖恢复仍可恢复所选备份。
+- 新增完整发布前后进程中断、legacy/new 锁互斥、恢复后的移动/撤销、失败 Future 与取消排队测试。
+- 新增 API 测试一度把 `DB_PATH` 写成 `DATABASE`，在默认目录误建空库；核对七张业务/隔离表全为 0 行后，
+  将文件移到 `/private/tmp/classic-games-empty-test-db-SgdkjE/games.db` 保留。已修正配置并断言实际 DB 路径，
+  后续完整测试统一设置临时 `GAMES_DB` 兜底，不接触默认数据位置。

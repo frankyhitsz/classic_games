@@ -150,7 +150,7 @@ def create_app(config: dict | None = None) -> Flask:
             loopback = ipaddress.ip_address(remote).is_loopback
         except ValueError:
             loopback = remote.casefold() == "localhost"
-        if loopback:
+        if loopback and not app.config.get("ALLOW_REMOTE_API"):
             return None
         if not app.config.get("ALLOW_REMOTE_API"):
             return api_error(

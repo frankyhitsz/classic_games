@@ -22,9 +22,9 @@ from .profile import ProfileIdentity, ProfileIdentityError
 from .progress import (ProgressPolicyError,
                        merge_progress as merge_progress_values,
                        validate_progress)
-from .service import StorageStatus
+from .service import SlotQuarantineReceipt, StorageStatus
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 # The render thread never waits on this budget. A quarter second gives the
 # optional Flask adapter and direct maintenance callers room to serialize
 # ordinary bursts while still falling back far sooner than the old 5 s wait.
@@ -291,6 +291,9 @@ class LocalGameStore:
                 return False
             if not self._state_receipt_tables_are_current(conn):
                 return False
+            if not {"semantic_key", "logical_revision", "operation_id", "kind",
+                    "updated_at"} <= self._table_columns(conn, "state_barriers"):
+                return False
             for table, columns in (
                 ("profiles", required_profiles), ("settings", required_settings),
                 ("progress", required_progress), ("save_slots", required_slots)):
@@ -408,8 +411,18 @@ class LocalGameStore:
         with self.connection() as conn:
             row = conn.execute(
                 "SELECT COALESCE(MAX(logical_revision),0) AS revision "
-                "FROM state_receipts").fetchone()
+                "FROM (SELECT logical_revision FROM state_receipts UNION ALL "
+                "SELECT logical_revision FROM state_barriers)").fetchone()
         return int(row["revision"])
+
+    @staticmethod
+    def state_barrier_supersedes(operation: dict, barrier) -> bool:
+        if barrier is None:
+            return False
+        if barrier["kind"] == "progress_baseline":
+            return operation["updated_at"] <= barrier["updated_at"]
+        return (operation["logical_revision"], operation["operation_id"]) < (
+            int(barrier["logical_revision"]), barrier["operation_id"])
 
     def state_merge_components_applied(self, operation: dict) -> bool:
         (method, _args, key, _revision, _operation_id, _payload_hash,
@@ -794,6 +807,12 @@ class LocalGameStore:
     @staticmethod
     def _create_state_receipt_tables(conn: sqlite3.Connection) -> None:
         conn.execute(
+            "CREATE TABLE IF NOT EXISTS state_barriers ("
+            "semantic_key TEXT PRIMARY KEY, logical_revision INTEGER NOT NULL "
+            "CHECK(logical_revision>=0), operation_id TEXT NOT NULL, "
+            "kind TEXT NOT NULL CHECK(kind IN ('progress_reset','progress_baseline','slot_delete')), "
+            "updated_at REAL NOT NULL)")
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS state_receipts ("
             "semantic_key TEXT PRIMARY KEY, "
             "logical_revision INTEGER NOT NULL CHECK(logical_revision>=0), "
@@ -978,6 +997,15 @@ class LocalGameStore:
             (semantic_key, logical_revision, operation_id, payload_hash,
              method, canonical_json(state_ref), value_hash, receipt_kind,
              canonical_json(result), occurred_at, applied_at))
+        if method == "set_progress":
+            conn.execute(
+                "INSERT INTO state_barriers VALUES(?,?,?,?,?) "
+                "ON CONFLICT(semantic_key) DO UPDATE SET "
+                "logical_revision=excluded.logical_revision,operation_id=excluded.operation_id,"
+                "kind=excluded.kind,updated_at=excluded.updated_at",
+                (semantic_key, logical_revision, operation_id,
+                 "progress_baseline" if receipt_kind == "baseline" else "progress_reset",
+                 occurred_at))
 
     def _seed_state_baselines(self, conn: sqlite3.Connection, *,
                               missing_only: bool = False,
@@ -1080,7 +1108,8 @@ class LocalGameStore:
     def _ensure_state_receipt_tables(self, conn: sqlite3.Connection,
                                      source_version: int) -> None:
         current = self._state_receipt_tables_are_current(conn)
-        rebuild = source_version < SCHEMA_VERSION or not current
+        # Schema 8 adds barriers without discarding schema-7 replay receipts.
+        rebuild = source_version < 7 or not current
         legacy_merge = None
         legacy_revision_floor = 0
         if rebuild:
@@ -1109,7 +1138,7 @@ class LocalGameStore:
                 if table == "state_merge_receipts":
                     legacy_merge = legacy
             self._create_state_receipt_tables(conn)
-            if legacy_merge is not None and source_version >= SCHEMA_VERSION:
+            if legacy_merge is not None and source_version >= 7:
                 columns = self._table_columns(conn, legacy_merge)
                 required = {"operation_id", "semantic_key", "payload_hash",
                             "applied_at"}
@@ -1126,6 +1155,11 @@ class LocalGameStore:
                 f"已为 {seeded} 条本机状态建立恢复基线")
         else:
             self._create_state_receipt_tables(conn)
+        conn.execute(
+            "INSERT OR IGNORE INTO state_barriers "
+            "SELECT semantic_key,logical_revision,operation_id,CASE receipt_kind "
+            "WHEN 'baseline' THEN 'progress_baseline' ELSE 'progress_reset' END,"
+            "occurred_at FROM state_receipts WHERE method='set_progress'")
 
     @staticmethod
     def _local_state_table_is_current(conn: sqlite3.Connection,
@@ -2351,7 +2385,7 @@ class LocalGameStore:
                     if authoritative is not None:
                         current, _value_hash, _updated_at = authoritative
                         winner = conn.execute(
-                            "SELECT logical_revision,operation_id FROM "
+                            "SELECT logical_revision,operation_id,payload_hash,value_hash FROM "
                             "state_receipts WHERE semantic_key=?", (key,)
                         ).fetchone()
                         result = {
@@ -2366,6 +2400,8 @@ class LocalGameStore:
                                 "winning_logical_revision": int(
                                     winner["logical_revision"]),
                                 "winning_operation_id": winner["operation_id"],
+                                "winning_payload_hash": winner["payload_hash"],
+                                "winning_value_hash": winner["value_hash"],
                             })
                         conn.commit()
                         return result
@@ -2396,7 +2432,7 @@ class LocalGameStore:
                     if authoritative is not None:
                         current, _value_hash, _updated_at = authoritative
                         winner = conn.execute(
-                            "SELECT logical_revision,operation_id FROM "
+                            "SELECT logical_revision,operation_id,payload_hash,value_hash FROM "
                             "state_receipts WHERE semantic_key=?", (key,)
                         ).fetchone()
                         result = {
@@ -2410,6 +2446,8 @@ class LocalGameStore:
                                 "winning_logical_revision": int(
                                     winner["logical_revision"]),
                                 "winning_operation_id": winner["operation_id"],
+                                "winning_payload_hash": winner["payload_hash"],
+                                "winning_value_hash": winner["value_hash"],
                             })
                         conn.commit()
                         return result
@@ -2417,6 +2455,18 @@ class LocalGameStore:
                         "DELETE FROM state_merge_receipts WHERE semantic_key=?",
                         (key,))
                     applied_components.clear()
+
+            barrier = conn.execute(
+                "SELECT * FROM state_barriers WHERE semantic_key=?", (key,)
+            ).fetchone()
+            if self.state_barrier_supersedes(operation, barrier):
+                conn.commit()
+                return {"ok": True, "superseded": True,
+                        "state_apply": "superseded", "semantic_key": key,
+                        "logical_revision": revision, "operation_id": operation_id,
+                        "winning_logical_revision": barrier["logical_revision"],
+                        "winning_operation_id": barrier["operation_id"],
+                        "barrier": barrier["kind"]}
 
             prior = conn.execute(
                 "SELECT * FROM state_receipts WHERE semantic_key=?", (key,)
@@ -2536,8 +2586,10 @@ class LocalGameStore:
                     and not incoming_after_baseline)
                 if (prior is not None
                         and (baseline_wins_by_time
-                             or incoming_order < prior_order)):
-                    if method == "merge_progress":
+                             or incoming_order < prior_order and not incoming_after_baseline)):
+                    if (method == "merge_progress"
+                            and prior["method"] == "merge_progress"
+                            and not baseline_wins_by_time):
                         merge_stale = True
                     else:
                         conn.commit()
@@ -2548,6 +2600,8 @@ class LocalGameStore:
                             "operation_id": operation_id,
                             "winning_logical_revision": prior_order[0],
                             "winning_operation_id": prior_order[1],
+                            "winning_payload_hash": prior["payload_hash"],
+                            "winning_value_hash": prior["value_hash"],
                         }
 
             result: dict
@@ -2801,6 +2855,8 @@ class LocalGameStore:
                 result.update({
                     "winning_logical_revision": int(prior["logical_revision"]),
                     "winning_operation_id": prior["operation_id"],
+                    "winning_payload_hash": prior["payload_hash"],
+                    "winning_value_hash": value_hash,
                 })
                 winner_result = {
                     **result,
@@ -3157,23 +3213,11 @@ class LocalGameStore:
             state = json.loads(
                 row["state_json"], parse_constant=_reject_json_constant)
         except (TypeError, ValueError, json.JSONDecodeError):
-            with self.connection() as conn:
-                conn.execute("BEGIN IMMEDIATE")
-                current = conn.execute(
-                    "SELECT state_json FROM save_slots WHERE profile_id=? "
-                    "AND game_id=? AND slot_id=?",
-                    (profile_id, game_id, slot_id)).fetchone()
-                if current is not None and current["state_json"] == row["state_json"]:
-                    self._quarantine_local_state(
-                        conn, kind="save_slots", profile_id=profile_id,
-                        game_id=game_id, item_key=slot_id,
-                        raw_value=str(row["state_json"]), reason="invalid_json")
-                    conn.execute(
-                        "DELETE FROM save_slots WHERE profile_id=? AND game_id=? "
-                        "AND slot_id=?", (profile_id, game_id, slot_id))
-                    self._invalidate_state_receipts(
-                        conn, f"slot:{profile_id}:{game_id}:{slot_id}")
-                conn.commit()
+            self.quarantine_slot(
+                profile_id, game_id, slot_id, "invalid_json",
+                expected_value_hash=hashlib.sha256(str(row["state_json"]).encode()).hexdigest(),
+                expected_ruleset=row["ruleset_version"],
+                expected_state_version=row["state_version"])
             return None
         value_hash = self._state_value_hash({
             "state": state,
@@ -3187,7 +3231,11 @@ class LocalGameStore:
                 "value_hash": value_hash}
 
     def quarantine_slot(self, profile_id: str, game_id: str,
-                        slot_id: str, reason: str) -> bool:
+                        slot_id: str, reason: str, *,
+                        expected_value_hash: str | None = None,
+                        expected_ruleset: str | None = None,
+                        expected_state_version: int | None = None,
+                        logical_revision: int | None = None) -> SlotQuarantineReceipt:
         if game_id not in VALID_GAME_IDS:
             raise StoreError("unknown_game", f"unknown game_id: {game_id}", 404)
         profile_id = self._profile_uuid(profile_id)
@@ -3196,12 +3244,33 @@ class LocalGameStore:
         with self.connection() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT state_json FROM save_slots WHERE profile_id=? "
+                "SELECT * FROM save_slots WHERE profile_id=? "
                 "AND game_id=? AND slot_id=?",
                 (profile_id, game_id, slot_id)).fetchone()
             if row is None:
                 conn.commit()
-                return False
+                return {"ok": True, "status": "ABSENT", "committed": True}
+            try:
+                state = json.loads(row["state_json"], parse_constant=_reject_json_constant)
+                value_hash = self._state_value_hash({
+                    "state": state, "state_version": int(row["state_version"]),
+                    "ruleset_version": row["ruleset_version"]})
+            except (TypeError, ValueError):
+                value_hash = hashlib.sha256(str(row["state_json"]).encode()).hexdigest()
+            if (expected_value_hash != value_hash
+                    or expected_ruleset != row["ruleset_version"]
+                    or expected_state_version != row["state_version"]):
+                conn.commit()
+                return {"ok": False, "status": "CHANGED", "retryable": True}
+            key = f"slot:{profile_id}:{game_id}:{slot_id}"
+            high_water = conn.execute(
+                "SELECT COALESCE(MAX(logical_revision),0) FROM "
+                "(SELECT logical_revision FROM state_receipts UNION ALL "
+                "SELECT logical_revision FROM state_barriers)").fetchone()[0]
+            revision = max(time.time_ns(), int(high_water) + 1,
+                           logical_revision or 0)
+            if revision > (1 << 63) - 1:
+                raise StoreError("state_clock_overflow", "local state clock is exhausted")
             self._quarantine_local_state(
                 conn, kind="save_slots", profile_id=profile_id,
                 game_id=game_id, item_key=slot_id,
@@ -3210,9 +3279,16 @@ class LocalGameStore:
                 "DELETE FROM save_slots WHERE profile_id=? AND game_id=? "
                 "AND slot_id=?", (profile_id, game_id, slot_id))
             self._invalidate_state_receipts(
-                conn, f"slot:{profile_id}:{game_id}:{slot_id}")
+                conn, key)
+            conn.execute(
+                "INSERT INTO state_barriers VALUES(?,?,?,?,?) "
+                "ON CONFLICT(semantic_key) DO UPDATE SET "
+                "logical_revision=excluded.logical_revision,"
+                "operation_id=excluded.operation_id,updated_at=excluded.updated_at",
+                (key, revision, uuid.uuid4().hex, "slot_delete", time.time()))
             conn.commit()
-            return True
+            return {"ok": True, "status": "QUARANTINED", "committed": True,
+                    "logical_revision": revision}
 
     def _legacy_rows(self, legacy_conn: sqlite3.Connection,
                      source: str) -> list[tuple]:

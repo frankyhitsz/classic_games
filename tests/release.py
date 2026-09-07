@@ -14,6 +14,7 @@ from pathlib import Path
 
 STAGE_TIMEOUTS = {
     "ruff": 120,
+    "typing": 120,
     "dependency-audit": 300,
     "dependency-sbom": 300,
     "compile": 120,
@@ -39,6 +40,7 @@ def _commands(profile: str) -> list[tuple[str, list[str]]]:
         commands[:0] = [
             ("ruff", [sys.executable, "-m", "ruff", "check",
                       "client", "game_service", "server", "tests"]),
+            ("typing", [sys.executable, "-m", "mypy"]),
             ("dependency-audit", [sys.executable, "-m", "pip_audit",
                                   "--cache-dir", str(Path(tempfile.gettempdir())
                                                      / "classic-games-pip-audit"),

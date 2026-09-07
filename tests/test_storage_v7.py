@@ -321,7 +321,7 @@ class Game2048RecoveryTests(unittest.TestCase):
         def save_slot_async(self, *_args):
             return completed_future({"ok": True})
 
-        def quarantine_slot_async(self, *_args):
+        def quarantine_slot_async(self, *_args, **_expected):
             self.quarantine_calls += 1
             return self.quarantine
 
@@ -365,7 +365,7 @@ class Game2048RecoveryTests(unittest.TestCase):
         game._poll_slot_load()
         self.assertEqual(game.slot_load_state, "quarantining")
         self.assertNotIn("已隔离", game.slot_load_error)
-        backend.quarantine.set_result(True)
+        backend.quarantine.set_result({"ok": True, "committed": True, "status": "QUARANTINED"})
         game._poll_slot_quarantine()
         self.assertEqual(game.slot_load_state, "failed")
         self.assertIn("已隔离", game.slot_load_error)

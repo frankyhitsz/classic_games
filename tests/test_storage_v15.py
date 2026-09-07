@@ -59,7 +59,7 @@ class ProgressAggregateTests(unittest.TestCase):
         baseline = self.operation(
             "set_progress", {"unlocked_level": 3}, 10, "f-component")
         delta = self.operation(
-            "merge_progress", {"unlocked_level": 8}, 5, "delta")
+            "merge_progress", {"unlocked_level": 8}, 11, "delta")
         aggregate, _resolution = PersistentStateOutbox.resolve_operations(
             baseline, delta)
         winner, resolution = PersistentStateOutbox.resolve_operations(
@@ -81,7 +81,7 @@ class ProgressAggregateTests(unittest.TestCase):
             baseline = self.operation(
                 "set_progress", {"unlocked_level": 3}, 10, "f-component")
             delta = self.operation(
-                "merge_progress", {"unlocked_level": 8}, 5, "delta")
+                "merge_progress", {"unlocked_level": 8}, 11, "delta")
             aggregate, _resolution = PersistentStateOutbox.resolve_operations(
                 baseline, delta)
             store.apply_state_operation(aggregate)
@@ -158,7 +158,7 @@ class StateBusyAndEventTests(unittest.TestCase):
                 phase="prepared", reason="test")
             outbox._write_reject_marker_locked(marker, transaction)
             with patch.object(
-                    outbox, "_key_lock",
+                    outbox, "_digest_lock",
                     side_effect=StoreError(
                         "state_lock_timeout", "busy", 503, retryable=True)):
                 outbox._recover_reject_transactions()
@@ -726,9 +726,9 @@ class GameStateTests(unittest.TestCase):
                     "state": {"version": 999, "historical": True},
                     "ruleset_version": "2048-legacy"})
 
-            def quarantine_slot_async(self, *_args):
+            def quarantine_slot_async(self, *_args, **_expected):
                 quarantined.append(_args[-1])
-                return completed(True)
+                return completed({"ok": True, "committed": True, "status": "QUARANTINED"})
 
             @staticmethod
             def failed_save_count():

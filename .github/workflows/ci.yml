@@ -21,8 +21,8 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: python -m pip install pip==26.2.1
-      - run: python -m pip install -c constraints-release.txt -e ".[dev]"
+      - run: python -m pip install --require-hashes --only-binary=:all: -r requirements-release.lock
+      - run: python -m pip install --no-deps --no-build-isolation -e ".[dev]"
       - run: python -m tests.release release --junit release-results.xml --json release-results.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
@@ -48,8 +48,8 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - run: python -m pip install pip==26.2.1
-      - run: python -m pip install -c constraints-release.txt -e .
+      - run: python -m pip install --require-hashes --only-binary=:all: -r requirements-core.lock
+      - run: python -m pip install --no-deps --no-build-isolation -e .
       - run: python -m unittest discover -s tests -p "test_storage*.py"
 
   test:
@@ -70,11 +70,12 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install pip==26.2.1
-      - run: python -m pip install -c constraints-release.txt -e ".[dev]"
+      - run: python -m pip install --require-hashes --only-binary=:all: -r requirements-release.lock
+      - run: python -m pip install --no-deps --no-build-isolation -e ".[dev]"
       - name: Run wheel and sdist user-data smoke
         run: python -m tests.wheel_smoke
       - run: python -m ruff check client game_service server tests
+      - run: python -m mypy
       - name: Run storage tests
         shell: bash
         run: |
@@ -112,7 +113,8 @@ jobs:
           fi
           exit ${status}
       - run: python -m coverage combine --append
-      - run: python -m coverage report --fail-under=60
+      - run: python -m coverage report --fail-under=75
+      - run: python -m coverage report --include="game_service/store.py,game_service/data_cli.py,game_service/import_transaction.py" --fail-under=75
       - run: python -m coverage xml
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: always()
@@ -142,8 +144,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install pip==26.2.1
-      - run: python -m pip install -c constraints-release.txt -e ".[dev]"
+      - run: python -m pip install --require-hashes --only-binary=:all: -r requirements-release.lock
+      - run: python -m pip install --no-deps --no-build-isolation -e ".[dev]"
       - run: python -m ruff check client game_service server tests
+      - run: python -m mypy
       - run: python -m unittest discover -s tests -p "test_storage*.py"
       - run: python -m tests.ci_regression

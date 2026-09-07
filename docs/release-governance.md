@@ -30,6 +30,13 @@
 `constraints-release.txt` 固定正式验证使用的完整解析依赖闭包；`pyproject.toml` 的范围用于普通
 安装和兼容性 CI。升级约束时应重新解析三平台依赖，运行依赖审计、完整测试和隔离 venv wheel
 与 sdist smoke，并检查 release profile 输出的 CycloneDX `release-sbom.json` 和
-`release-installed-packages.json`。当前约束是精确版本清单，但还不是带 hash 的跨平台 lock；正式
-发布前若启用 `--require-hashes`，必须同时收集 Windows、macOS 和 Linux 所需 wheel 的 hash，
-不能只锁开发机平台。
+`release-installed-packages.json`。`requirements-release.lock` 收录精确版本在 PyPI 发布的 wheel SHA-256，
+覆盖 Windows、macOS 和 Linux，CI 用 `--require-hashes --only-binary=:all:` 安装；最小安装使用独立的
+`requirements-core.lock`。`python -m tests.lock_dependencies` 从已审定的版本清单输出新锁，更新后仍需
+审查、三平台安装和漏洞审计；哈希锁不替代依赖来源与漏洞判断。
+
+类型门禁先覆盖 `service.py`、`safe_fs.py`、`sokoban_history.py`，不表示全仓已类型化。
+本轮没有把覆盖率阈值直接调到尚未达到的 90%/80%；根据本机完整检查的 78% 结果，将全仓门禁从
+60% 提高到 75%，Store/Archive/Transaction 三模块另设 75% 下限。未覆盖分支继续保留在 CI。
+已生成的图形来自代码绘制，没有新增第三方音频或字体文件。人工、历史工具辅助与外部审查的变更
+来源可按 Git 提交及 `docs/audits/` 追溯；这不是对所有历史贡献权利的法律证明。
