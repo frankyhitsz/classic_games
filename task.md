@@ -38,6 +38,13 @@
   Store/Archive/Transaction 另设 75% 下限；没有修改测试排除项。
 - 包版本 0.10.0 的 wheel/sdist 安装、只读用户数据 smoke、SBOM/manifest、依赖漏洞审计均通过。
 
+## GitHub 交付
+
+- 实现提交 `7d82db6` 已推送到 origin/main。CI #50 在解析 YAML 时失败，尚未创建测试 job：
+  单行 run 中 `--only-binary=:all:` 后的冒号被当作 YAML 分隔符。
+- 已把四处安装命令改为 YAML 多行字符串，并新增本地 workflow-config 解析门禁及 hash-locked PyYAML；
+  本地配置检查通过。修复提交和远端测试结果待补。
+
 ## 第一轮复查
 
 - 异步练习保存抛异常会留下 pending transition，已改为失败结果也执行状态收尾。

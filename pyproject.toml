@@ -25,6 +25,7 @@ dev = [
     "pip-audit>=2.10,<3",
     "build>=1.5,<2",
     "mypy>=2.3,<3",
+    "PyYAML>=6.0,<7",
 ]
 
 [project.scripts]
